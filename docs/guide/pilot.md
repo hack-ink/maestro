@@ -1,6 +1,10 @@
 # Pilot Runbook
 
-Purpose: Run the `maestro` MVP against one configured Linear project and one target repository, with `maestro` itself as the default first pilot target.
+Goal: Run the `maestro` MVP against one configured Linear project and one target repository, with `maestro` itself as the default first pilot target.
+Read this when: You are preparing a dry run or live self-dogfood pilot and need the bounded operator procedure for config, target-repo requirements, and expected run behavior.
+Preconditions: `codex app-server` is available locally; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is available through `projects.tracker.api_token_env`.
+Depends on: `docs/spec/system_maestro_runtime.md`, `docs/spec/system_workflow_contract.md`, `docs/spec/system_app_server_contract.md`, the target repository root `WORKFLOW.md`, and `Makefile.toml` for repo-native verification tasks.
+Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run --config ./maestro.toml`; and, when the environment is ready, `cargo run -- run --once --config ./maestro.toml`.
 
 ## Alignment note
 

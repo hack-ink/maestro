@@ -1,8 +1,10 @@
 # Workflow Contract Specification
 
 Purpose: Define the machine-readable contract for downstream repository `WORKFLOW.md` files consumed by `maestro`.
-
-Audience: Repository owners and `maestro` implementers.
+Status: normative
+Read this when: You are authoring, parsing, or validating a downstream repository `WORKFLOW.md` file for use by `maestro`.
+Not this document: The `maestro` runtime state machine, the `app-server` protocol contract, or the operator pilot sequence.
+Defines: The file location, parse model, supported frontmatter structure, and the required and optional `WORKFLOW.md` fields that `maestro` consumes.
 
 ## File location
 

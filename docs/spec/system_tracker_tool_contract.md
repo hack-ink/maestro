@@ -1,8 +1,10 @@
 # Tracker Tool Contract Specification
 
 Purpose: Define the issue-scoped tracker tool surface that allows the coding agent to update the currently leased issue autonomously while keeping `maestro` in control of orchestration lifecycle and safety.
-
-Audience: `maestro` implementers and repository owners who author repo-local workflow policy.
+Status: normative
+Read this when: You are implementing, reviewing, or constraining the issue-scoped tracker tool bridge used during a `maestro` run.
+Not this document: The full `maestro` runtime state machine, the downstream `WORKFLOW.md` contract, or the end-to-end pilot runbook.
+Defines: The tracker ownership boundary, preferred transport, issue-scoped tool surface, policy constraints, and failure-handling rules for tracker writes.
 
 ## Ownership boundary
 

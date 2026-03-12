@@ -1,8 +1,10 @@
 # Maestro Runtime Specification
 
 Purpose: Define the authoritative runtime model for the `maestro` MVP.
-
-Audience: This specification is normative for the current MVP implementation.
+Status: normative
+Read this when: You need the authoritative model for issue eligibility, leases, lane ownership, runtime states, tracker-write ownership, or Linear writeback behavior.
+Not this document: The low-level `app-server` protocol contract, the downstream `WORKFLOW.md` schema, or the operator pilot procedure.
+Defines: The runtime scope, source-of-truth boundaries, eligibility rules, lane model, local state machine, tracker-write ownership, and writeback semantics.
 
 ## Scope
 

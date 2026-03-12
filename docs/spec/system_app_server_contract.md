@@ -1,8 +1,10 @@
 # App-Server Contract Specification
 
 Purpose: Define the direct `codex app-server` protocol boundary used by the `maestro` MVP.
-
-Audience: `maestro` implementers.
+Status: normative
+Read this when: You are implementing or validating `maestro`'s direct `codex app-server` integration, including transport, handshake, request flow, or dynamic tools.
+Not this document: The runtime state machine, downstream `WORKFLOW.md` policy, or operator runbooks.
+Defines: The supported transport, protocol source-of-truth boundary, required request and notification flow, and the MVP contract for `initialize`, `thread/start`, and `turn/start`.
 
 ## Transport
 
