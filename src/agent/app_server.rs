@@ -693,9 +693,10 @@ fn thread_id_from_value(value: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-
-	use crate::agent::app_server;
-	use crate::agent::{app_server::{AppServerRunResult}, json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage}};
+	use crate::agent::{
+		app_server::AppServerRunResult,
+		json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
+	};
 
 	fn notification_message(method: &str, params: serde_json::Value) -> WireMessage {
 		WireMessage {
@@ -718,8 +719,8 @@ mod tests {
 			}),
 		);
 
-		assert!(app_server::targets_thread(&message, Some("thread-1")));
-		assert!(!app_server::targets_thread(&message, Some("thread-2")));
+		assert!(super::targets_thread(&message, Some("thread-1")));
+		assert!(!super::targets_thread(&message, Some("thread-2")));
 	}
 
 	#[test]
@@ -736,8 +737,8 @@ mod tests {
 			}),
 		);
 
-		assert!(app_server::targets_thread(&message, Some("thread-1")));
-		assert!(!app_server::targets_thread(&message, Some("thread-2")));
+		assert!(super::targets_thread(&message, Some("thread-1")));
+		assert!(!super::targets_thread(&message, Some("thread-2")));
 	}
 
 	#[test]
