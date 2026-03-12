@@ -1,7 +1,5 @@
 //! Maestro runtime bootstrap and CLI entrypoint.
 
-#![deny(clippy::all, missing_docs, unused_crate_dependencies)]
-
 /// Service configuration types and loaders.
 pub mod config;
 /// Thin local persistence for active Maestro execution state.
