@@ -17,6 +17,11 @@ Purpose: Provide the canonical entry point and reading order for repository docu
 - Location: `docs/spec/` (flat structure).
 - Use for: System contracts, data models, pipeline behavior, and required invariants.
 - Entry point: `docs/spec/index.md`.
+- Current core specs:
+  - `docs/spec/system_maestro_runtime.md`
+  - `docs/spec/system_workflow_contract.md`
+  - `docs/spec/system_app_server_contract.md`
+  - `docs/spec/system_tracker_tool_contract.md`
 
 ### Operational and pipeline docs (implementation guides)
 
