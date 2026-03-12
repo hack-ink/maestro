@@ -1,11 +1,16 @@
-use std::time::{Duration, Instant};
+use std::{
+	env,
+	time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
 	agent::{
-		json_rpc::{JsonRpcConnection, JsonRpcMessage, JsonRpcNotification, WireMessage},
+		json_rpc::{
+			JsonRpcConnection, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, WireMessage,
+		},
 		tracker_tool_bridge::{DynamicToolCallResponse, DynamicToolHandler, DynamicToolSpec},
 	},
 	prelude::{Result, eyre},
@@ -38,134 +43,13 @@ pub(crate) struct AppServerRunRequest<'a> {
 	pub(crate) dynamic_tool_handler: Option<&'a dyn DynamicToolHandler>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AppServerRunResult {
 	pub(crate) user_agent: String,
 	pub(crate) thread_id: String,
 	pub(crate) turn_id: String,
 	pub(crate) event_count: i64,
 	pub(crate) final_output: String,
-}
-
-pub(crate) fn execute_app_server_run(
-	request: &AppServerRunRequest<'_>,
-	state_store: &StateStore,
-) -> Result<AppServerRunResult> {
-	state_store.record_run_attempt(
-		&request.run_id,
-		&request.issue_id,
-		request.attempt_number,
-		"starting",
-	)?;
-
-	let result = execute_app_server_run_inner(request, state_store);
-	if result.is_err() {
-		state_store.record_run_attempt(
-			&request.run_id,
-			&request.issue_id,
-			request.attempt_number,
-			"failed",
-		)?;
-	}
-
-	result
-}
-
-pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
-	let state_store = StateStore::open_in_memory()?;
-	let probe_tool_handler = ProbeDynamicToolHandler;
-	let result = execute_app_server_run(
-		&AppServerRunRequest {
-			run_id: PROBE_RUN_ID.to_owned(),
-			issue_id: PROBE_ISSUE_ID.to_owned(),
-			attempt_number: 1,
-			listen: listen.to_owned(),
-			cwd: std::env::current_dir()?.display().to_string(),
-			approval_policy: String::from("never"),
-			sandbox: String::from("workspace-write"),
-			developer_instructions: PROBE_DEVELOPER_INSTRUCTIONS.to_owned(),
-			user_input: PROBE_USER_INPUT.to_owned(),
-			model: None,
-			personality: None,
-			service_tier: None,
-			timeout: PROBE_TIMEOUT,
-			dynamic_tool_handler: Some(&probe_tool_handler),
-		},
-		&state_store,
-	)?;
-
-	if result.final_output.trim() != PROBE_EXPECTED_OUTPUT {
-		eyre::bail!(
-			"Protocol probe completed, but the final output was `{}` instead of `{PROBE_EXPECTED_OUTPUT}`.",
-			result.final_output.trim()
-		);
-	}
-
-	Ok(result)
-}
-
-fn execute_app_server_run_inner(
-	request: &AppServerRunRequest<'_>,
-	state_store: &StateStore,
-) -> Result<AppServerRunResult> {
-	let mut recorder = RunRecorder::new(state_store, &request.run_id);
-	let mut client = AppServerClient::spawn(&request.listen)?;
-	let initialize_response = client.initialize(request.dynamic_tool_handler.is_some())?;
-	client.mark_initialized()?;
-
-	flush_pending_messages(&mut client, &mut recorder, None)?;
-
-	let thread_response = client.start_thread(ThreadStartRequest {
-		cwd: Some(request.cwd.clone()),
-		dynamic_tools: request.dynamic_tool_handler.map(|handler| handler.tool_specs()),
-		approval_policy: Some(request.approval_policy.clone()),
-		developer_instructions: Some(request.developer_instructions.clone()),
-		model: request.model.clone(),
-		personality: request.personality.clone(),
-		sandbox: Some(request.sandbox.clone()),
-		service_tier: request.service_tier.clone().map(Value::String),
-		..ThreadStartRequest::default()
-	})?;
-	let thread_id = thread_response.thread.id.clone();
-	state_store.update_run_thread(&request.run_id, &thread_id)?;
-	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
-
-	let turn_response = client.start_turn(TurnStartRequest {
-		thread_id: thread_id.clone(),
-		input: vec![UserInput::Text { text: request.user_input.clone() }],
-		..TurnStartRequest::default()
-	})?;
-	let turn_id = turn_response.turn.id.clone();
-	state_store.record_run_attempt(
-		&request.run_id,
-		&request.issue_id,
-		request.attempt_number,
-		"running",
-	)?;
-	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
-
-	let run_outcome = wait_for_turn_completion(
-		&mut client,
-		&mut recorder,
-		&thread_id,
-		&turn_id,
-		request.timeout,
-		request.dynamic_tool_handler,
-	)?;
-	state_store.record_run_attempt(
-		&request.run_id,
-		&request.issue_id,
-		request.attempt_number,
-		"succeeded",
-	)?;
-
-	Ok(AppServerRunResult {
-		user_agent: initialize_response.user_agent,
-		thread_id,
-		turn_id,
-		event_count: state_store.event_count(&request.run_id)?,
-		final_output: run_outcome.final_output,
-	})
 }
 
 struct AppServerClient {
@@ -238,233 +122,11 @@ impl<'a> RunRecorder<'a> {
 
 	fn record(&mut self, event_type: &str, payload: &str) -> Result<()> {
 		self.state_store.append_event(self.run_id, self.next_sequence, event_type, payload)?;
+
 		self.next_sequence += 1;
 
 		Ok(())
 	}
-}
-
-fn flush_pending_messages(
-	client: &mut AppServerClient,
-	recorder: &mut RunRecorder<'_>,
-	target_thread_id: Option<&str>,
-) -> Result<()> {
-	for message in client.drain_pending() {
-		if targets_thread(&message, target_thread_id) {
-			recorder.record(message_type(&message), &message.raw)?;
-		}
-	}
-
-	Ok(())
-}
-
-fn wait_for_turn_completion(
-	client: &mut AppServerClient,
-	recorder: &mut RunRecorder<'_>,
-	target_thread_id: &str,
-	target_turn_id: &str,
-	timeout: Duration,
-	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
-) -> Result<RunOutcome> {
-	let deadline = Instant::now() + timeout;
-	let mut final_output = String::new();
-
-	loop {
-		let now = Instant::now();
-		if now >= deadline {
-			eyre::bail!(
-				"Timed out while waiting for turn `{target_turn_id}` on thread `{target_thread_id}`."
-			);
-		}
-
-		let wire_message = client.recv(Some(deadline - now))?;
-		if !targets_thread(&wire_message, Some(target_thread_id)) {
-			tracing::debug!(raw = %wire_message.raw, "Ignoring app-server message for another thread.");
-			continue;
-		}
-
-		recorder.record(message_type(&wire_message), &wire_message.raw)?;
-
-		match &wire_message.message {
-			JsonRpcMessage::Notification(notification) => match notification.method.as_str() {
-				"thread/status/changed" => {
-					let payload: ThreadStatusChangedNotification =
-						serde_json::from_value(notification.params.clone())?;
-					if payload.status.kind == "systemError" {
-						eyre::bail!("Thread `{}` entered `systemError` status.", payload.thread_id);
-					}
-					if payload.status.kind == "active"
-						&& payload
-							.status
-							.active_flags
-							.iter()
-							.any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")
-					{
-						eyre::bail!(
-							"Thread `{}` requested interactive input, which is unsupported for Maestro.",
-							payload.thread_id
-						);
-					}
-				},
-				"item/agentMessage/delta" => {
-					let payload: AgentMessageDeltaNotification =
-						serde_json::from_value(notification.params.clone())?;
-					final_output.push_str(&payload.delta);
-				},
-				"item/completed" => {
-					let payload: ItemCompletedNotification =
-						serde_json::from_value(notification.params.clone())?;
-					if payload.item.kind == "agentMessage"
-						&& let Some(text) = payload.item.text
-					{
-						final_output = text;
-					}
-				},
-				"turn/completed" => {
-					let payload: TurnCompletedNotification =
-						serde_json::from_value(notification.params.clone())?;
-					if payload.turn.id != target_turn_id {
-						continue;
-					}
-
-					if payload.turn.status == "completed" {
-						return Ok(RunOutcome { final_output });
-					}
-
-					let error_message = payload
-						.turn
-						.error
-						.as_ref()
-						.map(|error| error.message.as_str())
-						.unwrap_or("turn completed without an explicit error payload");
-					eyre::bail!(
-						"Turn `{}` ended with status `{}`: {}",
-						payload.turn.id,
-						payload.turn.status,
-						error_message
-					);
-				},
-				_ => {},
-			},
-			JsonRpcMessage::Request(request) => {
-				if request.method == "item/tool/call" {
-					let response = handle_dynamic_tool_call(
-						dynamic_tool_handler,
-						request,
-						target_thread_id,
-						target_turn_id,
-					);
-					client.respond(&request.id, &response)?;
-					recorder
-						.record("item/tool/call/response", &serde_json::to_string(&response)?)?;
-					continue;
-				}
-
-				eyre::bail!(
-					"Received unexpected server request `{}` during non-interactive execution.",
-					request.method
-				);
-			},
-			JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {
-				eyre::bail!(
-					"Received an unexpected JSON-RPC response while waiting for turn completion."
-				);
-			},
-		}
-	}
-}
-
-fn handle_dynamic_tool_call(
-	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
-	request: &crate::agent::json_rpc::JsonRpcRequest,
-	target_thread_id: &str,
-	target_turn_id: &str,
-) -> DynamicToolCallResponse {
-	let payload = match serde_json::from_value::<DynamicToolCallParams>(request.params.clone()) {
-		Ok(payload) => payload,
-		Err(error) => {
-			return DynamicToolCallResponse {
-				content_items: vec![
-					crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-						text: format!("Invalid `item/tool/call` payload: {error}"),
-					},
-				],
-				success: false,
-			};
-		},
-	};
-	if payload.thread_id != target_thread_id {
-		return DynamicToolCallResponse {
-			content_items: vec![
-				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-					text: format!(
-						"Dynamic tool call targeted thread `{}`, but the active thread is `{target_thread_id}`.",
-						payload.thread_id
-					),
-				},
-			],
-			success: false,
-		};
-	}
-	if payload.turn_id != target_turn_id {
-		return DynamicToolCallResponse {
-			content_items: vec![
-				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-					text: format!(
-						"Dynamic tool call targeted turn `{}`, but the active turn is `{target_turn_id}`.",
-						payload.turn_id
-					),
-				},
-			],
-			success: false,
-		};
-	}
-	let Some(dynamic_tool_handler) = dynamic_tool_handler else {
-		return DynamicToolCallResponse {
-			content_items: vec![
-				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-					text: String::from("Dynamic tool bridge is unavailable for this run attempt."),
-				},
-			],
-			success: false,
-		};
-	};
-
-	dynamic_tool_handler.handle_call(&payload.tool, payload.arguments)
-}
-
-fn message_type(message: &WireMessage) -> &str {
-	match &message.message {
-		JsonRpcMessage::Notification(notification) => notification.method.as_str(),
-		JsonRpcMessage::Request(request) => request.method.as_str(),
-		JsonRpcMessage::Response(_) => "json-rpc/response",
-		JsonRpcMessage::Error(_) => "json-rpc/error",
-	}
-}
-
-fn targets_thread(message: &WireMessage, target_thread_id: Option<&str>) -> bool {
-	let Some(target_thread_id) = target_thread_id else {
-		return true;
-	};
-
-	match &message.message {
-		JsonRpcMessage::Notification(notification) => thread_id_from_notification(notification)
-			.is_none_or(|thread_id| thread_id == target_thread_id),
-		JsonRpcMessage::Request(request) => thread_id_from_value(&request.params)
-			.is_none_or(|thread_id| thread_id == target_thread_id),
-		JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => true,
-	}
-}
-
-fn thread_id_from_notification(notification: &JsonRpcNotification) -> Option<&str> {
-	thread_id_from_value(&notification.params)
-}
-
-fn thread_id_from_value(value: &Value) -> Option<&str> {
-	value
-		.get("threadId")
-		.and_then(Value::as_str)
-		.or_else(|| value.get("thread").and_then(|thread| thread.get("id")).and_then(Value::as_str))
 }
 
 #[derive(Debug, Serialize)]
@@ -560,13 +222,6 @@ struct TurnStartRequest {
 	thread_id: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-enum UserInput {
-	#[serde(rename = "text")]
-	Text { text: String },
-}
-
 #[derive(Debug, Deserialize)]
 struct TurnStartResponse {
 	turn: TurnStatusPayload,
@@ -656,6 +311,7 @@ impl DynamicToolHandler for ProbeDynamicToolHandler {
 				"Unexpected probe tool `{tool_name}`."
 			));
 		}
+
 		let Some(text) = arguments.get("text").and_then(Value::as_str) else {
 			return DynamicToolCallResponse::failure(String::from(
 				"`echo_probe` requires a string `text` argument.",
@@ -666,12 +322,381 @@ impl DynamicToolHandler for ProbeDynamicToolHandler {
 	}
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum UserInput {
+	#[serde(rename = "text")]
+	Text { text: String },
+}
+
+pub(crate) fn execute_app_server_run(
+	request: &AppServerRunRequest<'_>,
+	state_store: &StateStore,
+) -> Result<AppServerRunResult> {
+	state_store.record_run_attempt(
+		&request.run_id,
+		&request.issue_id,
+		request.attempt_number,
+		"starting",
+	)?;
+
+	let result = execute_app_server_run_inner(request, state_store);
+
+	if result.is_err() {
+		state_store.record_run_attempt(
+			&request.run_id,
+			&request.issue_id,
+			request.attempt_number,
+			"failed",
+		)?;
+	}
+
+	result
+}
+
+pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
+	let state_store = StateStore::open_in_memory()?;
+	let probe_tool_handler = ProbeDynamicToolHandler;
+	let result = execute_app_server_run(
+		&AppServerRunRequest {
+			run_id: PROBE_RUN_ID.to_owned(),
+			issue_id: PROBE_ISSUE_ID.to_owned(),
+			attempt_number: 1,
+			listen: listen.to_owned(),
+			cwd: env::current_dir()?.display().to_string(),
+			approval_policy: String::from("never"),
+			sandbox: String::from("workspace-write"),
+			developer_instructions: PROBE_DEVELOPER_INSTRUCTIONS.to_owned(),
+			user_input: PROBE_USER_INPUT.to_owned(),
+			model: None,
+			personality: None,
+			service_tier: None,
+			timeout: PROBE_TIMEOUT,
+			dynamic_tool_handler: Some(&probe_tool_handler),
+		},
+		&state_store,
+	)?;
+
+	if result.final_output.trim() != PROBE_EXPECTED_OUTPUT {
+		eyre::bail!(
+			"Protocol probe completed, but the final output was `{}` instead of `{PROBE_EXPECTED_OUTPUT}`.",
+			result.final_output.trim()
+		);
+	}
+
+	Ok(result)
+}
+
+fn execute_app_server_run_inner(
+	request: &AppServerRunRequest<'_>,
+	state_store: &StateStore,
+) -> Result<AppServerRunResult> {
+	let mut recorder = RunRecorder::new(state_store, &request.run_id);
+	let mut client = AppServerClient::spawn(&request.listen)?;
+	let initialize_response = client.initialize(request.dynamic_tool_handler.is_some())?;
+
+	client.mark_initialized()?;
+
+	flush_pending_messages(&mut client, &mut recorder, None)?;
+
+	let thread_response = client.start_thread(ThreadStartRequest {
+		cwd: Some(request.cwd.clone()),
+		dynamic_tools: request.dynamic_tool_handler.map(|handler| handler.tool_specs()),
+		approval_policy: Some(request.approval_policy.clone()),
+		developer_instructions: Some(request.developer_instructions.clone()),
+		model: request.model.clone(),
+		personality: request.personality.clone(),
+		sandbox: Some(request.sandbox.clone()),
+		service_tier: request.service_tier.clone().map(Value::String),
+		..ThreadStartRequest::default()
+	})?;
+	let thread_id = thread_response.thread.id.clone();
+
+	state_store.update_run_thread(&request.run_id, &thread_id)?;
+
+	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
+
+	let turn_response = client.start_turn(TurnStartRequest {
+		thread_id: thread_id.clone(),
+		input: vec![UserInput::Text { text: request.user_input.clone() }],
+		..TurnStartRequest::default()
+	})?;
+	let turn_id = turn_response.turn.id.clone();
+
+	state_store.record_run_attempt(
+		&request.run_id,
+		&request.issue_id,
+		request.attempt_number,
+		"running",
+	)?;
+
+	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
+
+	let run_outcome = wait_for_turn_completion(
+		&mut client,
+		&mut recorder,
+		&thread_id,
+		&turn_id,
+		request.timeout,
+		request.dynamic_tool_handler,
+	)?;
+
+	state_store.record_run_attempt(
+		&request.run_id,
+		&request.issue_id,
+		request.attempt_number,
+		"succeeded",
+	)?;
+
+	Ok(AppServerRunResult {
+		user_agent: initialize_response.user_agent,
+		thread_id,
+		turn_id,
+		event_count: state_store.event_count(&request.run_id)?,
+		final_output: run_outcome.final_output,
+	})
+}
+
+fn flush_pending_messages(
+	client: &mut AppServerClient,
+	recorder: &mut RunRecorder<'_>,
+	target_thread_id: Option<&str>,
+) -> Result<()> {
+	for message in client.drain_pending() {
+		if targets_thread(&message, target_thread_id) {
+			recorder.record(message_type(&message), &message.raw)?;
+		}
+	}
+
+	Ok(())
+}
+
+fn wait_for_turn_completion(
+	client: &mut AppServerClient,
+	recorder: &mut RunRecorder<'_>,
+	target_thread_id: &str,
+	target_turn_id: &str,
+	timeout: Duration,
+	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
+) -> Result<RunOutcome> {
+	let deadline = Instant::now() + timeout;
+	let mut final_output = String::new();
+
+	loop {
+		let now = Instant::now();
+
+		if now >= deadline {
+			eyre::bail!(
+				"Timed out while waiting for turn `{target_turn_id}` on thread `{target_thread_id}`."
+			);
+		}
+
+		let wire_message = client.recv(Some(deadline - now))?;
+
+		if !targets_thread(&wire_message, Some(target_thread_id)) {
+			tracing::debug!(raw = %wire_message.raw, "Ignoring app-server message for another thread.");
+
+			continue;
+		}
+
+		recorder.record(message_type(&wire_message), &wire_message.raw)?;
+
+		match &wire_message.message {
+			JsonRpcMessage::Notification(notification) => match notification.method.as_str() {
+				"thread/status/changed" => {
+					let payload: ThreadStatusChangedNotification =
+						serde_json::from_value(notification.params.clone())?;
+
+					if payload.status.kind == "systemError" {
+						eyre::bail!("Thread `{}` entered `systemError` status.", payload.thread_id);
+					}
+					if payload.status.kind == "active"
+						&& payload
+							.status
+							.active_flags
+							.iter()
+							.any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")
+					{
+						eyre::bail!(
+							"Thread `{}` requested interactive input, which is unsupported for Maestro.",
+							payload.thread_id
+						);
+					}
+				},
+				"item/agentMessage/delta" => {
+					let payload: AgentMessageDeltaNotification =
+						serde_json::from_value(notification.params.clone())?;
+
+					final_output.push_str(&payload.delta);
+				},
+				"item/completed" => {
+					let payload: ItemCompletedNotification =
+						serde_json::from_value(notification.params.clone())?;
+
+					if payload.item.kind == "agentMessage"
+						&& let Some(text) = payload.item.text
+					{
+						final_output = text;
+					}
+				},
+				"turn/completed" => {
+					let payload: TurnCompletedNotification =
+						serde_json::from_value(notification.params.clone())?;
+
+					if payload.turn.id != target_turn_id {
+						continue;
+					}
+					if payload.turn.status == "completed" {
+						return Ok(RunOutcome { final_output });
+					}
+
+					let error_message = payload
+						.turn
+						.error
+						.as_ref()
+						.map(|error| error.message.as_str())
+						.unwrap_or("turn completed without an explicit error payload");
+
+					eyre::bail!(
+						"Turn `{}` ended with status `{}`: {}",
+						payload.turn.id,
+						payload.turn.status,
+						error_message
+					);
+				},
+				_ => {},
+			},
+			JsonRpcMessage::Request(request) => {
+				if request.method == "item/tool/call" {
+					let response = handle_dynamic_tool_call(
+						dynamic_tool_handler,
+						request,
+						target_thread_id,
+						target_turn_id,
+					);
+
+					client.respond(&request.id, &response)?;
+					recorder
+						.record("item/tool/call/response", &serde_json::to_string(&response)?)?;
+
+					continue;
+				}
+
+				eyre::bail!(
+					"Received unexpected server request `{}` during non-interactive execution.",
+					request.method
+				);
+			},
+			JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {
+				eyre::bail!(
+					"Received an unexpected JSON-RPC response while waiting for turn completion."
+				);
+			},
+		}
+	}
+}
+
+fn handle_dynamic_tool_call(
+	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
+	request: &JsonRpcRequest,
+	target_thread_id: &str,
+	target_turn_id: &str,
+) -> DynamicToolCallResponse {
+	let payload = match serde_json::from_value::<DynamicToolCallParams>(request.params.clone()) {
+		Ok(payload) => payload,
+		Err(error) => {
+			return DynamicToolCallResponse {
+				content_items: vec![
+					crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
+						text: format!("Invalid `item/tool/call` payload: {error}"),
+					},
+				],
+				success: false,
+			};
+		},
+	};
+
+	if payload.thread_id != target_thread_id {
+		return DynamicToolCallResponse {
+			content_items: vec![
+				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
+					text: format!(
+						"Dynamic tool call targeted thread `{}`, but the active thread is `{target_thread_id}`.",
+						payload.thread_id
+					),
+				},
+			],
+			success: false,
+		};
+	}
+	if payload.turn_id != target_turn_id {
+		return DynamicToolCallResponse {
+			content_items: vec![
+				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
+					text: format!(
+						"Dynamic tool call targeted turn `{}`, but the active turn is `{target_turn_id}`.",
+						payload.turn_id
+					),
+				},
+			],
+			success: false,
+		};
+	}
+
+	let Some(dynamic_tool_handler) = dynamic_tool_handler else {
+		return DynamicToolCallResponse {
+			content_items: vec![
+				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
+					text: String::from("Dynamic tool bridge is unavailable for this run attempt."),
+				},
+			],
+			success: false,
+		};
+	};
+
+	dynamic_tool_handler.handle_call(&payload.tool, payload.arguments)
+}
+
+fn message_type(message: &WireMessage) -> &str {
+	match &message.message {
+		JsonRpcMessage::Notification(notification) => notification.method.as_str(),
+		JsonRpcMessage::Request(request) => request.method.as_str(),
+		JsonRpcMessage::Response(_) => "json-rpc/response",
+		JsonRpcMessage::Error(_) => "json-rpc/error",
+	}
+}
+
+fn targets_thread(message: &WireMessage, target_thread_id: Option<&str>) -> bool {
+	let Some(target_thread_id) = target_thread_id else {
+		return true;
+	};
+
+	match &message.message {
+		JsonRpcMessage::Notification(notification) => thread_id_from_notification(notification)
+			.is_none_or(|thread_id| thread_id == target_thread_id),
+		JsonRpcMessage::Request(request) => thread_id_from_value(&request.params)
+			.is_none_or(|thread_id| thread_id == target_thread_id),
+		JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => true,
+	}
+}
+
+fn thread_id_from_notification(notification: &JsonRpcNotification) -> Option<&str> {
+	thread_id_from_value(&notification.params)
+}
+
+fn thread_id_from_value(value: &Value) -> Option<&str> {
+	value
+		.get("threadId")
+		.and_then(Value::as_str)
+		.or_else(|| value.get("thread").and_then(|thread| thread.get("id")).and_then(Value::as_str))
+}
+
 #[cfg(test)]
 mod tests {
-	use serde_json::json;
 
 	use crate::agent::{
-		app_server::{AppServerRunResult, targets_thread},
+		app_server,
+		app_server::AppServerRunResult,
 		json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
 	};
 
@@ -689,22 +714,22 @@ mod tests {
 	fn matches_thread_id_from_thread_started_notification() {
 		let message = notification_message(
 			"thread/started",
-			json!({
+			serde_json::json!({
 				"thread": {
 					"id": "thread-1",
 				}
 			}),
 		);
 
-		assert!(targets_thread(&message, Some("thread-1")));
-		assert!(!targets_thread(&message, Some("thread-2")));
+		assert!(app_server::targets_thread(&message, Some("thread-1")));
+		assert!(!app_server::targets_thread(&message, Some("thread-2")));
 	}
 
 	#[test]
 	fn matches_thread_id_from_thread_id_field() {
 		let message = notification_message(
 			"turn/completed",
-			json!({
+			serde_json::json!({
 				"threadId": "thread-1",
 				"turn": {
 					"id": "turn-1",
@@ -714,8 +739,8 @@ mod tests {
 			}),
 		);
 
-		assert!(targets_thread(&message, Some("thread-1")));
-		assert!(!targets_thread(&message, Some("thread-2")));
+		assert!(app_server::targets_thread(&message, Some("thread-1")));
+		assert!(!app_server::targets_thread(&message, Some("thread-2")));
 	}
 
 	#[test]

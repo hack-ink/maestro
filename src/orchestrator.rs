@@ -1,17 +1,19 @@
 use std::{
 	collections::{HashMap, HashSet},
-	fs,
+	env, fs,
 	path::{Path, PathBuf},
 	process::Command,
+	slice,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
+use color_eyre::Report;
 use directories::ProjectDirs;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
-	agent::{AppServerRunRequest, execute_app_server_run},
-	config::{ProjectConfig, ServiceConfig, default_config_path},
+	agent::{self, AppServerRunRequest},
+	config::{self, ProjectConfig, ServiceConfig},
 	prelude::{Result, eyre},
 	state::{StateStore, WorktreeMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
@@ -19,12 +21,32 @@ use crate::{
 	workspace::{WorkspaceManager, WorkspaceSpec},
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunSummary {
+	project_id: String,
+	issue_identifier: String,
+	branch_name: String,
+	worktree_path: PathBuf,
+	attempt_number: i64,
+	run_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct IssueRunPlan {
+	issue: TrackerIssue,
+	workspace: WorkspaceSpec,
+	attempt_number: i64,
+	run_id: String,
+}
+
 pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
 			println!("dry run: no maestro config found; nothing to execute.");
+
 			return Ok(());
 		}
+
 		eyre::bail!("No maestro config found. Pass --config or create maestro.toml.");
 	};
 	let config = ServiceConfig::from_path(&config_path)?;
@@ -37,9 +59,12 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> 
 	for project in config.projects() {
 		let workflow_path = project.repo_root().join(project.workflow_path());
 		let workflow = WorkflowDocument::from_path(&workflow_path)?;
+
 		validate_project_contract(project, &workflow)?;
-		let api_token = std::env::var(project.tracker().api_token_env())?;
+
+		let api_token = env::var(project.tracker().api_token_env())?;
 		let tracker = LinearClient::new(api_token)?;
+
 		if let Some(summary) =
 			run_project_once(&tracker, project, &workflow, &state_store, dry_run)?
 		{
@@ -61,6 +86,7 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> 
 					summary.worktree_path.display()
 				);
 			}
+
 			return Ok(());
 		}
 	}
@@ -70,22 +96,29 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> 
 	Ok(())
 }
 
-fn run_project_once<T: IssueTracker>(
+fn run_project_once<T>(
 	tracker: &T,
 	project: &ProjectConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	dry_run: bool,
-) -> Result<Option<RunSummary>> {
+) -> Result<Option<RunSummary>>
+where
+	T: IssueTracker,
+{
 	let project_slug = project.tracker().project_slug();
+
 	tracker
 		.get_project_by_slug(project_slug)?
 		.ok_or_else(|| eyre::eyre!("Linear project slug `{project_slug}` was not found."))?;
+
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
+
 	if !dry_run {
 		reconcile_project_state(tracker, project, workflow, state_store, &workspace_manager)?;
 	}
+
 	let issues = tracker.list_project_issues(project_slug)?;
 	let Some(issue) = issues
 		.into_iter()
@@ -93,16 +126,19 @@ fn run_project_once<T: IssueTracker>(
 	else {
 		return Ok(None);
 	};
-	let mut refreshed_issues = tracker.refresh_issues(std::slice::from_ref(&issue.id))?;
+	let mut refreshed_issues = tracker.refresh_issues(slice::from_ref(&issue.id))?;
 	let Some(issue) = refreshed_issues.pop() else {
 		return Ok(None);
 	};
+
 	if !is_issue_eligible(&issue, workflow, state_store)? {
 		return Ok(None);
 	}
+
 	let attempt_number = state_store.next_attempt_number(&issue.id)?;
 	let run_id = build_run_id(&issue.identifier, attempt_number)?;
 	let workspace = workspace_manager.ensure_workspace(&issue.identifier, dry_run)?;
+
 	if !dry_run {
 		state_store.upsert_worktree(
 			project.id(),
@@ -111,15 +147,19 @@ fn run_project_once<T: IssueTracker>(
 			&workspace.path.display().to_string(),
 		)?;
 	}
+
 	let Some(issue) = refresh_issue(tracker, &issue.id)? else {
 		return Ok(None);
 	};
+
 	if !is_issue_eligible(&issue, workflow, state_store)? {
 		if !dry_run && is_terminal_issue(&issue, workflow) {
 			cleanup_terminal_worktree(state_store, &workspace_manager, &issue.id, &workspace.path)?;
 		}
+
 		return Ok(None);
 	}
+
 	let issue_run = IssueRunPlan { issue, workspace, attempt_number, run_id };
 
 	if dry_run {
@@ -138,20 +178,25 @@ fn run_project_once<T: IssueTracker>(
 	Ok(Some(summary))
 }
 
-fn reconcile_project_state<T: IssueTracker>(
+fn reconcile_project_state<T>(
 	tracker: &T,
 	project: &ProjectConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
-) -> Result<()> {
+) -> Result<()>
+where
+	T: IssueTracker,
+{
 	let leases = state_store.list_leases(project.id())?;
 	let worktrees = state_store.list_worktrees(project.id())?;
+
 	if leases.is_empty() && worktrees.is_empty() {
 		return Ok(());
 	}
 
 	let mut issue_ids = HashSet::new();
+
 	for lease in &leases {
 		issue_ids.insert(lease.issue_id().to_owned());
 	}
@@ -170,10 +215,11 @@ fn reconcile_project_state<T: IssueTracker>(
 			Some(issue) if is_terminal_issue(issue, workflow) => "terminated",
 			Some(_) | None => "interrupted",
 		};
+
 		mark_run_attempt_if_active(state_store, lease.run_id(), reconciled_status)?;
+
 		state_store.clear_lease(lease.issue_id())?;
 	}
-
 	for mapping in &worktrees {
 		if issues_by_id
 			.get(mapping.issue_id())
@@ -186,13 +232,16 @@ fn reconcile_project_state<T: IssueTracker>(
 	Ok(())
 }
 
-fn execute_issue_run<T: IssueTracker>(
+fn execute_issue_run<T>(
 	tracker: &T,
 	project: &ProjectConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	issue_run: IssueRunPlan,
-) -> Result<RunSummary> {
+) -> Result<RunSummary>
+where
+	T: IssueTracker,
+{
 	state_store.upsert_lease(project.id(), &issue_run.issue.id, &issue_run.run_id)?;
 	state_store.upsert_worktree(
 		project.id(),
@@ -209,18 +258,22 @@ fn execute_issue_run<T: IssueTracker>(
 		Ok(summary) => Ok(summary),
 		Err(error) => {
 			handle_failure(tracker, workflow, &issue_run, &error)?;
+
 			Err(error)
 		},
 	}
 }
 
-fn execute_issue_run_inner<T: IssueTracker>(
+fn execute_issue_run_inner<T>(
 	tracker: &T,
 	project: &ProjectConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	issue_run: &IssueRunPlan,
-) -> Result<RunSummary> {
+) -> Result<RunSummary>
+where
+	T: IssueTracker,
+{
 	let transport = project
 		.agent()
 		.transport()
@@ -231,7 +284,7 @@ fn execute_issue_run_inner<T: IssueTracker>(
 	let tracker_tool_bridge =
 		crate::agent::TrackerToolBridge::new(tracker, &issue_run.issue, workflow);
 
-	execute_app_server_run(
+	agent::execute_app_server_run(
 		&AppServerRunRequest {
 			run_id: issue_run.run_id.clone(),
 			issue_id: issue_run.issue.id.clone(),
@@ -250,6 +303,7 @@ fn execute_issue_run_inner<T: IssueTracker>(
 		},
 		state_store,
 	)?;
+
 	run_validation_commands(
 		workflow.frontmatter().execution().validation_commands(),
 		&issue_run.workspace.path,
@@ -265,13 +319,17 @@ fn execute_issue_run_inner<T: IssueTracker>(
 	})
 }
 
-fn handle_failure<T: IssueTracker>(
+fn handle_failure<T>(
 	tracker: &T,
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
-	error: &color_eyre::Report,
-) -> Result<()> {
+	error: &Report,
+) -> Result<()>
+where
+	T: IssueTracker,
+{
 	let max_attempts = i64::from(workflow.frontmatter().execution().max_attempts());
+
 	if issue_run.attempt_number < max_attempts {
 		tracker.create_comment(
 			&issue_run.issue.id,
@@ -283,6 +341,7 @@ fn handle_failure<T: IssueTracker>(
 				error,
 			),
 		)?;
+
 		return Ok(());
 	}
 
@@ -296,6 +355,7 @@ fn handle_failure<T: IssueTracker>(
 				issue_run.issue.identifier
 			)
 		})?;
+
 	tracker.update_issue_state(&issue_run.issue.id, failure_state_id)?;
 
 	if let Some(label_id) =
@@ -303,6 +363,7 @@ fn handle_failure<T: IssueTracker>(
 	{
 		let mut label_ids =
 			issue_run.issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
+
 		if !label_ids.iter().any(|existing| existing == label_id) {
 			label_ids.push(label_id.to_owned());
 			tracker.update_issue_labels(&issue_run.issue.id, &label_ids)?;
@@ -346,6 +407,7 @@ fn is_issue_eligible(
 	state_store: &StateStore,
 ) -> Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
+
 	if tracker_policy.terminal_states().iter().any(|state| state == &issue.state.name) {
 		return Ok(false);
 	}
@@ -359,7 +421,10 @@ fn is_issue_eligible(
 	Ok(state_store.lease_for_issue(&issue.id)?.is_none())
 }
 
-fn refresh_issue<T: IssueTracker>(tracker: &T, issue_id: &str) -> Result<Option<TrackerIssue>> {
+fn refresh_issue<T>(tracker: &T, issue_id: &str) -> Result<Option<TrackerIssue>>
+where
+	T: IssueTracker,
+{
 	let issue_ids = [issue_id.to_owned()];
 	let mut refreshed_issues = tracker.refresh_issues(&issue_ids)?;
 
@@ -383,6 +448,7 @@ fn mark_run_attempt_if_active(
 	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
 		return Ok(());
 	};
+
 	if matches!(run_attempt.status(), "starting" | "running") {
 		state_store.update_run_status(run_id, reconciled_status)?;
 	}
@@ -423,12 +489,14 @@ fn build_developer_instructions(
 	for relative_path in workflow.frontmatter().context().read_first() {
 		let absolute_path = project.repo_root().join(relative_path);
 		let contents = fs::read_to_string(&absolute_path)?;
+
 		sections.push(format!("File: {relative_path}\n{contents}"));
 	}
 
 	if !workflow.body().is_empty() {
 		sections.push(format!("WORKFLOW.md\n{}", workflow.body()));
 	}
+
 	sections.push(format!(
 		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `issue.transition` to move the issue to `{in_progress}` and add a brief `issue.comment` that you started work on run `{run_id}` attempt `{attempt}`.\n- When implementation and repo validation are complete, call `issue.transition` to move the issue to `{success}` and add a brief `issue.comment` summarizing the result.\n- If you determine the issue needs human attention, add label `{needs_attention}` and explain why in a comment.\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
@@ -467,8 +535,10 @@ fn build_user_input(
 fn run_validation_commands(commands: &[String], cwd: &Path) -> Result<()> {
 	for command in commands {
 		let output = Command::new("zsh").arg("-lc").arg(command).current_dir(cwd).output()?;
+
 		if !output.status.success() {
 			let stderr = String::from_utf8_lossy(&output.stderr);
+
 			eyre::bail!(
 				"Validation command `{}` failed in `{}`: {}",
 				command,
@@ -486,7 +556,7 @@ fn format_retry_comment(
 	attempt_number: i64,
 	max_attempts: i64,
 	workspace: &WorkspaceSpec,
-	error: &color_eyre::Report,
+	error: &Report,
 ) -> String {
 	format!(
 		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- worktree_path: `{worktree}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
@@ -500,7 +570,7 @@ fn format_terminal_failure_comment(
 	run_id: &str,
 	attempt_number: i64,
 	workspace: &WorkspaceSpec,
-	error: &color_eyre::Report,
+	error: &Report,
 ) -> String {
 	format!(
 		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- worktree_path: `{worktree}`\n- error_class: `retry_budget_exhausted`\n- next_action: `inspect the worktree, resolve the issue manually, then move the issue back to a startable state if another automated run is desired`\n- error: `{error}`",
@@ -526,11 +596,13 @@ fn resolve_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> 
 	}
 
 	let repo_local = PathBuf::from("maestro.toml");
+
 	if repo_local.exists() {
 		return Ok(Some(repo_local));
 	}
 
-	let default_path = default_config_path()?;
+	let default_path = config::default_config_path()?;
+
 	if default_path.exists() {
 		return Ok(Some(default_path));
 	}
@@ -545,24 +617,6 @@ fn default_state_store_path() -> Result<PathBuf> {
 	Ok(project_dirs.data_dir().join("maestro.sqlite3"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RunSummary {
-	project_id: String,
-	issue_identifier: String,
-	branch_name: String,
-	worktree_path: PathBuf,
-	attempt_number: i64,
-	run_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct IssueRunPlan {
-	issue: TrackerIssue,
-	workspace: WorkspaceSpec,
-	attempt_number: i64,
-	run_id: String,
-}
-
 #[cfg(test)]
 mod tests {
 	use std::{cell::RefCell, fs, path::Path, process::Command};
@@ -571,7 +625,7 @@ mod tests {
 
 	use crate::{
 		config::ServiceConfig,
-		orchestrator::{RunSummary, is_issue_eligible, run_project_once},
+		orchestrator::{self, RunSummary},
 		prelude::Result,
 		state::StateStore,
 		tracker::{
@@ -617,6 +671,7 @@ mod tests {
 		fn refresh_issues(&self, issue_ids: &[String]) -> Result<Vec<TrackerIssue>> {
 			let snapshot = {
 				let mut refresh_snapshots = self.refresh_snapshots.borrow_mut();
+
 				if refresh_snapshots.is_empty() {
 					self.listed_issues.clone()
 				} else {
@@ -641,6 +696,7 @@ mod tests {
 
 		fn create_comment(&self, _issue_id: &str, body: &str) -> Result<()> {
 			self.comments.borrow_mut().push(body.to_owned());
+
 			Ok(())
 		}
 	}
@@ -694,11 +750,13 @@ mod tests {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let repo_root = temp_dir.path().join("target-repo");
 		let workspace_root = temp_dir.path().join("workspaces");
+
 		fs::create_dir_all(&repo_root).expect("repo root should exist");
 		fs::create_dir_all(&workspace_root).expect("workspace root should exist");
 		fs::write(repo_root.join("AGENTS.md"), "Read me first.\n").expect("AGENTS should exist");
 		fs::write(repo_root.join("WORKFLOW.md"), sample_workflow_markdown())
 			.expect("workflow should exist");
+
 		assert!(
 			Command::new("git")
 				.arg("init")
@@ -798,21 +856,22 @@ Follow the repository policy.
 		let wrong_state_issue = sample_issue("In Progress", &[]);
 
 		assert!(
-			is_issue_eligible(&eligible_issue, &workflow, &state_store)
+			orchestrator::is_issue_eligible(&eligible_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
 		);
 		assert!(
-			!is_issue_eligible(&opted_out_issue, &workflow, &state_store)
+			!orchestrator::is_issue_eligible(&opted_out_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
 		);
 		assert!(
-			!is_issue_eligible(&wrong_state_issue, &workflow, &state_store)
+			!orchestrator::is_issue_eligible(&wrong_state_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
 		);
 
 		state_store.upsert_lease("pubfi", "issue-1", "run-1").expect("lease should record");
+
 		assert!(
-			!is_issue_eligible(&eligible_issue, &workflow, &state_store)
+			!orchestrator::is_issue_eligible(&eligible_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
 		);
 	}
@@ -822,10 +881,15 @@ Follow the repository policy.
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![sample_issue("Todo", &[])]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let summary =
-			run_project_once(&tracker, &config.projects()[0], &workflow, &state_store, true)
-				.expect("run once should succeed")
-				.expect("one issue should be selected");
+		let summary = orchestrator::run_project_once(
+			&tracker,
+			&config.projects()[0],
+			&workflow,
+			&state_store,
+			true,
+		)
+		.expect("run once should succeed")
+		.expect("one issue should be selected");
 
 		assert_eq!(
 			summary,
@@ -863,9 +927,14 @@ Follow the repository policy.
 			)
 			.expect("worktree mapping should record");
 
-		let summary =
-			run_project_once(&tracker, &config.projects()[0], &workflow, &state_store, false)
-				.expect("reconciliation should succeed");
+		let summary = orchestrator::run_project_once(
+			&tracker,
+			&config.projects()[0],
+			&workflow,
+			&state_store,
+			false,
+		)
+		.expect("reconciliation should succeed");
 
 		assert!(summary.is_none());
 		assert!(
@@ -896,10 +965,14 @@ Follow the repository policy.
 			vec![vec![listed_issue.clone()], vec![sample_issue("In Progress", &[])]],
 		);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-
-		let summary =
-			run_project_once(&tracker, &config.projects()[0], &workflow, &state_store, false)
-				.expect("run once should succeed");
+		let summary = orchestrator::run_project_once(
+			&tracker,
+			&config.projects()[0],
+			&workflow,
+			&state_store,
+			false,
+		)
+		.expect("run once should succeed");
 
 		assert!(summary.is_none());
 		assert!(

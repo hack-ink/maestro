@@ -145,6 +145,7 @@ impl LinearClient {
 		if let Some(errors) = payload.errors {
 			let messages =
 				errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; ");
+
 			eyre::bail!("Linear GraphQL request failed: {messages}");
 		}
 
@@ -175,6 +176,7 @@ impl LinearClient {
 			}
 
 			after = connection.page_info.end_cursor;
+
 			if after.is_none() {
 				eyre::bail!(
 					"Linear pagination reported `hasNextPage = true` without an `endCursor`."

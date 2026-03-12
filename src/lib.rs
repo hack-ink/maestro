@@ -2,19 +2,20 @@
 
 #![deny(clippy::all, missing_docs, unused_crate_dependencies)]
 
-mod agent;
-mod cli;
 /// Service configuration types and loaders.
 pub mod config;
+/// Thin local persistence for active Maestro execution state.
+pub mod state;
+/// Downstream `WORKFLOW.md` parsing and validation.
+pub mod workflow;
+
+mod agent;
+mod cli;
 mod orchestrator;
 mod prelude {
 	pub use color_eyre::{Result, eyre};
 }
-/// Thin local persistence for active Maestro execution state.
-pub mod state;
 mod tracker;
-/// Downstream `WORKFLOW.md` parsing and validation.
-pub mod workflow;
 mod workspace;
 
 use std::{panic, process};

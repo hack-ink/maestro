@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::prelude::{Result, eyre};
 
 /// Top-level service configuration for one or more target repositories.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ServiceConfig {
 	projects: Vec<ProjectConfig>,
 }
@@ -57,16 +57,8 @@ impl ServiceConfig {
 	}
 }
 
-/// Default service configuration path under the platform config directory.
-pub fn default_config_path() -> Result<PathBuf> {
-	let project_dirs = ProjectDirs::from("", "helixbox", env!("CARGO_PKG_NAME"))
-		.ok_or_else(|| eyre::eyre!("Failed to resolve project directories."))?;
-
-	Ok(project_dirs.config_dir().join("maestro.toml"))
-}
-
 /// Per-repository service configuration.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ProjectConfig {
 	id: String,
 	repo_root: PathBuf,
@@ -118,7 +110,7 @@ impl ProjectConfig {
 }
 
 /// Tracker-specific settings for a target project.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ProjectTrackerConfig {
 	#[serde(alias = "project")]
 	project_slug: String,
@@ -148,7 +140,7 @@ impl ProjectTrackerConfig {
 }
 
 /// Project-level agent defaults from service configuration.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 pub struct ProjectAgentConfig {
 	transport: Option<String>,
 	model: Option<String>,
@@ -165,13 +157,21 @@ impl ProjectAgentConfig {
 	}
 }
 
+/// Default service configuration path under the platform config directory.
+pub fn default_config_path() -> Result<PathBuf> {
+	let project_dirs = ProjectDirs::from("", "helixbox", env!("CARGO_PKG_NAME"))
+		.ok_or_else(|| eyre::eyre!("Failed to resolve project directories."))?;
+
+	Ok(project_dirs.config_dir().join("maestro.toml"))
+}
+
 fn default_workflow_path() -> PathBuf {
 	PathBuf::from("WORKFLOW.md")
 }
 
 #[cfg(test)]
 mod tests {
-	use std::fs;
+	use std::{fs, path::Path};
 
 	use tempfile::NamedTempFile;
 
@@ -255,6 +255,4 @@ mod tests {
 
 		assert!(result.is_err());
 	}
-
-	use std::path::Path;
 }

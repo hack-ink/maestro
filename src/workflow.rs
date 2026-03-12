@@ -9,7 +9,7 @@ use crate::prelude::{Result, eyre};
 const FRONTMATTER_DELIMITER: &str = "+++";
 
 /// Parsed downstream workflow document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowDocument {
 	frontmatter: WorkflowFrontmatter,
 	body: String,
@@ -44,7 +44,7 @@ impl WorkflowDocument {
 }
 
 /// Typed TOML frontmatter for a downstream workflow document.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct WorkflowFrontmatter {
 	version: u8,
 	tracker: WorkflowTracker,
@@ -85,14 +85,12 @@ impl WorkflowFrontmatter {
 		if self.version != 1 {
 			eyre::bail!("Unsupported WORKFLOW.md version: {}", self.version);
 		}
-
 		if self.tracker.startable_states.is_empty() {
 			eyre::bail!("`tracker.startable_states` must not be empty.");
 		}
 		if self.tracker.project_slug.trim().is_empty() {
 			eyre::bail!("`tracker.project_slug` must not be empty.");
 		}
-
 		if self.execution.max_attempts == 0 {
 			eyre::bail!("`execution.max_attempts` must be greater than zero.");
 		}
@@ -102,7 +100,7 @@ impl WorkflowFrontmatter {
 }
 
 /// Tracker-facing repository policy.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct WorkflowTracker {
 	provider: TrackerProvider,
 	#[serde(alias = "project")]
@@ -170,7 +168,7 @@ impl WorkflowTracker {
 }
 
 /// Supported tracker providers.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackerProvider {
 	/// Linear issue tracking.
@@ -178,7 +176,7 @@ pub enum TrackerProvider {
 }
 
 /// Repo-local agent defaults.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct WorkflowAgent {
 	#[serde(default = "default_transport")]
 	transport: String,
@@ -189,18 +187,6 @@ pub struct WorkflowAgent {
 	model: Option<String>,
 	personality: Option<String>,
 	service_tier: Option<String>,
-}
-impl Default for WorkflowAgent {
-	fn default() -> Self {
-		Self {
-			transport: default_transport(),
-			sandbox: default_sandbox(),
-			approval_policy: default_approval_policy(),
-			model: None,
-			personality: None,
-			service_tier: None,
-		}
-	}
 }
 impl WorkflowAgent {
 	/// App-server transport.
@@ -234,18 +220,26 @@ impl WorkflowAgent {
 	}
 }
 
+impl Default for WorkflowAgent {
+	fn default() -> Self {
+		Self {
+			transport: default_transport(),
+			sandbox: default_sandbox(),
+			approval_policy: default_approval_policy(),
+			model: None,
+			personality: None,
+			service_tier: None,
+		}
+	}
+}
+
 /// Repo-local execution policy.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct WorkflowExecution {
 	#[serde(default = "default_max_attempts")]
 	max_attempts: u32,
 	#[serde(default)]
 	validation_commands: Vec<String>,
-}
-impl Default for WorkflowExecution {
-	fn default() -> Self {
-		Self { max_attempts: default_max_attempts(), validation_commands: Vec::new() }
-	}
 }
 impl WorkflowExecution {
 	/// Maximum automatic attempts before human attention is required.
@@ -259,21 +253,28 @@ impl WorkflowExecution {
 	}
 }
 
+impl Default for WorkflowExecution {
+	fn default() -> Self {
+		Self { max_attempts: default_max_attempts(), validation_commands: Vec::new() }
+	}
+}
+
 /// Repo-local early-load context.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct WorkflowContext {
 	#[serde(default = "default_read_first")]
 	read_first: Vec<String>,
-}
-impl Default for WorkflowContext {
-	fn default() -> Self {
-		Self { read_first: default_read_first() }
-	}
 }
 impl WorkflowContext {
 	/// Repository-relative files to load before the broader prompt body.
 	pub fn read_first(&self) -> &[String] {
 		&self.read_first
+	}
+}
+
+impl Default for WorkflowContext {
+	fn default() -> Self {
+		Self { read_first: default_read_first() }
 	}
 }
 
@@ -292,9 +293,9 @@ fn split_frontmatter(input: &str) -> Result<(String, String)> {
 	for line in lines {
 		if !found_end && line == FRONTMATTER_DELIMITER {
 			found_end = true;
+
 			continue;
 		}
-
 		if found_end {
 			body_lines.push(line);
 		} else {

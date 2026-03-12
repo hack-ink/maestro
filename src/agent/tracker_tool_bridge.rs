@@ -1,14 +1,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{tracker::TrackerIssue, workflow::WorkflowDocument};
+use crate::{
+	tracker::{IssueTracker, TrackerIssue},
+	workflow::WorkflowDocument,
+};
 
 pub(crate) trait DynamicToolHandler {
 	fn tool_specs(&self) -> Vec<DynamicToolSpec>;
 	fn handle_call(&self, tool_name: &str, arguments: Value) -> DynamicToolCallResponse;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DynamicToolSpec {
 	pub(crate) description: String,
 	#[serde(rename = "inputSchema")]
@@ -18,13 +21,13 @@ pub(crate) struct DynamicToolSpec {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TrackerToolBridge<'a> {
-	tracker: &'a dyn crate::tracker::IssueTracker,
+	tracker: &'a dyn IssueTracker,
 	issue: &'a TrackerIssue,
 	workflow: &'a WorkflowDocument,
 }
 impl<'a> TrackerToolBridge<'a> {
 	pub(crate) fn new(
-		tracker: &'a dyn crate::tracker::IssueTracker,
+		tracker: &'a dyn IssueTracker,
 		issue: &'a TrackerIssue,
 		workflow: &'a WorkflowDocument,
 	) -> Self {
@@ -101,11 +104,13 @@ impl<'a> TrackerToolBridge<'a> {
 				));
 			},
 		};
+
 		if let Err(error) = self.ensure_issue_scope(&parsed.scope) {
 			return DynamicToolCallResponse::failure(error);
 		}
 
 		let allowed_states = self.allowed_transition_states();
+
 		if !allowed_states.iter().any(|state| state == &parsed.state) {
 			return DynamicToolCallResponse::failure(format!(
 				"State `{}` is outside the allowed tracker tool policy.",
@@ -141,9 +146,11 @@ impl<'a> TrackerToolBridge<'a> {
 				));
 			},
 		};
+
 		if let Err(error) = self.ensure_issue_scope(&parsed.scope) {
 			return DynamicToolCallResponse::failure(error);
 		}
+
 		if parsed.body.trim().is_empty() {
 			return DynamicToolCallResponse::failure(String::from(
 				"`issue.comment` requires a non-empty `body`.",
@@ -171,6 +178,7 @@ impl<'a> TrackerToolBridge<'a> {
 				));
 			},
 		};
+
 		if let Err(error) = self.ensure_issue_scope(&parsed.scope) {
 			return DynamicToolCallResponse::failure(error);
 		}
@@ -179,6 +187,7 @@ impl<'a> TrackerToolBridge<'a> {
 			self.workflow.frontmatter().tracker().opt_out_label(),
 			self.workflow.frontmatter().tracker().needs_attention_label(),
 		];
+
 		if !allowed_labels.iter().any(|label| label == &parsed.label) {
 			return DynamicToolCallResponse::failure(format!(
 				"Label `{}` is outside the allowed tracker tool policy.",
@@ -192,15 +201,16 @@ impl<'a> TrackerToolBridge<'a> {
 				parsed.label, self.issue.identifier
 			));
 		};
-
 		let mut label_ids =
 			self.issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
+
 		if label_ids.iter().any(|existing| existing == label_id) {
 			return DynamicToolCallResponse::success(format!(
 				"Issue `{}` already has label `{}`.",
 				self.issue.identifier, parsed.label
 			));
 		}
+
 		label_ids.push(label_id.to_owned());
 
 		match self.tracker.update_issue_labels(&self.issue.id, &label_ids) {
@@ -239,6 +249,7 @@ impl<'a> TrackerToolBridge<'a> {
 	fn allowed_transition_states(&self) -> Vec<&str> {
 		let tracker = self.workflow.frontmatter().tracker();
 		let mut states = tracker.startable_states().iter().map(String::as_str).collect::<Vec<_>>();
+
 		for state in [tracker.in_progress_state(), tracker.success_state(), tracker.failure_state()]
 		{
 			if !states.iter().any(|existing| existing == &state) {
@@ -259,7 +270,7 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DynamicToolCallResponse {
 	#[serde(rename = "contentItems")]
 	pub(crate) content_items: Vec<DynamicToolContentItem>,
@@ -275,7 +286,7 @@ impl DynamicToolCallResponse {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum DynamicToolContentItem {
 	#[serde(rename = "inputText")]
@@ -289,9 +300,8 @@ impl DynamicToolContentItem {
 
 #[derive(Debug, Deserialize)]
 struct ScopeArgs {
-	#[serde(default)]
 	issue_id: Option<String>,
-	#[serde(default)]
+
 	issue_identifier: Option<String>,
 }
 
@@ -360,16 +370,19 @@ mod tests {
 
 		fn update_issue_state(&self, _issue_id: &str, state_id: &str) -> Result<()> {
 			self.state_updates.borrow_mut().push(state_id.to_owned());
+
 			Ok(())
 		}
 
 		fn update_issue_labels(&self, _issue_id: &str, label_ids: &[String]) -> Result<()> {
 			self.label_updates.borrow_mut().push(label_ids.to_vec());
+
 			Ok(())
 		}
 
 		fn create_comment(&self, _issue_id: &str, body: &str) -> Result<()> {
 			self.comments.borrow_mut().push(body.to_owned());
+
 			Ok(())
 		}
 	}
@@ -439,7 +452,6 @@ Use the tracker tools.
 		let issue = sample_issue();
 		let workflow = sample_workflow();
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
-
 		let response = DynamicToolHandler::handle_call(
 			&bridge,
 			"issue.transition",
@@ -456,7 +468,6 @@ Use the tracker tools.
 		let issue = sample_issue();
 		let workflow = sample_workflow();
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
-
 		let response = DynamicToolHandler::handle_call(
 			&bridge,
 			"issue.comment",
@@ -473,7 +484,6 @@ Use the tracker tools.
 		let issue = sample_issue();
 		let workflow = sample_workflow();
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
-
 		let response = DynamicToolHandler::handle_call(
 			&bridge,
 			"issue.label.add",

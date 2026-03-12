@@ -2,7 +2,16 @@ pub(crate) mod linear;
 
 use crate::prelude::Result;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) trait IssueTracker {
+	fn list_project_issues(&self, project_slug: &str) -> Result<Vec<TrackerIssue>>;
+	fn get_project_by_slug(&self, project_slug: &str) -> Result<Option<TrackerProject>>;
+	fn refresh_issues(&self, issue_ids: &[String]) -> Result<Vec<TrackerIssue>>;
+	fn update_issue_state(&self, issue_id: &str, state_id: &str) -> Result<()>;
+	fn update_issue_labels(&self, issue_id: &str, label_ids: &[String]) -> Result<()>;
+	fn create_comment(&self, issue_id: &str, body: &str) -> Result<()>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrackerIssue {
 	pub(crate) id: String,
 	pub(crate) identifier: String,
@@ -34,19 +43,19 @@ impl TrackerIssue {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrackerState {
 	pub(crate) id: String,
 	pub(crate) name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrackerLabel {
 	pub(crate) id: String,
 	pub(crate) name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrackerTeam {
 	pub(crate) id: String,
 	pub(crate) name: String,
@@ -54,18 +63,9 @@ pub(crate) struct TrackerTeam {
 	pub(crate) labels: Vec<TrackerLabel>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TrackerProject {
 	pub(crate) id: String,
 	pub(crate) name: String,
 	pub(crate) slug: String,
-}
-
-pub(crate) trait IssueTracker {
-	fn list_project_issues(&self, project_slug: &str) -> Result<Vec<TrackerIssue>>;
-	fn get_project_by_slug(&self, project_slug: &str) -> Result<Option<TrackerProject>>;
-	fn refresh_issues(&self, issue_ids: &[String]) -> Result<Vec<TrackerIssue>>;
-	fn update_issue_state(&self, issue_id: &str, state_id: &str) -> Result<()>;
-	fn update_issue_labels(&self, issue_id: &str, label_ids: &[String]) -> Result<()>;
-	fn create_comment(&self, issue_id: &str, body: &str) -> Result<()>;
 }

@@ -6,7 +6,7 @@ use std::{
 
 use crate::prelude::{Result, eyre};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkspaceSpec {
 	pub(crate) branch_name: String,
 	pub(crate) issue_identifier: String,
@@ -53,6 +53,7 @@ impl WorkspaceManager {
 		dry_run: bool,
 	) -> Result<WorkspaceSpec> {
 		let spec = self.plan_for_issue(issue_identifier);
+
 		if dry_run || spec.reused_existing {
 			return Ok(spec);
 		}
@@ -60,6 +61,7 @@ impl WorkspaceManager {
 		fs::create_dir_all(&self.workspace_root)?;
 
 		let mut command = Command::new("git");
+
 		command.arg("-C").arg(&self.repo_root).arg("worktree").arg("add");
 
 		if branch_exists(&self.repo_root, &spec.branch_name)? {
@@ -69,8 +71,10 @@ impl WorkspaceManager {
 		}
 
 		let output = command.output()?;
+
 		if !output.status.success() {
 			let stderr = String::from_utf8_lossy(&output.stderr);
+
 			eyre::bail!("Failed to create worktree `{}`: {}", spec.path.display(), stderr.trim());
 		}
 
@@ -90,8 +94,10 @@ impl WorkspaceManager {
 			.arg("--force")
 			.arg(path)
 			.output()?;
+
 		if !output.status.success() {
 			let stderr = String::from_utf8_lossy(&output.stderr);
+
 			eyre::bail!("Failed to remove worktree `{}`: {}", path.display(), stderr.trim());
 		}
 

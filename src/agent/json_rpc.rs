@@ -1,16 +1,15 @@
 use std::{
 	collections::VecDeque,
-	io::{BufRead, BufReader, Write},
+	io::{BufRead as _, BufReader, Write as _},
 	process::{Child, ChildStdin, Command, Stdio},
 	sync::mpsc::{self, Receiver, RecvTimeoutError},
 	thread,
 	time::Duration,
 };
 
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
-
-use color_eyre::eyre::eyre;
+use color_eyre::eyre;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{self, Value};
 
 use crate::prelude::Result;
 
@@ -30,13 +29,16 @@ impl JsonRpcConnection {
 			.stderr(Stdio::piped())
 			.spawn()?;
 		let stdin =
-			child.stdin.take().ok_or_else(|| eyre!("Failed to capture app-server stdin."))?;
-		let stdout =
-			child.stdout.take().ok_or_else(|| eyre!("Failed to capture app-server stdout."))?;
-		let stderr =
-			child.stderr.take().ok_or_else(|| eyre!("Failed to capture app-server stderr."))?;
+			child.stdin.take().ok_or_else(|| eyre::eyre!("Failed to capture app-server stdin."))?;
+		let stdout = child
+			.stdout
+			.take()
+			.ok_or_else(|| eyre::eyre!("Failed to capture app-server stdout."))?;
+		let stderr = child
+			.stderr
+			.take()
+			.ok_or_else(|| eyre::eyre!("Failed to capture app-server stderr."))?;
 		let (stdout_tx, stdout_rx) = mpsc::channel();
-
 		let _stdout_task = thread::spawn(move || {
 			let reader = BufReader::new(stdout);
 
@@ -44,6 +46,7 @@ impl JsonRpcConnection {
 				match line {
 					Ok(line) => {
 						let line: String = line;
+
 						if line.trim().is_empty() {
 							continue;
 						}
@@ -53,12 +56,12 @@ impl JsonRpcConnection {
 					},
 					Err(error) => {
 						tracing::warn!(?error, "Failed to read app-server stdout.");
+
 						break;
 					},
 				}
 			}
 		});
-
 		let _stderr_task = thread::spawn(move || {
 			let reader = BufReader::new(stderr);
 
@@ -66,13 +69,16 @@ impl JsonRpcConnection {
 				match line {
 					Ok(line) => {
 						let line: String = line;
+
 						if line.trim().is_empty() {
 							continue;
 						}
+
 						tracing::warn!(stderr = %line, "codex app-server stderr");
 					},
 					Err(error) => {
 						tracing::warn!(?error, "Failed to read app-server stderr.");
+
 						break;
 					},
 				}
@@ -89,8 +95,10 @@ impl JsonRpcConnection {
 	{
 		let request_id = self.next_request_id;
 		let expected_id = Value::from(request_id);
+
 		self.next_request_id += 1;
-		self.send_value(&json!({
+
+		self.send_value(&serde_json::json!({
 			"id": request_id,
 			"method": method,
 			"params": params,
@@ -105,20 +113,20 @@ impl JsonRpcConnection {
 					return Ok(serde_json::from_value(response.result.clone())?);
 				},
 				JsonRpcMessage::Error(error) if error.id == expected_id => {
-					return Err(eyre!(
+					return Err(eyre::eyre!(
 						"`{method}` failed with {}: {}",
 						error.error.code,
 						error.error.message
 					));
 				},
 				JsonRpcMessage::Request(request) => {
-					return Err(eyre!(
+					return Err(eyre::eyre!(
 						"Unexpected inbound JSON-RPC request `{}` while waiting for `{method}`.",
 						request.method
 					));
 				},
 				JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {
-					return Err(eyre!(
+					return Err(eyre::eyre!(
 						"Received an unexpected JSON-RPC response while waiting for `{method}`."
 					));
 				},
@@ -131,12 +139,13 @@ impl JsonRpcConnection {
 		P: Serialize,
 	{
 		let value = match params {
-			Some(params) => json!({
+			Some(params) => serde_json::json!({
 				"method": method,
 				"params": params,
 			}),
-			None => json!({ "method": method }),
+			None => serde_json::json!({ "method": method }),
 		};
+
 		self.send_value(&value)
 	}
 
@@ -152,7 +161,7 @@ impl JsonRpcConnection {
 	where
 		R: Serialize,
 	{
-		self.send_value(&json!({
+		self.send_value(&serde_json::json!({
 			"id": id,
 			"result": result,
 		}))
@@ -164,6 +173,7 @@ impl JsonRpcConnection {
 
 	fn send_value(&mut self, value: &Value) -> Result<()> {
 		writeln!(self.stdin, "{}", serde_json::to_string(value)?)?;
+
 		self.stdin.flush()?;
 
 		Ok(())
@@ -174,16 +184,16 @@ impl JsonRpcConnection {
 			Some(timeout) => match self.stdout_rx.recv_timeout(timeout) {
 				Ok(raw) => raw,
 				Err(RecvTimeoutError::Timeout) => {
-					return Err(eyre!("Timed out while waiting for app-server output."));
+					return Err(eyre::eyre!("Timed out while waiting for app-server output."));
 				},
 				Err(RecvTimeoutError::Disconnected) => {
-					return Err(eyre!("App-server stdout disconnected unexpectedly."));
+					return Err(eyre::eyre!("App-server stdout disconnected unexpectedly."));
 				},
 			},
 			None => self
 				.stdout_rx
 				.recv()
-				.map_err(|_| eyre!("App-server stdout disconnected unexpectedly."))?,
+				.map_err(|_| eyre::eyre!("App-server stdout disconnected unexpectedly."))?,
 		};
 
 		WireMessage::parse(raw)
@@ -196,7 +206,7 @@ impl Drop for JsonRpcConnection {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct WireMessage {
 	pub(crate) raw: String,
 	pub(crate) message: JsonRpcMessage,
@@ -213,14 +223,14 @@ impl WireMessage {
 		} else if value.get("result").is_some() {
 			JsonRpcMessage::Response(serde_json::from_value(value)?)
 		} else {
-			return Err(eyre!("Received an unrecognized JSON-RPC payload: {raw}"));
+			return Err(eyre::eyre!("Received an unrecognized JSON-RPC payload: {raw}"));
 		};
 
 		Ok(Self { raw, message })
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum JsonRpcMessage {
 	Request(JsonRpcRequest),
 	Notification(JsonRpcNotification),
@@ -228,7 +238,7 @@ pub(crate) enum JsonRpcMessage {
 	Error(JsonRpcError),
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct JsonRpcRequest {
 	pub(crate) id: Value,
 	pub(crate) method: String,
@@ -236,26 +246,26 @@ pub(crate) struct JsonRpcRequest {
 	pub(crate) params: Value,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct JsonRpcNotification {
 	pub(crate) method: String,
 	#[serde(default)]
 	pub(crate) params: Value,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct JsonRpcResponse {
 	pub(crate) id: Value,
 	pub(crate) result: Value,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct JsonRpcError {
 	pub(crate) id: Value,
 	pub(crate) error: JsonRpcErrorPayload,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct JsonRpcErrorPayload {
 	pub(crate) code: i64,
 	pub(crate) message: String,

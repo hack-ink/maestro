@@ -5,9 +5,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
-
-use crate::prelude::Result;
+use rusqlite::{self, Connection, OptionalExtension};
 
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 
@@ -17,7 +15,7 @@ pub struct StateStore {
 }
 impl StateStore {
 	/// Open or create a SQLite-backed state store on disk.
-	pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+	pub fn open(path: impl AsRef<Path>) -> crate::prelude::Result<Self> {
 		let path = path.as_ref();
 
 		if let Some(parent) = path.parent() {
@@ -33,7 +31,7 @@ impl StateStore {
 	}
 
 	/// Open an in-memory state store for tests and probes.
-	pub fn open_in_memory() -> Result<Self> {
+	pub fn open_in_memory() -> crate::prelude::Result<Self> {
 		let connection = Connection::open_in_memory()?;
 		let store = Self { connection };
 
@@ -43,7 +41,12 @@ impl StateStore {
 	}
 
 	/// Create or replace the active lease for one issue.
-	pub fn upsert_lease(&self, project_id: &str, issue_id: &str, run_id: &str) -> Result<()> {
+	pub fn upsert_lease(
+		&self,
+		project_id: &str,
+		issue_id: &str,
+		run_id: &str,
+	) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
 			INSERT INTO issue_leases (project_id, issue_id, run_id)
@@ -53,19 +56,19 @@ impl StateStore {
 				run_id = excluded.run_id,
 				acquired_at = CURRENT_TIMESTAMP
 			",
-			params![project_id, issue_id, run_id],
+			rusqlite::params![project_id, issue_id, run_id],
 		)?;
 
 		Ok(())
 	}
 
 	/// Read the active lease for one issue.
-	pub fn lease_for_issue(&self, issue_id: &str) -> Result<Option<IssueLease>> {
+	pub fn lease_for_issue(&self, issue_id: &str) -> crate::prelude::Result<Option<IssueLease>> {
 		let lease = self
 			.connection
 			.query_row(
 				"SELECT project_id, issue_id, run_id FROM issue_leases WHERE issue_id = ?1",
-				params![issue_id],
+				rusqlite::params![issue_id],
 				|row| {
 					Ok(IssueLease {
 						project_id: row.get(0)?,
@@ -80,7 +83,7 @@ impl StateStore {
 	}
 
 	/// List all active leases.
-	pub fn list_leases(&self, project_id: &str) -> Result<Vec<IssueLease>> {
+	pub fn list_leases(&self, project_id: &str) -> crate::prelude::Result<Vec<IssueLease>> {
 		let mut statement = self.connection.prepare(
 			"
 			SELECT project_id, issue_id, run_id
@@ -89,19 +92,18 @@ impl StateStore {
 			ORDER BY issue_id
 			",
 		)?;
-		let rows = statement.query_map(params![project_id], |row| {
+		let rows = statement.query_map(rusqlite::params![project_id], |row| {
 			Ok(IssueLease { project_id: row.get(0)?, issue_id: row.get(1)?, run_id: row.get(2)? })
 		})?;
-
 		let leases = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
 		Ok(leases)
 	}
 
 	/// Remove the active lease for one issue.
-	pub fn clear_lease(&self, issue_id: &str) -> Result<()> {
+	pub fn clear_lease(&self, issue_id: &str) -> crate::prelude::Result<()> {
 		self.connection
-			.execute("DELETE FROM issue_leases WHERE issue_id = ?1", params![issue_id])?;
+			.execute("DELETE FROM issue_leases WHERE issue_id = ?1", rusqlite::params![issue_id])?;
 
 		Ok(())
 	}
@@ -113,7 +115,7 @@ impl StateStore {
 		issue_id: &str,
 		attempt_number: i64,
 		status: &str,
-	) -> Result<()> {
+	) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
 			INSERT INTO run_attempts (run_id, issue_id, attempt_number, status)
@@ -124,21 +126,21 @@ impl StateStore {
 				status = excluded.status,
 				updated_at = CURRENT_TIMESTAMP
 			",
-			params![run_id, issue_id, attempt_number, status],
+			rusqlite::params![run_id, issue_id, attempt_number, status],
 		)?;
 
 		Ok(())
 	}
 
 	/// Compute the next attempt number for one issue.
-	pub fn next_attempt_number(&self, issue_id: &str) -> Result<i64> {
+	pub fn next_attempt_number(&self, issue_id: &str) -> crate::prelude::Result<i64> {
 		let next_attempt = self.connection.query_row(
 			"
 			SELECT COALESCE(MAX(attempt_number), 0) + 1
 			FROM run_attempts
 			WHERE issue_id = ?1
 			",
-			params![issue_id],
+			rusqlite::params![issue_id],
 			|row| row.get(0),
 		)?;
 
@@ -146,7 +148,7 @@ impl StateStore {
 	}
 
 	/// Attach the active thread identifier to a run attempt.
-	pub fn update_run_thread(&self, run_id: &str, thread_id: &str) -> Result<()> {
+	pub fn update_run_thread(&self, run_id: &str, thread_id: &str) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
 			UPDATE run_attempts
@@ -154,14 +156,14 @@ impl StateStore {
 				updated_at = CURRENT_TIMESTAMP
 			WHERE run_id = ?1
 			",
-			params![run_id, thread_id],
+			rusqlite::params![run_id, thread_id],
 		)?;
 
 		Ok(())
 	}
 
 	/// Update the status for one run attempt.
-	pub fn update_run_status(&self, run_id: &str, status: &str) -> Result<()> {
+	pub fn update_run_status(&self, run_id: &str, status: &str) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
 			UPDATE run_attempts
@@ -169,14 +171,14 @@ impl StateStore {
 				updated_at = CURRENT_TIMESTAMP
 			WHERE run_id = ?1
 			",
-			params![run_id, status],
+			rusqlite::params![run_id, status],
 		)?;
 
 		Ok(())
 	}
 
 	/// Read one run attempt.
-	pub fn run_attempt(&self, run_id: &str) -> Result<Option<RunAttempt>> {
+	pub fn run_attempt(&self, run_id: &str) -> crate::prelude::Result<Option<RunAttempt>> {
 		let attempt = self
 			.connection
 			.query_row(
@@ -185,7 +187,7 @@ impl StateStore {
 				FROM run_attempts
 				WHERE run_id = ?1
 				",
-				params![run_id],
+				rusqlite::params![run_id],
 				|row| {
 					Ok(RunAttempt {
 						run_id: row.get(0)?,
@@ -208,23 +210,23 @@ impl StateStore {
 		sequence_number: i64,
 		event_type: &str,
 		payload: &str,
-	) -> Result<()> {
+	) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
 			INSERT INTO event_journal (run_id, sequence_number, event_type, payload)
 			VALUES (?1, ?2, ?3, ?4)
 			",
-			params![run_id, sequence_number, event_type, payload],
+			rusqlite::params![run_id, sequence_number, event_type, payload],
 		)?;
 
 		Ok(())
 	}
 
 	/// Count protocol journal records for one run.
-	pub fn event_count(&self, run_id: &str) -> Result<i64> {
+	pub fn event_count(&self, run_id: &str) -> crate::prelude::Result<i64> {
 		let count = self.connection.query_row(
 			"SELECT COUNT(*) FROM event_journal WHERE run_id = ?1",
-			params![run_id],
+			rusqlite::params![run_id],
 			|row| row.get(0),
 		)?;
 
@@ -238,7 +240,7 @@ impl StateStore {
 		issue_id: &str,
 		branch_name: &str,
 		worktree_path: &str,
-	) -> Result<()> {
+	) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
 			INSERT INTO worktree_mappings (project_id, issue_id, branch_name, worktree_path)
@@ -249,14 +251,17 @@ impl StateStore {
 				worktree_path = excluded.worktree_path,
 				updated_at = CURRENT_TIMESTAMP
 			",
-			params![project_id, issue_id, branch_name, worktree_path],
+			rusqlite::params![project_id, issue_id, branch_name, worktree_path],
 		)?;
 
 		Ok(())
 	}
 
 	/// Read the worktree mapping for one issue.
-	pub fn worktree_for_issue(&self, issue_id: &str) -> Result<Option<WorktreeMapping>> {
+	pub fn worktree_for_issue(
+		&self,
+		issue_id: &str,
+	) -> crate::prelude::Result<Option<WorktreeMapping>> {
 		let mapping = self
 			.connection
 			.query_row(
@@ -265,7 +270,7 @@ impl StateStore {
 				FROM worktree_mappings
 				WHERE issue_id = ?1
 				",
-				params![issue_id],
+				rusqlite::params![issue_id],
 				|row| {
 					Ok(WorktreeMapping {
 						project_id: row.get(0)?,
@@ -281,7 +286,7 @@ impl StateStore {
 	}
 
 	/// List all known worktree mappings.
-	pub fn list_worktrees(&self, project_id: &str) -> Result<Vec<WorktreeMapping>> {
+	pub fn list_worktrees(&self, project_id: &str) -> crate::prelude::Result<Vec<WorktreeMapping>> {
 		let mut statement = self.connection.prepare(
 			"
 			SELECT project_id, issue_id, branch_name, worktree_path
@@ -290,7 +295,7 @@ impl StateStore {
 			ORDER BY issue_id
 			",
 		)?;
-		let rows = statement.query_map(params![project_id], |row| {
+		let rows = statement.query_map(rusqlite::params![project_id], |row| {
 			Ok(WorktreeMapping {
 				project_id: row.get(0)?,
 				issue_id: row.get(1)?,
@@ -298,21 +303,22 @@ impl StateStore {
 				worktree_path: PathBuf::from(row.get::<_, String>(3)?),
 			})
 		})?;
-
 		let mappings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
 		Ok(mappings)
 	}
 
 	/// Remove the worktree mapping for one issue.
-	pub fn clear_worktree(&self, issue_id: &str) -> Result<()> {
-		self.connection
-			.execute("DELETE FROM worktree_mappings WHERE issue_id = ?1", params![issue_id])?;
+	pub fn clear_worktree(&self, issue_id: &str) -> crate::prelude::Result<()> {
+		self.connection.execute(
+			"DELETE FROM worktree_mappings WHERE issue_id = ?1",
+			rusqlite::params![issue_id],
+		)?;
 
 		Ok(())
 	}
 
-	fn initialize(&self) -> Result<()> {
+	fn initialize(&self) -> crate::prelude::Result<()> {
 		self.connection.execute_batch(INIT_SQL)?;
 
 		Ok(())
@@ -320,7 +326,7 @@ impl StateStore {
 }
 
 /// Active lease for one issue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssueLease {
 	project_id: String,
 	issue_id: String,
@@ -344,7 +350,7 @@ impl IssueLease {
 }
 
 /// Persistent run attempt metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunAttempt {
 	run_id: String,
 	issue_id: String,
@@ -380,7 +386,7 @@ impl RunAttempt {
 }
 
 /// Worktree mapping for one issue lane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeMapping {
 	project_id: String,
 	issue_id: String,
@@ -411,6 +417,8 @@ impl WorktreeMapping {
 
 #[cfg(test)]
 mod tests {
+	use std::path::Path;
+
 	use crate::state::StateStore;
 
 	#[test]
@@ -418,6 +426,7 @@ mod tests {
 		let store = StateStore::open_in_memory().expect("in-memory state store should open");
 
 		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should be inserted");
+
 		let lease = store
 			.lease_for_issue("PUB-101")
 			.expect("lease read should succeed")
@@ -428,6 +437,7 @@ mod tests {
 		assert_eq!(lease.project_id(), "pubfi");
 
 		store.clear_lease("PUB-101").expect("lease should be deleted");
+
 		assert!(store.lease_for_issue("PUB-101").expect("lease lookup should succeed").is_none());
 	}
 
@@ -456,10 +466,12 @@ mod tests {
 		assert_eq!(store.next_attempt_number("PUB-101").expect("next attempt should load"), 2);
 
 		store.update_run_status("run-1", "interrupted").expect("status should update");
+
 		let updated = store
 			.run_attempt("run-1")
 			.expect("run attempt query should succeed")
 			.expect("run attempt should exist");
+
 		assert_eq!(updated.status(), "interrupted");
 	}
 
@@ -481,7 +493,9 @@ mod tests {
 		assert_eq!(mapping.worktree_path(), Path::new("/tmp/worktrees/pub-101"));
 		assert_eq!(mapping.project_id(), "pubfi");
 		assert_eq!(store.list_worktrees("pubfi").expect("list should succeed").len(), 1);
+
 		store.clear_worktree("PUB-101").expect("mapping should be deleted");
+
 		assert!(store.worktree_for_issue("PUB-101").expect("lookup should succeed").is_none());
 	}
 
@@ -499,6 +513,4 @@ mod tests {
 		assert_eq!(leases[0].issue_id(), "PUB-101");
 		assert_eq!(leases[1].issue_id(), "PUB-102");
 	}
-
-	use std::path::Path;
 }
