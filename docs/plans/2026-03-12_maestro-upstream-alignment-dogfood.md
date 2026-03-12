@@ -36,7 +36,7 @@ Realign `maestro` with the important ownership and runtime boundaries from upstr
 
 - Last Updated: 2026-03-12
 - Next Checkpoint: Task 6
-- Blockers: `LINEAR_API_KEY` is not present in the current shell, so the first real self-targeting `run --once --dry-run --config ./maestro.toml` cannot be exercised from this checkout yet.
+- Blockers: none in architecture. The next dry run depends only on a local `maestro.toml` whose `tracker.api_key` is set to either a literal Linear token or a `$ENV_VAR` reference.
 
 ## Decision Notes
 
@@ -47,7 +47,7 @@ Realign `maestro` with the important ownership and runtime boundaries from upstr
 - Canonical Linear project identity for service config and workflow policy: `project_slug`, matching the upstream Symphony notion and mapping to Linear project `slugId` in the reader query layer.
 - Preserve the current worktree-first lane model. One Linear issue should still map to one isolated branch and one `git worktree` checkout.
 - Use `maestro` itself as the first target repo because it gives the cleanest dry-run and first-live-run path with the lowest external blast radius.
-- Local reconciliation state now scopes leases and worktree mappings by configured `projects.id` so one service config can manage multiple project lanes without cross-project cleanup.
+- Local reconciliation state now scopes leases and worktree mappings by configured `id` so one `maestro.toml` manages one project lane without cross-project cleanup.
 - The first self-dogfood tracker scope is the bounded helixbox Linear project `Maestro MVP`, currently identified by project slug `maestro-mvp-10bbdae9b904`.
 
 ## Implementation Outline
@@ -126,7 +126,7 @@ done
 
 **Changes**
 
-1. Replace `projects.tracker.project` with canonical `projects.tracker.project_slug`, and mirror the same stable identifier in downstream `WORKFLOW.md`.
+1. Replace project-name equality with canonical `tracker.project_slug`, and mirror the same stable identifier in downstream `WORKFLOW.md`.
 2. Add paginated issue listing instead of a single `first: 50` project query.
 3. Add tracker reads needed for reconciliation, including refreshing issue state for known issue IDs and reading project metadata from the chosen stable identifier.
 4. Update the orchestrator contract validation so service config and `WORKFLOW.md` align on `project_slug` rather than project-name equality.
@@ -214,7 +214,7 @@ done
 2. Implement the minimum stop/skip semantics needed when an issue becomes terminal or otherwise ineligible while `maestro` is preparing or reconsidering a lane.
 3. Add terminal worktree cleanup and retention rules that match the runtime spec instead of leaving cleanup as a future-only note.
 4. Document the operator-visible behavior for these transitions in the runtime spec and pilot guide.
-5. Scope local issue leases and worktree mappings by configured `projects.id` so reconciliation and cleanup only operate within the current project lane.
+5. Scope local issue leases and worktree mappings by configured `id` so reconciliation and cleanup only operate within the current project lane.
 
 **Verification**
 

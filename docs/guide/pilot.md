@@ -2,7 +2,7 @@
 
 Goal: Run the `maestro` MVP against one configured Linear project and one target repository, with `maestro` itself as the default first pilot target.
 Read this when: You are preparing a dry run or live self-dogfood pilot and need the bounded operator procedure for config, target-repo requirements, and expected run behavior.
-Preconditions: `codex app-server` is available locally; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is available through `projects.tracker.api_token_env`.
+Preconditions: `codex app-server` is available locally; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is configured through `tracker.api_key` in `maestro.toml`.
 Depends on: `docs/spec/system_maestro_runtime.md`, `docs/spec/system_workflow_contract.md`, `docs/spec/system_app_server_contract.md`, the target repository root `WORKFLOW.md`, and `Makefile.toml` for repo-native verification tasks.
 Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run --config ./maestro.toml`; and, when the environment is ready, `cargo run -- run --once --config ./maestro.toml`.
 
@@ -19,7 +19,7 @@ Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run 
 - The target repository has a root `WORKFLOW.md`.
 - The target repository files referenced by `WORKFLOW.md [context.read_first]` exist.
 - The Linear team already has the workflow states used by the target `WORKFLOW.md`.
-- The Linear API token is available in the environment variable named by `projects.tracker.api_token_env`.
+- The Linear API token is configured through `tracker.api_key` in `maestro.toml`.
 
 Recommended first-run check:
 
@@ -31,7 +31,7 @@ If `protocol probe` does not return `PROBE_OK`, stop there. The orchestrator loo
 
 ## Recommended layout
 
-For the recommended first deployment, keep `maestro.toml` alongside the checked-out `maestro` repo and point it back at this repository. Other deployment layouts are valid as long as the configured paths are explicit.
+For the recommended first deployment, keep `maestro.toml` alongside the checked-out `maestro` repo and point it back at this repository. Keep issue worktrees under the repo-local `.worktrees/` directory.
 
 ```text
 /path/to/maestro/
@@ -41,7 +41,7 @@ For the recommended first deployment, keep `maestro.toml` alongside the checked-
   AGENTS.md
   WORKFLOW.md
 
-/path/to/maestro-workspaces/maestro/
+/path/to/maestro/.worktrees/
   PUB-600/
   PUB-601/
 ```
@@ -54,22 +54,21 @@ For the recommended first deployment, keep `maestro.toml` alongside the checked-
 
 The SQLite operational state is stored separately from the target repo and uses the filename `maestro.sqlite3` under the platform data directory.
 
-The local state is scoped by configured `projects.id`, so reconciliation and cleanup operate within one configured project lane at a time even when one service config contains multiple projects.
+The local state is scoped by configured `id`, so reconciliation and cleanup operate within the single configured project lane for this `maestro.toml`.
 
 ## Sample service config
 
 ```toml
-[[projects]]
 id = "maestro"
 repo_root = "/absolute/path/to/helixbox/maestro"
-workspace_root = "/absolute/path/to/maestro-workspaces/maestro"
+workspace_root = "/absolute/path/to/helixbox/maestro/.worktrees"
 workflow_path = "WORKFLOW.md"
 
-[projects.tracker]
+[tracker]
 project_slug = "maestro-mvp-10bbdae9b904"
-api_token_env = "LINEAR_API_KEY"
+api_key = "$HELIXBOX_LINEAR_API_KEY"
 
-[projects.agent]
+[agent]
 transport = "stdio://"
 model = "gpt-5-codex"
 ```
@@ -77,10 +76,11 @@ model = "gpt-5-codex"
 Notes:
 
 - `repo_root` should point at this repository for the first self-dogfood pilot.
-- `workspace_root` is where `maestro` creates per-issue `git worktree` lanes.
+- `workspace_root` is where `maestro` creates per-issue `git worktree` lanes. For the first pilot, use a repo-local path such as `.worktrees`.
 - `workflow_path` is repository-relative and defaults to `WORKFLOW.md`.
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
+- `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
 - The recommended first tracker scope is the bounded `Maestro MVP` project in helixbox Linear, whose current project slug is `maestro-mvp-10bbdae9b904`.
 
 ## Target repository contract
@@ -163,7 +163,7 @@ Example:
 
 ```text
 branch  x/maestro-pub-600
-path    /absolute/path/to/maestro-workspaces/maestro/PUB-600
+path    /absolute/path/to/helixbox/maestro/.worktrees/PUB-600
 ```
 
 Retries reuse the same worktree path.
@@ -182,8 +182,8 @@ Start with Linear:
 Then inspect the worktree mentioned in the comment:
 
 ```sh
-git -C /absolute/path/to/maestro-workspaces/maestro/PUB-600 status --short
-git -C /absolute/path/to/maestro-workspaces/maestro/PUB-600 log --oneline --decorate -5
+git -C /absolute/path/to/helixbox/maestro/.worktrees/PUB-600 status --short
+git -C /absolute/path/to/helixbox/maestro/.worktrees/PUB-600 log --oneline --decorate -5
 ```
 
 If you need the thin operational state, inspect the SQLite file directly:

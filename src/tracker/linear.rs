@@ -63,7 +63,7 @@ query IssuesForProject($projectSlug: String!, $after: String) {
 }
 "#;
 const ISSUES_BY_IDS_QUERY: &str = r#"
-query IssuesByIds($issueIds: [String!], $after: String) {
+query IssuesByIds($issueIds: [ID!], $after: String) {
   issues(filter: { id: { in: $issueIds } }, first: 50, after: $after) {
     nodes {
       id
@@ -136,7 +136,7 @@ impl LinearClient {
 		let response = self
 			.http
 			.post(LINEAR_GRAPHQL_URL)
-			.bearer_auth(&self.api_token)
+			.header("Authorization", &self.api_token)
 			.json(&GraphqlRequest { query, variables })
 			.send()?
 			.error_for_status()?;

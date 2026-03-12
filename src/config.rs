@@ -1,8 +1,7 @@
 //! Service configuration for Maestro.
 
 use std::{
-	collections::BTreeSet,
-	fs,
+	env, fs,
 	path::{Path, PathBuf},
 };
 
@@ -11,10 +10,17 @@ use serde::Deserialize;
 
 use crate::prelude::{Result, eyre};
 
-/// Top-level service configuration for one or more target repositories.
+/// Top-level service configuration for one target repository and tracker scope.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ServiceConfig {
-	projects: Vec<ProjectConfig>,
+	id: String,
+	repo_root: PathBuf,
+	workspace_root: PathBuf,
+	#[serde(default = "default_workflow_path")]
+	workflow_path: PathBuf,
+	tracker: ProjectTrackerConfig,
+	#[serde(default)]
+	agent: ProjectAgentConfig,
 }
 impl ServiceConfig {
 	/// Parse service configuration from TOML text.
@@ -33,49 +39,12 @@ impl ServiceConfig {
 		Self::parse_toml(&input)
 	}
 
-	/// Configured target repositories.
-	pub fn projects(&self) -> &[ProjectConfig] {
-		&self.projects
-	}
-
-	fn validate(&self) -> Result<()> {
-		if self.projects.is_empty() {
-			eyre::bail!("Service configuration must include at least one project.");
-		}
-
-		let mut seen_ids = BTreeSet::new();
-
-		for project in &self.projects {
-			project.validate()?;
-
-			if !seen_ids.insert(project.id.as_str()) {
-				eyre::bail!("Duplicate project id detected: {}", project.id);
-			}
-		}
-
-		Ok(())
-	}
-}
-
-/// Per-repository service configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct ProjectConfig {
-	id: String,
-	repo_root: PathBuf,
-	workspace_root: PathBuf,
-	#[serde(default = "default_workflow_path")]
-	workflow_path: PathBuf,
-	tracker: ProjectTrackerConfig,
-	#[serde(default)]
-	agent: ProjectAgentConfig,
-}
-impl ProjectConfig {
-	/// Stable identifier for this project entry.
+	/// Stable identifier for this target service config.
 	pub fn id(&self) -> &str {
 		&self.id
 	}
 
-	/// Absolute or service-relative repository root used for the target checkout.
+	/// Absolute repository root used for the target checkout.
 	pub fn repo_root(&self) -> &Path {
 		&self.repo_root
 	}
@@ -114,7 +83,7 @@ impl ProjectConfig {
 pub struct ProjectTrackerConfig {
 	#[serde(alias = "project")]
 	project_slug: String,
-	api_token_env: String,
+	api_key: String,
 }
 impl ProjectTrackerConfig {
 	/// Stable Linear project slug.
@@ -122,17 +91,36 @@ impl ProjectTrackerConfig {
 		&self.project_slug
 	}
 
-	/// Environment variable name containing the tracker API token.
-	pub fn api_token_env(&self) -> &str {
-		&self.api_token_env
+	/// Tracker API key value or environment-variable reference like `$HELIXBOX_LINEAR_API_KEY`.
+	pub fn api_key(&self) -> &str {
+		&self.api_key
+	}
+
+	/// Resolve the configured tracker API key into a concrete token string.
+	pub fn resolve_api_key(&self) -> Result<String> {
+		let api_key = self.api_key();
+
+		if let Some(env_var) = api_key.strip_prefix('$') {
+			if env_var.trim().is_empty() {
+				eyre::bail!("`tracker.api_key` env reference must include a variable name.");
+			}
+
+			return env::var(env_var).map_err(|error| {
+				eyre::eyre!(
+					"Failed to read environment variable `{env_var}` referenced by `tracker.api_key`: {error}"
+				)
+			});
+		}
+
+		Ok(api_key.to_owned())
 	}
 
 	fn validate(&self) -> Result<()> {
 		if self.project_slug.trim().is_empty() {
-			eyre::bail!("`projects.tracker.project_slug` must not be empty.");
+			eyre::bail!("`tracker.project_slug` must not be empty.");
 		}
-		if self.api_token_env.trim().is_empty() {
-			eyre::bail!("`projects.tracker.api_token_env` must not be empty.");
+		if self.api_key.trim().is_empty() {
+			eyre::bail!("`tracker.api_key` must not be empty.");
 		}
 
 		Ok(())
@@ -181,27 +169,29 @@ mod tests {
 	fn parses_service_config_from_str() {
 		let config = ServiceConfig::parse_toml(
 			r#"
-				[[projects]]
 				id = "pubfi"
 				repo_root = "/tmp/pubfi"
-				workspace_root = "/tmp/maestro-workspaces/pubfi"
+					workspace_root = "/tmp/pubfi/.worktrees"
 
-				[projects.tracker]
+				[tracker]
 				project_slug = "pubfi"
-				api_token_env = "LINEAR_API_KEY"
+				api_key = "lin_api_test"
 
-				[projects.agent]
+				[agent]
 				transport = "stdio://"
 				model = "gpt-5-codex"
 			"#,
 		)
 		.expect("service config should parse");
 
-		assert_eq!(config.projects().len(), 1);
-		assert_eq!(config.projects()[0].id(), "pubfi");
-		assert_eq!(config.projects()[0].workflow_path(), Path::new("WORKFLOW.md"));
-		assert_eq!(config.projects()[0].tracker().project_slug(), "pubfi");
-		assert_eq!(config.projects()[0].agent().model(), Some("gpt-5-codex"));
+		assert_eq!(config.id(), "pubfi");
+		assert_eq!(config.workflow_path(), Path::new("WORKFLOW.md"));
+		assert_eq!(config.tracker().project_slug(), "pubfi");
+		assert_eq!(
+			config.tracker().resolve_api_key().expect("literal key should resolve"),
+			"lin_api_test"
+		);
+		assert_eq!(config.agent().model(), Some("gpt-5-codex"));
 	}
 
 	#[test]
@@ -211,14 +201,13 @@ mod tests {
 		fs::write(
 			file.path(),
 			r#"
-				[[projects]]
 				id = "pubfi"
 				repo_root = "/tmp/pubfi"
 				workspace_root = "/tmp/workspaces"
 
-				[projects.tracker]
+				[tracker]
 				project_slug = "pubfi"
-				api_token_env = "LINEAR_API_KEY"
+				api_key = "$HOME"
 			"#,
 		)
 		.expect("temp config should be written");
@@ -226,30 +215,21 @@ mod tests {
 		let config =
 			ServiceConfig::from_path(file.path()).expect("service config should load from disk");
 
-		assert_eq!(config.projects()[0].workspace_root(), Path::new("/tmp/workspaces"));
+		assert_eq!(config.workspace_root(), Path::new("/tmp/workspaces"));
+		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
 	}
 
 	#[test]
-	fn rejects_duplicate_project_ids() {
+	fn rejects_empty_project_id() {
 		let result = ServiceConfig::parse_toml(
 			r#"
-				[[projects]]
-				id = "dup"
+				id = ""
 				repo_root = "/tmp/one"
 				workspace_root = "/tmp/workspaces/one"
 
-				[projects.tracker]
+				[tracker]
 				project_slug = "one"
-				api_token_env = "LINEAR_API_KEY"
-
-				[[projects]]
-				id = "dup"
-				repo_root = "/tmp/two"
-				workspace_root = "/tmp/workspaces/two"
-
-				[projects.tracker]
-				project_slug = "two"
-				api_token_env = "LINEAR_API_KEY"
+				api_key = "lin_api_test"
 			"#,
 		);
 

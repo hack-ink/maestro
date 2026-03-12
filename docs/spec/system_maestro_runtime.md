@@ -63,7 +63,7 @@ Optional future expansion:
 - One active run attempt owns the lane at a time.
 - The lane path must be deterministic from issue identity so retries reuse the same checkout.
 - Worktrees must be created and removed with `git worktree` commands, not manual directory copying or deletion.
-- Worktree mappings and active leases must remain scoped to the configured `maestro.toml` project so reconciliation does not cross project boundaries.
+- Worktree mappings and active leases must remain scoped to the configured `maestro.toml` `id` so reconciliation does not cross project boundaries.
 
 ## Runtime state machine
 

@@ -138,11 +138,11 @@ mod tests {
 
 	#[test]
 	fn plans_workspace_paths_and_branch_names() {
-		let manager = WorkspaceManager::new("pubfi", "/tmp/pubfi", "/tmp/maestro-workspaces/pubfi");
+		let manager = WorkspaceManager::new("pubfi", "/tmp/pubfi", "/tmp/pubfi/.worktrees");
 		let spec = manager.plan_for_issue("PUB-101");
 
 		assert_eq!(spec.branch_name, "x/pubfi-pub-101");
-		assert_eq!(spec.path, Path::new("/tmp/maestro-workspaces/pubfi/PUB-101"));
+		assert_eq!(spec.path, Path::new("/tmp/pubfi/.worktrees/PUB-101"));
 		assert!(!spec.reused_existing);
 	}
 }

@@ -29,7 +29,7 @@ These commands are intentionally early-stage entrypoints. The `protocol probe` c
 
 ## Pilot Guide
 
-For the first real pilot, target `maestro` itself before onboarding another repository. Keep the service config in the repository root as `./maestro.toml` and point it at this checkout plus one dedicated worktree root. Other layouts are fine as long as the configured paths are explicit.
+For the first real pilot, target `maestro` itself before onboarding another repository. Keep the service config in the repository root as `./maestro.toml` and keep issue lanes under the repo-local `.worktrees/` directory.
 
 Recommended order:
 

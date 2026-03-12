@@ -1,6 +1,6 @@
 use std::{
 	collections::{HashMap, HashSet},
-	env, fs,
+	fs,
 	path::{Path, PathBuf},
 	process::Command,
 	slice,
@@ -13,7 +13,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
 	agent::{self, AppServerRunRequest},
-	config::{self, ProjectConfig, ServiceConfig},
+	config::{self, ServiceConfig},
 	prelude::{Result, eyre},
 	state::{StateStore, WorktreeMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
@@ -55,50 +55,45 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> 
 	} else {
 		StateStore::open(default_state_store_path()?)?
 	};
+	let workflow_path = config.repo_root().join(config.workflow_path());
+	let workflow = WorkflowDocument::from_path(&workflow_path)?;
 
-	for project in config.projects() {
-		let workflow_path = project.repo_root().join(project.workflow_path());
-		let workflow = WorkflowDocument::from_path(&workflow_path)?;
+	validate_project_contract(&config, &workflow)?;
 
-		validate_project_contract(project, &workflow)?;
+	let api_key = config.tracker().resolve_api_key()?;
+	let tracker = LinearClient::new(api_key)?;
 
-		let api_token = env::var(project.tracker().api_token_env())?;
-		let tracker = LinearClient::new(api_token)?;
-
-		if let Some(summary) =
-			run_project_once(&tracker, project, &workflow, &state_store, dry_run)?
-		{
-			if dry_run {
-				println!(
-					"dry run: project={} issue={} branch={} worktree={} attempt={}",
-					summary.project_id,
-					summary.issue_identifier,
-					summary.branch_name,
-					summary.worktree_path.display(),
-					summary.attempt_number
-				);
-			} else {
-				println!(
-					"run complete: project={} issue={} run_id={} worktree={}",
-					summary.project_id,
-					summary.issue_identifier,
-					summary.run_id,
-					summary.worktree_path.display()
-				);
-			}
-
-			return Ok(());
+	if let Some(summary) = run_project_once(&tracker, &config, &workflow, &state_store, dry_run)? {
+		if dry_run {
+			println!(
+				"dry run: project={} issue={} branch={} worktree={} attempt={}",
+				summary.project_id,
+				summary.issue_identifier,
+				summary.branch_name,
+				summary.worktree_path.display(),
+				summary.attempt_number
+			);
+		} else {
+			println!(
+				"run complete: project={} issue={} run_id={} worktree={}",
+				summary.project_id,
+				summary.issue_identifier,
+				summary.run_id,
+				summary.worktree_path.display()
+			);
 		}
+
+		return Ok(());
 	}
 
-	println!("No eligible issue found for any configured project.");
+	println!("No eligible issue found for the configured project.");
 
 	Ok(())
 }
 
 fn run_project_once<T>(
 	tracker: &T,
-	project: &ProjectConfig,
+	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	dry_run: bool,
@@ -180,7 +175,7 @@ where
 
 fn reconcile_project_state<T>(
 	tracker: &T,
-	project: &ProjectConfig,
+	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
@@ -234,7 +229,7 @@ where
 
 fn execute_issue_run<T>(
 	tracker: &T,
-	project: &ProjectConfig,
+	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	issue_run: IssueRunPlan,
@@ -266,7 +261,7 @@ where
 
 fn execute_issue_run_inner<T>(
 	tracker: &T,
-	project: &ProjectConfig,
+	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	issue_run: &IssueRunPlan,
@@ -389,7 +384,7 @@ where
 	Ok(())
 }
 
-fn validate_project_contract(project: &ProjectConfig, workflow: &WorkflowDocument) -> Result<()> {
+fn validate_project_contract(project: &ServiceConfig, workflow: &WorkflowDocument) -> Result<()> {
 	if project.tracker().project_slug() != workflow.frontmatter().tracker().project_slug() {
 		eyre::bail!(
 			"Project config tracker slug `{}` does not match WORKFLOW.md tracker slug `{}`.",
@@ -480,7 +475,7 @@ fn cleanup_terminal_worktree(
 }
 
 fn build_developer_instructions(
-	project: &ProjectConfig,
+	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
 ) -> Result<String> {
@@ -802,14 +797,13 @@ mod tests {
 
 		let config = ServiceConfig::parse_toml(&format!(
 			r#"
-				[[projects]]
 				id = "pubfi"
 				repo_root = "{}"
 				workspace_root = "{}"
 
-				[projects.tracker]
+				[tracker]
 				project_slug = "pubfi"
-				api_token_env = "LINEAR_API_KEY"
+				api_key = "lin_api_test"
 			"#,
 			repo_root.display(),
 			workspace_root.display()
@@ -881,15 +875,10 @@ Follow the repository policy.
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![sample_issue("Todo", &[])]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let summary = orchestrator::run_project_once(
-			&tracker,
-			&config.projects()[0],
-			&workflow,
-			&state_store,
-			true,
-		)
-		.expect("run once should succeed")
-		.expect("one issue should be selected");
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("run once should succeed")
+				.expect("one issue should be selected");
 
 		assert_eq!(
 			summary,
@@ -897,8 +886,7 @@ Follow the repository policy.
 				project_id: String::from("pubfi"),
 				issue_identifier: String::from("PUB-101"),
 				branch_name: String::from("x/pubfi-pub-101"),
-				worktree_path: Path::new(&config.projects()[0].workspace_root().join("PUB-101"))
-					.to_path_buf(),
+				worktree_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
 				attempt_number: 1,
 				run_id: summary.run_id.clone(),
 			}
@@ -912,7 +900,7 @@ Follow the repository policy.
 		let issue = sample_issue("Done", &[]);
 		let tracker = FakeTracker::new(vec![issue.clone()]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let worktree_path = config.projects()[0].workspace_root().join("PUB-101");
+		let worktree_path = config.workspace_root().join("PUB-101");
 
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
@@ -927,14 +915,9 @@ Follow the repository policy.
 			)
 			.expect("worktree mapping should record");
 
-		let summary = orchestrator::run_project_once(
-			&tracker,
-			&config.projects()[0],
-			&workflow,
-			&state_store,
-			false,
-		)
-		.expect("reconciliation should succeed");
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
+				.expect("reconciliation should succeed");
 
 		assert!(summary.is_none());
 		assert!(
@@ -965,14 +948,9 @@ Follow the repository policy.
 			vec![vec![listed_issue.clone()], vec![sample_issue("In Progress", &[])]],
 		);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let summary = orchestrator::run_project_once(
-			&tracker,
-			&config.projects()[0],
-			&workflow,
-			&state_store,
-			false,
-		)
-		.expect("run once should succeed");
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
+				.expect("run once should succeed");
 
 		assert!(summary.is_none());
 		assert!(
