@@ -65,7 +65,7 @@ workspace_root = "/absolute/path/to/helixbox/maestro/.worktrees"
 workflow_path = "WORKFLOW.md"
 
 [tracker]
-project_slug = "maestro-mvp-10bbdae9b904"
+project_slug = "maestro-pilot-ops-hardening-8c4cd895b10d"
 api_key = "$HELIXBOX_LINEAR_API_KEY"
 
 [agent]
@@ -81,7 +81,7 @@ Notes:
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
 - `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
-- The recommended first tracker scope is the bounded `Maestro MVP` project in helixbox Linear, whose current project slug is `maestro-mvp-10bbdae9b904`.
+- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in helixbox Linear, whose current project slug is `maestro-pilot-ops-hardening-8c4cd895b10d`.
 
 ## Target repository contract
 
@@ -108,7 +108,7 @@ If `maestro:needs-attention` does not exist, the run will still fail correctly, 
 
 ## Recommended first scope
 
-Use `maestro` itself as the first target repo and keep the tracker scope bounded to the `Maestro MVP` project rather than a broad team backlog. That keeps the first dry run and first live run inside one repo, one project, and one worktree root.
+Use `maestro` itself as the first target repo and keep the tracker scope bounded to the `Maestro Pilot Ops Hardening` project rather than a broad team backlog. That keeps the current dry run and live run inside one repo, one project, and one worktree root.
 
 ## Running the pilot
 

@@ -106,7 +106,7 @@ Required run-start comment fields:
 - `run_id`
 - `attempt`
 - `started_at`
-- `worktree_path`
+- `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
 - `transport`
 - `model` when configured
 
@@ -123,7 +123,7 @@ Required completion comment fields:
 - `attempt`
 - `finished_at`
 - `branch`
-- `worktree_path`
+- `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
 - `validation_result`
 - `summary`
 
@@ -148,7 +148,7 @@ Required failure comment fields:
 - `failed_at`
 - `error_class`
 - `next_action`
-- `worktree_path`
+- `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
 
 ## Local operational state
 

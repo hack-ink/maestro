@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{
 	Args, Parser, Subcommand,
@@ -86,10 +86,7 @@ struct DaemonCommand {
 }
 impl DaemonCommand {
 	fn run(&self) -> Result<()> {
-		let _ = self.poll_interval_s;
-		let _ = &self.config;
-
-		eyre::bail!("`daemon` is not implemented yet. Use `run --once` for the MVP execution path.")
+		orchestrator::run_daemon(self.config.as_deref(), Duration::from_secs(self.poll_interval_s))
 	}
 }
 
@@ -152,7 +149,8 @@ mod tests {
 	use clap::Parser;
 
 	use crate::cli::{
-		Cli, Command, ProtocolCommand, ProtocolProbeCommand, ProtocolSubcommand, RunCommand,
+		Cli, Command, DaemonCommand, ProtocolCommand, ProtocolProbeCommand, ProtocolSubcommand,
+		RunCommand,
 	};
 
 	#[test]
@@ -175,6 +173,23 @@ mod tests {
 			Command::Protocol(ProtocolCommand {
 				command: ProtocolSubcommand::Probe(ProtocolProbeCommand { .. })
 			})
+		));
+	}
+
+	#[test]
+	fn parses_daemon_with_poll_interval_and_config() {
+		let cli = Cli::parse_from([
+			"maestro",
+			"daemon",
+			"--poll-interval-s",
+			"5",
+			"--config",
+			"./maestro.toml",
+		]);
+
+		assert!(matches!(
+			cli.command,
+			Command::Daemon(DaemonCommand { poll_interval_s: 5, config: Some(_) })
 		));
 	}
 }

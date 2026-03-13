@@ -3,7 +3,7 @@ version = 1
 
 [tracker]
 provider = "linear"
-project_slug = "maestro-mvp-10bbdae9b904"
+project_slug = "maestro-pilot-ops-hardening-8c4cd895b10d"
 startable_states = ["Todo"]
 terminal_states = ["Done", "Canceled", "Duplicate"]
 in_progress_state = "In Progress"

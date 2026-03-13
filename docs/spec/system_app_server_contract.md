@@ -68,6 +68,7 @@ When dynamic tools are enabled, `maestro` must also:
 1. Register the tool surface in `thread/start.dynamicTools`.
 2. Answer `item/tool/call` requests with `DynamicToolCallResponse`.
 3. Serialize dynamic tool output items with schema-approved `type` values such as `inputText`.
+4. Keep every `dynamicTools[].name` within the app-server identifier pattern `^[a-zA-Z0-9_-]+$`.
 
 ## `initialize`
 
@@ -123,7 +124,9 @@ The MVP turn start request owns these fields:
 
 - `threadId`
 - `input`
-- optional overrides for `cwd`, `approvalPolicy`, `model`, `personality`, `serviceTier`, and sandbox policy when the run needs turn-level overrides
+- optional overrides for `cwd`, `approvalPolicy`, `effort`, `model`, `personality`, `serviceTier`, and sandbox policy when the run needs turn-level overrides
+
+`maestro` should send an explicit supported `effort` value instead of inheriting a potentially incompatible desktop default from the parent Codex runtime.
 
 `TurnStartResponse` returns the accepted turn object.
 

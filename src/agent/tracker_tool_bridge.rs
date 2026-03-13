@@ -1,3 +1,5 @@
+use std::path::Component;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -5,6 +7,10 @@ use crate::{
 	tracker::{IssueTracker, TrackerIssue},
 	workflow::WorkflowDocument,
 };
+
+pub(crate) const ISSUE_TRANSITION_TOOL_NAME: &str = "issue_transition";
+pub(crate) const ISSUE_COMMENT_TOOL_NAME: &str = "issue_comment";
+pub(crate) const ISSUE_LABEL_ADD_TOOL_NAME: &str = "issue_label_add";
 
 pub(crate) trait DynamicToolHandler {
 	fn tool_specs(&self) -> Vec<DynamicToolSpec>;
@@ -37,7 +43,7 @@ impl<'a> TrackerToolBridge<'a> {
 	fn build_tool_specs(&self) -> Vec<DynamicToolSpec> {
 		vec![
 			DynamicToolSpec {
-				name: String::from("issue.transition"),
+				name: ISSUE_TRANSITION_TOOL_NAME.to_owned(),
 				description: String::from(
 					"Move the currently leased issue to another allowed workflow state.",
 				),
@@ -53,7 +59,7 @@ impl<'a> TrackerToolBridge<'a> {
 				}),
 			},
 			DynamicToolSpec {
-				name: String::from("issue.comment"),
+				name: ISSUE_COMMENT_TOOL_NAME.to_owned(),
 				description: String::from("Add a comment to the currently leased issue."),
 				input_schema: json!({
 					"type": "object",
@@ -67,7 +73,7 @@ impl<'a> TrackerToolBridge<'a> {
 				}),
 			},
 			DynamicToolSpec {
-				name: String::from("issue.label.add"),
+				name: ISSUE_LABEL_ADD_TOOL_NAME.to_owned(),
 				description: String::from(
 					"Add an allowed workflow label to the currently leased issue.",
 				),
@@ -87,9 +93,9 @@ impl<'a> TrackerToolBridge<'a> {
 
 	fn handle_call_inner(&self, tool_name: &str, arguments: Value) -> DynamicToolCallResponse {
 		match tool_name {
-			"issue.transition" => self.handle_transition(arguments),
-			"issue.comment" => self.handle_comment(arguments),
-			"issue.label.add" => self.handle_add_label(arguments),
+			ISSUE_TRANSITION_TOOL_NAME => self.handle_transition(arguments),
+			ISSUE_COMMENT_TOOL_NAME => self.handle_comment(arguments),
+			ISSUE_LABEL_ADD_TOOL_NAME => self.handle_add_label(arguments),
 			_ =>
 				DynamicToolCallResponse::failure(format!("Unsupported tracker tool `{tool_name}`.")),
 		}
@@ -155,6 +161,10 @@ impl<'a> TrackerToolBridge<'a> {
 			return DynamicToolCallResponse::failure(String::from(
 				"`issue.comment` requires a non-empty `body`.",
 			));
+		}
+
+		if let Err(error) = validate_public_comment_body(&parsed.body) {
+			return DynamicToolCallResponse::failure(error);
 		}
 
 		match self.tracker.create_comment(&self.issue.id, &parsed.body) {
@@ -260,6 +270,7 @@ impl<'a> TrackerToolBridge<'a> {
 		states
 	}
 }
+
 impl DynamicToolHandler for TrackerToolBridge<'_> {
 	fn tool_specs(&self) -> Vec<DynamicToolSpec> {
 		self.build_tool_specs()
@@ -328,12 +339,61 @@ struct LabelArgs {
 	label: String,
 }
 
+fn validate_public_comment_body(body: &str) -> Result<(), String> {
+	for line in body.lines() {
+		let Some(worktree_path) = extract_structured_field_value(line, "worktree_path") else {
+			continue;
+		};
+
+		validate_repo_relative_path(worktree_path)?;
+	}
+
+	Ok(())
+}
+
+fn extract_structured_field_value<'a>(line: &'a str, field_name: &str) -> Option<&'a str> {
+	let trimmed = line.trim();
+	let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+	let (key, value) = trimmed.split_once(':')?;
+
+	(key.trim() == field_name).then_some(value.trim().trim_matches('`'))
+}
+
+fn validate_repo_relative_path(path: &str) -> Result<(), String> {
+	if path.is_empty() {
+		return Err(String::from("`worktree_path` must not be empty."));
+	}
+	if path.starts_with('/') || path.starts_with("~/") || is_windows_absolute_path(path) {
+		return Err(format!("`worktree_path` must be repository-relative, not `{path}`."));
+	}
+
+	let components = std::path::Path::new(path).components();
+
+	if components.into_iter().any(|component| matches!(component, Component::ParentDir)) {
+		return Err(format!("`worktree_path` must stay within the repository, not `{path}`."));
+	}
+
+	Ok(())
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+	let bytes = path.as_bytes();
+
+	bytes.len() >= 3
+		&& bytes[0].is_ascii_alphabetic()
+		&& bytes[1] == b':'
+		&& matches!(bytes[2], b'\\' | b'/')
+}
+
 #[cfg(test)]
 mod tests {
 	use std::cell::RefCell;
 
 	use crate::{
-		agent::tracker_tool_bridge::{DynamicToolHandler, TrackerToolBridge},
+		agent::tracker_tool_bridge::{
+			DynamicToolHandler, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
+			ISSUE_TRANSITION_TOOL_NAME, TrackerToolBridge,
+		},
 		prelude::Result,
 		tracker::{
 			IssueTracker, TrackerIssue, TrackerLabel, TrackerProject, TrackerState, TrackerTeam,
@@ -454,7 +514,7 @@ Use the tracker tools.
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let response = DynamicToolHandler::handle_call(
 			&bridge,
-			"issue.transition",
+			ISSUE_TRANSITION_TOOL_NAME,
 			serde_json::json!({ "issue_identifier": "MAE-1", "state": "In Progress" }),
 		);
 
@@ -470,12 +530,104 @@ Use the tracker tools.
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let response = DynamicToolHandler::handle_call(
 			&bridge,
-			"issue.comment",
+			ISSUE_COMMENT_TOOL_NAME,
 			serde_json::json!({ "issue_identifier": "MAE-999", "body": "hello" }),
 		);
 
 		assert!(!response.success);
 		assert!(tracker.comments.borrow().is_empty());
+	}
+
+	#[test]
+	fn accepts_comment_without_structured_worktree_path() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_COMMENT_TOOL_NAME,
+			serde_json::json!({ "body": "Started work and running validation now." }),
+		);
+
+		assert!(response.success);
+		assert_eq!(
+			tracker.comments.borrow().as_slice(),
+			["Started work and running validation now."]
+		);
+	}
+
+	#[test]
+	fn accepts_repo_relative_worktree_path_in_comment_body() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_COMMENT_TOOL_NAME,
+			serde_json::json!({
+				"body": "maestro run failed and will retry\n\n- worktree_path: `.worktrees/MAE-1`"
+			}),
+		);
+
+		assert!(response.success);
+		assert_eq!(
+			tracker.comments.borrow().as_slice(),
+			["maestro run failed and will retry\n\n- worktree_path: `.worktrees/MAE-1`"]
+		);
+	}
+
+	#[test]
+	fn rejects_absolute_worktree_path_in_comment_body() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_COMMENT_TOOL_NAME,
+			serde_json::json!({
+				"body": "maestro run failed and will retry\n\n- worktree_path: `/Users/xavier/code/trusted/helixbox/maestro/.worktrees/MAE-1`"
+			}),
+		);
+
+		assert!(!response.success);
+		assert!(tracker.comments.borrow().is_empty());
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: String::from(
+					"`worktree_path` must be repository-relative, not `/Users/xavier/code/trusted/helixbox/maestro/.worktrees/MAE-1`."
+				),
+			}]
+		);
+	}
+
+	#[test]
+	fn rejects_windows_absolute_worktree_path_in_comment_body() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_COMMENT_TOOL_NAME,
+			serde_json::json!({
+				"body": "maestro run failed and will retry\n\n- worktree_path: `C:/Users/xavier/code/trusted/helixbox/maestro/.worktrees/MAE-1`"
+			}),
+		);
+
+		assert!(!response.success);
+		assert!(tracker.comments.borrow().is_empty());
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: String::from(
+					"`worktree_path` must be repository-relative, not `C:/Users/xavier/code/trusted/helixbox/maestro/.worktrees/MAE-1`."
+				),
+			}]
+		);
 	}
 
 	#[test]
@@ -486,11 +638,25 @@ Use the tracker tools.
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let response = DynamicToolHandler::handle_call(
 			&bridge,
-			"issue.label.add",
+			ISSUE_LABEL_ADD_TOOL_NAME,
 			serde_json::json!({ "label": "maestro:needs-attention" }),
 		);
 
 		assert!(response.success);
 		assert_eq!(tracker.label_updates.borrow().as_slice(), [vec![String::from("label-needs")]]);
+	}
+
+	#[test]
+	fn publishes_protocol_safe_tool_names() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let tool_specs = DynamicToolHandler::tool_specs(&bridge);
+
+		assert!(!tool_specs.is_empty());
+		assert!(tool_specs.into_iter().all(|tool| {
+			tool.name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+		}));
 	}
 }

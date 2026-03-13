@@ -22,6 +22,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_RUN_ID: &str = "protocol-probe-run";
 const PROBE_ISSUE_ID: &str = "protocol-probe";
 const PROBE_EXPECTED_OUTPUT: &str = "PROBE_OK";
+const DEFAULT_TURN_EFFORT: &str = "high";
 const PROBE_DEVELOPER_INSTRUCTIONS: &str = "You are a protocol probe. You must call the dynamic tool `echo_probe` exactly once with the JSON argument `{\"text\":\"PROBE_OK\"}`. Do not use shell. Do not inspect files. After the tool response is returned, reply with the exact text PROBE_OK and nothing else.";
 const PROBE_USER_INPUT: &str = "Call `echo_probe` with `{\\\"text\\\":\\\"PROBE_OK\\\"}`. After the tool succeeds, reply with the exact text PROBE_OK.";
 
@@ -416,11 +417,8 @@ fn execute_app_server_run_inner(
 
 	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
 
-	let turn_response = client.start_turn(TurnStartRequest {
-		thread_id: thread_id.clone(),
-		input: vec![UserInput::Text { text: request.user_input.clone() }],
-		..TurnStartRequest::default()
-	})?;
+	let turn_response =
+		client.start_turn(build_turn_start_request(&thread_id, &request.user_input))?;
 	let turn_id = turn_response.turn.id.clone();
 
 	state_store.record_run_attempt(
@@ -455,6 +453,15 @@ fn execute_app_server_run_inner(
 		event_count: state_store.event_count(&request.run_id)?,
 		final_output: run_outcome.final_output,
 	})
+}
+
+fn build_turn_start_request(thread_id: &str, user_input: &str) -> TurnStartRequest {
+	TurnStartRequest {
+		thread_id: thread_id.to_owned(),
+		effort: Some(String::from(DEFAULT_TURN_EFFORT)),
+		input: vec![UserInput::Text { text: user_input.to_owned() }],
+		..TurnStartRequest::default()
+	}
 }
 
 fn flush_pending_messages(
@@ -752,5 +759,17 @@ mod tests {
 		};
 
 		assert_eq!(result.final_output, "PROBE_OK");
+	}
+
+	#[test]
+	fn turn_start_request_uses_supported_effort() {
+		let request = super::build_turn_start_request("thread-1", "hello");
+
+		assert_eq!(request.thread_id, "thread-1");
+		assert_eq!(request.effort.as_deref(), Some(super::DEFAULT_TURN_EFFORT));
+		assert!(matches!(
+			request.input.as_slice(),
+			[super::UserInput::Text { text }] if text == "hello"
+		));
 	}
 }

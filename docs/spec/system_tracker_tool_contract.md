@@ -34,11 +34,11 @@ Defines: The tracker ownership boundary, preferred transport, issue-scoped tool 
 
 The follow-up MVP should support these issue-scoped operations:
 
-- `issue.transition`
+- `issue_transition`
   - move the current issue to an allowed target state
-- `issue.comment`
+- `issue_comment`
   - add a comment to the current issue
-- `issue.label.add`
+- `issue_label_add`
   - add a label to the current issue when workflow policy requires it
 
 Additional operations such as PR-link attachment or richer metadata updates may be added later, but they are not required for the first self-dogfood pilot.
@@ -48,6 +48,8 @@ Additional operations such as PR-link attachment or richer metadata updates may 
 - Allowed target states should be constrained by repo workflow policy plus the orchestration phase.
 - The tool bridge should reject transitions that violate the current repo workflow contract.
 - Comment bodies should remain repository-controlled or agent-authored, but all tool calls must be journaled by `maestro` for recovery and audit.
+- Structured comment fields such as `worktree_path` must use repository-relative paths; absolute host paths should be rejected before writing to the tracker.
+- Dynamic tool names must satisfy the `codex app-server` identifier restriction `^[a-zA-Z0-9_-]+$`; dotted names are invalid.
 
 ## Failure handling
 
