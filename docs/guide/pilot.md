@@ -94,7 +94,7 @@ At minimum, the target repo should define:
 - `[tracker] startable_states = ["Todo"]` or another explicit start set
 - `[agent]` policy such as sandbox and approval mode
 - `[execution] max_attempts`
-- `[context] read_first = ["AGENTS.md"]` if repo policy should be loaded before the workflow body
+- `[context] read_first = ["AGENTS.md"]` if repo policy should be loaded into issue-scoped instructions without relying on raw workflow-body inlining
 
 The target Linear team should also expose:
 

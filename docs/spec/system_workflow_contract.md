@@ -194,6 +194,6 @@ Use the issue-scoped tracker tools autonomously when tracker updates are require
 ## Body semantics
 
 - The Markdown body is repository policy text.
-- `maestro` may append the body to developer instructions sent through `app-server`.
+- Issue-scoped developer instructions should rely on `context.read_first` files plus the explicit tracker tool contract by default instead of inlining the raw body.
 - The body should contain durable repo rules, not ephemeral run notes.
 - The body should instruct the coding agent to use the issue-scoped tracker tools autonomously when tracker writes are part of the repo workflow.

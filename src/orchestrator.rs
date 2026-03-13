@@ -548,10 +548,6 @@ fn build_developer_instructions(
 		sections.push(format!("File: {relative_path}\n{contents}"));
 	}
 
-	if !workflow.body().is_empty() {
-		sections.push(format!("WORKFLOW.md\n{}", workflow.body()));
-	}
-
 	sections.push(String::from(
 		"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
 	));
@@ -744,7 +740,10 @@ mod tests {
 
 	use crate::{
 		config::ServiceConfig,
-		orchestrator::{self, RunSummary},
+		orchestrator::{
+			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME,
+			RunSummary,
+		},
 		prelude::Result,
 		state::StateStore,
 		tracker::{
@@ -897,15 +896,39 @@ mod tests {
 	}
 
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_read_first(
+			&[("AGENTS.md", "Read me first.\n")],
+			"Follow the repository policy.\n",
+		)
+	}
+
+	fn temp_project_layout_with_read_first(
+		read_first_files: &[(&str, &str)],
+		workflow_body: &str,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let repo_root = temp_dir.path().join("target-repo");
 		let workspace_root = temp_dir.path().join("workspaces");
+		let read_first_paths = read_first_files.iter().map(|(path, _)| *path).collect::<Vec<_>>();
 
 		fs::create_dir_all(&repo_root).expect("repo root should exist");
 		fs::create_dir_all(&workspace_root).expect("workspace root should exist");
-		fs::write(repo_root.join("AGENTS.md"), "Read me first.\n").expect("AGENTS should exist");
-		fs::write(repo_root.join("WORKFLOW.md"), sample_workflow_markdown())
-			.expect("workflow should exist");
+
+		for (relative_path, contents) in read_first_files {
+			let absolute_path = repo_root.join(relative_path);
+
+			if let Some(parent) = absolute_path.parent() {
+				fs::create_dir_all(parent).expect("read_first parent should exist");
+			}
+
+			fs::write(absolute_path, contents).expect("read_first file should exist");
+		}
+
+		fs::write(
+			repo_root.join("WORKFLOW.md"),
+			sample_workflow_markdown(&read_first_paths, workflow_body),
+		)
+		.expect("workflow should exist");
 
 		assert!(
 			Command::new("git")
@@ -935,7 +958,15 @@ mod tests {
 		);
 		assert!(
 			Command::new("git")
-				.args(["add", "AGENTS.md", "WORKFLOW.md"])
+				.args(["config", "commit.gpgsign", "false"])
+				.current_dir(&repo_root)
+				.status()
+				.expect("git config should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.args(["add", "."])
 				.current_dir(&repo_root)
 				.status()
 				.expect("git add should run")
@@ -970,8 +1001,12 @@ mod tests {
 		(temp_dir, config, workflow)
 	}
 
-	fn sample_workflow_markdown() -> &'static str {
-		r#"
+	fn sample_workflow_markdown(read_first: &[&str], workflow_body: &str) -> String {
+		let read_first =
+			read_first.iter().map(|path| format!("\"{path}\"")).collect::<Vec<_>>().join(", ");
+
+		format!(
+			r#"
 +++
 version = 1
 
@@ -989,11 +1024,41 @@ approval_policy = "never"
 max_attempts = 3
 
 [context]
-read_first = ["AGENTS.md"]
+read_first = [{read_first}]
 +++
 
-Follow the repository policy.
-"#
+{workflow_body}"#
+		)
+	}
+
+	fn expected_developer_instructions(
+		read_first_files: &[(&str, &str)],
+		workflow: &WorkflowDocument,
+		issue_run: &orchestrator::IssueRunPlan,
+	) -> String {
+		let mut sections = read_first_files
+			.iter()
+			.map(|(relative_path, contents)| format!("File: {relative_path}\n{contents}"))
+			.collect::<Vec<_>>();
+
+		sections.push(String::from(
+			"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
+		));
+
+		sections.push(format!(
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When implementation and repo validation are complete, call `{transition_tool}` to move the issue to `{success}` and add a brief `{comment_tool}` comment summarizing the result.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.\n- Never write to any other issue.",
+			issue = issue_run.issue.identifier,
+			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
+			comment_tool = ISSUE_COMMENT_TOOL_NAME,
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			run_id = issue_run.run_id,
+			attempt = issue_run.attempt_number,
+			success = workflow.frontmatter().tracker().success_state(),
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+		));
+
+		sections.join("\n\n")
 	}
 
 	#[test]
@@ -1050,7 +1115,7 @@ Follow the repository policy.
 	}
 
 	#[test]
-	fn developer_instructions_bound_pre_edit_discovery() {
+	fn developer_instructions_trim_workflow_body_and_preserve_required_guidance() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
@@ -1068,8 +1133,45 @@ Follow the repository policy.
 			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
 				.expect("developer instructions should build");
 
+		assert!(instructions.contains("File: AGENTS.md\nRead me first.\n"));
 		assert!(instructions.contains("Keep pre-edit discovery bounded"));
 		assert!(instructions.contains("Do not browse upstream references"));
+		assert!(instructions.contains("Tracker tool contract"));
+		assert!(instructions.contains("You own issue-scoped tracker writes for `PUB-101`."));
+		assert!(!instructions.contains("WORKFLOW.md\n"));
+		assert!(!instructions.contains("Follow the repository policy."));
+	}
+
+	#[test]
+	fn developer_instructions_match_trimmed_prompt_shape() {
+		let read_first_files = [
+			("AGENTS.md", "Read me first.\n"),
+			("docs/index.md", "Use the documentation index.\n"),
+		];
+		let (_temp_dir, config, workflow) = temp_project_layout_with_read_first(
+			&read_first_files,
+			"This workflow body should never be appended.\n",
+		);
+		let issue = sample_issue("Todo", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue,
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: String::from("PUB-101"),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1-123"),
+		};
+		let instructions =
+			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
+				.expect("developer instructions should build");
+
+		assert_eq!(
+			instructions,
+			expected_developer_instructions(&read_first_files, &workflow, &issue_run)
+		);
 	}
 
 	#[test]
