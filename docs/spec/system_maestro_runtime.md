@@ -28,6 +28,16 @@ Defines: The runtime scope, source-of-truth boundaries, eligibility rules, lane 
 - `maestro` local state is the source of truth only for active leases, in-flight protocol sessions, retry bookkeeping, and short-lived diagnostic history.
 - `maestro` must not create a second long-lived business workflow model outside Linear.
 
+## Runtime tuning inputs
+
+- Runtime policy decisions that depend on Codex behavior, such as idle timeout, stall thresholds, retry cutoffs, or liveness heuristics, must not be tuned from local Maestro observation alone.
+- For those decisions, use three inputs together:
+  - the generated `codex app-server` schema for protocol shape
+  - live pilot telemetry for observed event cadence and failure modes
+  - the relevant Codex or `app-server` implementation path for terminal semantics, waiting states, and progress signals
+- If those inputs disagree, treat the local implementation and generated schema as more authoritative than stale design assumptions.
+- Do not hardcode a wall-clock budget only because one pilot run happened to exceed or fit within it. Timeout and stall policy should be grounded in upstream runtime behavior first, then tightened with local evidence.
+
 ## Core terms
 
 - Issue: One tracker work item from the configured Linear project scope.

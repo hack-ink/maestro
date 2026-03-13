@@ -486,25 +486,25 @@ fn wait_for_turn_completion(
 	timeout: Duration,
 	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
 ) -> Result<RunOutcome> {
-	let deadline = Instant::now() + timeout;
+	let mut last_activity_at = Instant::now();
 	let mut final_output = String::new();
 
 	loop {
 		let now = Instant::now();
-
-		if now >= deadline {
+		let Some(wait_timeout) = remaining_idle_budget(last_activity_at, now, timeout) else {
 			eyre::bail!(
 				"Timed out while waiting for turn `{target_turn_id}` on thread `{target_thread_id}`."
 			);
-		}
-
-		let wire_message = client.recv(Some(deadline - now))?;
+		};
+		let wire_message = client.recv(Some(wait_timeout))?;
 
 		if !targets_thread(&wire_message, Some(target_thread_id)) {
 			tracing::debug!(raw = %wire_message.raw, "Ignoring app-server message for another thread.");
 
 			continue;
 		}
+
+		last_activity_at = Instant::now();
 
 		recorder.record(message_type(&wire_message), &wire_message.raw)?;
 
@@ -601,6 +601,14 @@ fn wait_for_turn_completion(
 			},
 		}
 	}
+}
+
+fn remaining_idle_budget(
+	last_activity_at: Instant,
+	now: Instant,
+	timeout: Duration,
+) -> Option<Duration> {
+	timeout.checked_sub(now.saturating_duration_since(last_activity_at))
 }
 
 fn handle_dynamic_tool_call(
@@ -700,6 +708,8 @@ fn thread_id_from_value(value: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+	use std::time::{Duration, Instant};
+
 	use crate::agent::{
 		app_server::AppServerRunResult,
 		json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
@@ -771,5 +781,26 @@ mod tests {
 			request.input.as_slice(),
 			[super::UserInput::Text { text }] if text == "hello"
 		));
+	}
+
+	#[test]
+	fn remaining_idle_budget_resets_from_latest_activity() {
+		let now = Instant::now();
+		let timeout = Duration::from_secs(300);
+		let last_activity_at = now.checked_sub(Duration::from_secs(12)).expect("instant math");
+		let remaining = super::remaining_idle_budget(last_activity_at, now, timeout)
+			.expect("budget should remain");
+
+		assert!(remaining <= timeout);
+		assert!(remaining >= Duration::from_secs(287));
+	}
+
+	#[test]
+	fn remaining_idle_budget_expires_after_idle_timeout() {
+		let now = Instant::now();
+		let timeout = Duration::from_secs(300);
+		let last_activity_at = now.checked_sub(Duration::from_secs(301)).expect("instant math");
+
+		assert!(super::remaining_idle_budget(last_activity_at, now, timeout).is_none());
 	}
 }

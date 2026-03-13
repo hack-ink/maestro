@@ -29,6 +29,13 @@ codex app-server generate-json-schema --experimental --out /tmp/maestro-app-serv
 - `maestro` must treat the generated schema as more authoritative than stale handwritten assumptions.
 - `--experimental` is required when inspecting `dynamicTools` and related experimental fields in the generated bundle.
 
+## Implementation guidance
+
+- When implementing Maestro features that depend on Codex runtime behavior, read the relevant Codex or `app-server` implementation path, not only this contract.
+- This is especially required for features such as idle timeout policy, stall detection, retry boundaries, waiting-state handling, and any other liveness-sensitive behavior.
+- Use this document to constrain protocol shape, then use the upstream implementation to adapt Maestro behavior to how Codex actually emits progress, waits, and terminates turns.
+- Do not finalize these features from local heuristics alone when the upstream runtime behavior can be inspected directly.
+
 ## Upstream alignment
 
 - Upstream Symphony remains the ownership reference for the orchestration boundary.
