@@ -19,7 +19,7 @@ The CLI surface exists now as a scaffold. The orchestration baseline is in place
 ## Current CLI Shape
 
 ```sh
-cargo run -- run --once --dry-run
+cargo run -- run --once --dry-run --config ./maestro.toml
 cargo run -- run --once --config ./maestro.toml
 cargo run -- daemon --poll-interval-s 60
 cargo run -- protocol probe
