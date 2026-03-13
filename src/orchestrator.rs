@@ -1,4 +1,5 @@
 use std::{
+	cmp::Ordering,
 	collections::{HashMap, HashSet},
 	fs,
 	path::{Path, PathBuf},
@@ -163,10 +164,7 @@ where
 
 	let project_slug = project.tracker().project_slug();
 	let issues = tracker.list_project_issues(project_slug)?;
-	let Some(issue) = issues
-		.into_iter()
-		.find(|issue| is_issue_eligible(issue, workflow, state_store).unwrap_or(false))
-	else {
+	let Some(issue) = select_issue_candidate(issues, workflow, state_store)? else {
 		return Ok(None);
 	};
 	let mut refreshed_issues = tracker.refresh_issues(slice::from_ref(&issue.id))?;
@@ -634,6 +632,34 @@ fn relative_worktree_path(project: &ServiceConfig, workspace: &WorkspaceSpec) ->
 	)
 }
 
+fn select_issue_candidate(
+	issues: Vec<TrackerIssue>,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+) -> Result<Option<TrackerIssue>> {
+	let mut eligible_issues = Vec::new();
+
+	for issue in issues {
+		if is_issue_eligible(&issue, workflow, state_store)? {
+			eligible_issues.push(issue);
+		}
+	}
+
+	eligible_issues.sort_by(compare_issue_candidates);
+
+	Ok(eligible_issues.into_iter().next())
+}
+
+fn compare_issue_candidates(left: &TrackerIssue, right: &TrackerIssue) -> Ordering {
+	let left_priority = (left.priority.is_none(), left.priority.unwrap_or(i64::MAX));
+	let right_priority = (right.priority.is_none(), right.priority.unwrap_or(i64::MAX));
+
+	left_priority
+		.cmp(&right_priority)
+		.then_with(|| left.created_at.cmp(&right.created_at))
+		.then_with(|| left.identifier.cmp(&right.identifier))
+}
+
 fn format_retry_comment(
 	run_id: &str,
 	attempt_number: i64,
@@ -806,6 +832,24 @@ mod tests {
 	}
 
 	fn sample_issue(state_name: &str, labels: &[&str]) -> TrackerIssue {
+		sample_issue_with_sort_fields(
+			"issue-1",
+			"PUB-101",
+			state_name,
+			labels,
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		)
+	}
+
+	fn sample_issue_with_sort_fields(
+		id: &str,
+		identifier: &str,
+		state_name: &str,
+		labels: &[&str],
+		priority: Option<i64>,
+		created_at: &str,
+	) -> TrackerIssue {
 		let team_labels = vec![
 			TrackerLabel {
 				id: String::from("label-manual"),
@@ -818,10 +862,12 @@ mod tests {
 		];
 
 		TrackerIssue {
-			id: String::from("issue-1"),
-			identifier: String::from("PUB-101"),
+			id: id.to_owned(),
+			identifier: identifier.to_owned(),
 			title: String::from("Implement orchestration"),
 			description: String::from("Body"),
+			priority,
+			created_at: created_at.to_owned(),
 			state: TrackerState { id: String::from("state-current"), name: state_name.to_owned() },
 			team: TrackerTeam {
 				id: String::from("team-1"),
@@ -1024,6 +1070,84 @@ Follow the repository policy.
 
 		assert!(instructions.contains("Keep pre-edit discovery bounded"));
 		assert!(instructions.contains("Do not browse upstream references"));
+	}
+
+	#[test]
+	fn candidate_selection_sorts_by_priority_created_at_and_identifier() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let high_priority = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:18:17.133Z",
+		);
+		let oldest_same_priority = sample_issue_with_sort_fields(
+			"issue-3",
+			"PUB-103",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:15:17.133Z",
+		);
+		let newest_same_priority = sample_issue_with_sort_fields(
+			"issue-4",
+			"PUB-104",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:19:17.133Z",
+		);
+		let no_priority = sample_issue_with_sort_fields(
+			"issue-5",
+			"PUB-105",
+			"Todo",
+			&[],
+			None,
+			"2026-03-13T04:14:17.133Z",
+		);
+		let selected = orchestrator::select_issue_candidate(
+			vec![no_priority, newest_same_priority, oldest_same_priority, high_priority],
+			&workflow,
+			&state_store,
+		)
+		.expect("candidate selection should succeed")
+		.expect("one issue should be selected");
+
+		assert_eq!(selected.identifier, "PUB-102");
+	}
+
+	#[test]
+	fn candidate_selection_breaks_ties_by_identifier_after_created_at() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let later_identifier = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let earlier_identifier = sample_issue_with_sort_fields(
+			"issue-3",
+			"PUB-101",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let selected = orchestrator::select_issue_candidate(
+			vec![later_identifier, earlier_identifier],
+			&workflow,
+			&state_store,
+		)
+		.expect("candidate selection should succeed")
+		.expect("one issue should be selected");
+
+		assert_eq!(selected.identifier, "PUB-101");
 	}
 
 	#[test]

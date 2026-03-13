@@ -17,6 +17,8 @@ pub(crate) struct TrackerIssue {
 	pub(crate) identifier: String,
 	pub(crate) title: String,
 	pub(crate) description: String,
+	pub(crate) priority: Option<i64>,
+	pub(crate) created_at: String,
 	pub(crate) state: TrackerState,
 	pub(crate) team: TrackerTeam,
 	pub(crate) labels: Vec<TrackerLabel>,

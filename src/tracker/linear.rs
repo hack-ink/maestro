@@ -28,6 +28,8 @@ query IssuesForProject($projectSlug: String!, $after: String) {
       identifier
       title
       description
+      priority
+      createdAt
       state {
         id
         name
@@ -70,6 +72,8 @@ query IssuesByIds($issueIds: [ID!], $after: String) {
       identifier
       title
       description
+      priority
+      createdAt
       state {
         id
         name
@@ -350,6 +354,9 @@ struct LinearIssue {
 	identifier: String,
 	title: String,
 	description: Option<String>,
+	priority: Option<i64>,
+	#[serde(rename = "createdAt")]
+	created_at: String,
 	state: LinearState,
 	team: LinearTeam,
 	labels: LabelConnection,
@@ -434,6 +441,8 @@ fn map_issue(issue: LinearIssue) -> TrackerIssue {
 		identifier: issue.identifier,
 		title: issue.title,
 		description: issue.description.unwrap_or_default(),
+		priority: issue.priority,
+		created_at: issue.created_at,
 		state: TrackerState { id: issue.state.id, name: issue.state.name },
 		team: TrackerTeam {
 			id: issue.team.id,
@@ -459,5 +468,51 @@ fn map_issue(issue: LinearIssue) -> TrackerIssue {
 			.into_iter()
 			.map(|label| TrackerLabel { id: label.id, name: label.name })
 			.collect(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::tracker::linear::{
+		LabelConnection, LinearIssue, LinearLabel, LinearState, LinearTeam, StateConnection,
+	};
+
+	#[test]
+	fn map_issue_preserves_priority_and_created_at() {
+		let issue = LinearIssue {
+			id: String::from("issue-1"),
+			identifier: String::from("PUB-101"),
+			title: String::from("Implement ordering"),
+			description: Some(String::from("Body")),
+			priority: Some(2),
+			created_at: String::from("2026-03-13T04:16:17.133Z"),
+			state: LinearState { id: String::from("state-todo"), name: String::from("Todo") },
+			team: LinearTeam {
+				id: String::from("team-1"),
+				name: String::from("Pubfi"),
+				states: StateConnection {
+					nodes: vec![LinearState {
+						id: String::from("state-todo"),
+						name: String::from("Todo"),
+					}],
+				},
+				labels: LabelConnection {
+					nodes: vec![LinearLabel {
+						id: String::from("label-needs"),
+						name: String::from("maestro:needs-attention"),
+					}],
+				},
+			},
+			labels: LabelConnection {
+				nodes: vec![LinearLabel {
+					id: String::from("label-manual"),
+					name: String::from("maestro:manual-only"),
+				}],
+			},
+		};
+		let mapped = super::map_issue(issue);
+
+		assert_eq!(mapped.priority, Some(2));
+		assert_eq!(mapped.created_at, "2026-03-13T04:16:17.133Z");
 	}
 }

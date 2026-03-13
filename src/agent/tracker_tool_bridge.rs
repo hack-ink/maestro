@@ -453,6 +453,8 @@ mod tests {
 			identifier: String::from("MAE-1"),
 			title: String::from("Sample"),
 			description: String::from("Body"),
+			priority: Some(3),
+			created_at: String::from("2026-03-13T04:16:17.133Z"),
 			state: TrackerState { id: String::from("state-todo"), name: String::from("Todo") },
 			team: TrackerTeam {
 				id: String::from("team-1"),
