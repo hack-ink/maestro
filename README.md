@@ -19,10 +19,10 @@ The CLI surface exists now as a scaffold. The orchestration baseline is in place
 ## Current CLI Shape
 
 ```sh
+cargo run -- protocol probe
 cargo run -- run --once --dry-run --config ./maestro.toml
 cargo run -- run --once --config ./maestro.toml
-cargo run -- daemon --poll-interval-s 60
-cargo run -- protocol probe
+cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml
 ```
 
 These commands are intentionally early-stage entrypoints. The `protocol probe` command is the first contract check for `app-server` compatibility before the full orchestrator loop depends on it.
@@ -38,6 +38,8 @@ cargo run -- protocol probe
 cargo run -- run --once --dry-run --config ./maestro.toml
 cargo run -- run --once --config ./maestro.toml
 ```
+
+After those bounded checks pass, switch to `cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml` when you want the long-running poll loop for the pilot.
 
 The detailed operator runbook, including sample config, filesystem layout, and failure inspection, lives in [`docs/guide/pilot.md`](docs/guide/pilot.md).
 

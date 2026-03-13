@@ -152,6 +152,12 @@ On a normal successful run, `maestro` will:
 8. run the configured validation commands inside the worktree
 9. let the coding agent perform the normal-path `In Review` transition and completion comment through issue-scoped tools
 
+After `protocol probe`, `run --once --dry-run`, and `run --once` all behave as expected, use daemon mode for the long-running pilot loop:
+
+```sh
+cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml
+```
+
 ## Worktree behavior
 
 Each issue gets a deterministic lane:
