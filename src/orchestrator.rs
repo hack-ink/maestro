@@ -554,6 +554,10 @@ fn build_developer_instructions(
 		sections.push(format!("WORKFLOW.md\n{}", workflow.body()));
 	}
 
+	sections.push(String::from(
+		"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
+	));
+
 	sections.push(format!(
 		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When implementation and repo validation are complete, call `{transition_tool}` to move the issue to `{success}` and add a brief `{comment_tool}` comment summarizing the result.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
@@ -576,7 +580,7 @@ fn build_user_input(
 	issue_run: &IssueRunPlan,
 ) -> String {
 	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Implement the fix in the current worktree.\n- Run the repository validation needed to justify moving the issue to `{success}`.\n- When done, move the issue to `{success}` with `{transition_tool}` and leave a short `{comment_tool}` completion comment with the result.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.",
+		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current worktree.\n- Run the repository validation needed to justify moving the issue to `{success}`.\n- When done, move the issue to `{success}` with `{transition_tool}` and leave a short `{comment_tool}` completion comment with the result.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.",
 		identifier = issue.identifier,
 		title = issue.title,
 		description = if issue.description.trim().is_empty() {
@@ -997,6 +1001,29 @@ Follow the repository policy.
 			}
 		);
 		assert!(tracker.comments.borrow().is_empty());
+	}
+
+	#[test]
+	fn developer_instructions_bound_pre_edit_discovery() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue,
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: String::from("PUB-101"),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1-123"),
+		};
+		let instructions =
+			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
+				.expect("developer instructions should build");
+
+		assert!(instructions.contains("Keep pre-edit discovery bounded"));
+		assert!(instructions.contains("Do not browse upstream references"));
 	}
 
 	#[test]
