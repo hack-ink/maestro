@@ -129,6 +129,8 @@ impl WorkspaceManager {
 		}
 
 		let setup_result = (|| -> Result<()> {
+			copy_repo_local_git_config(&self.repo_root, &spec.path)?;
+
 			if let Some(source_origin_url) = source_origin_url.as_deref() {
 				run_git(
 					&spec.path,
@@ -239,6 +241,38 @@ where
 	}
 
 	Ok(())
+}
+
+fn copy_repo_local_git_config(source_repo_root: &Path, workspace_path: &Path) -> Result<()> {
+	let local_entries = git_stdout(
+		source_repo_root,
+		["config", "--local", "--null", "--list"],
+		"read source repository local git config",
+	)?;
+
+	for raw_entry in local_entries.split('\0').filter(|entry| !entry.is_empty()) {
+		let Some((key, value)) = raw_entry.split_once('\n') else {
+			continue;
+		};
+
+		if !should_copy_local_git_config(key) {
+			continue;
+		}
+
+		run_git(
+			workspace_path,
+			["config", "--local", "--add", key, value],
+			"copy source repository local git config into the workspace",
+		)?;
+	}
+
+	Ok(())
+}
+
+fn should_copy_local_git_config(key: &str) -> bool {
+	key.starts_with("user.")
+		|| key.starts_with("gpg.")
+		|| matches!(key, "commit.gpgsign" | "tag.gpgsign")
 }
 
 fn sanitize_branch_component(value: &str) -> String {
@@ -366,6 +400,35 @@ mod tests {
 
 		assert!(git_dir.starts_with(&workspace_root));
 		assert!(git_common_dir.starts_with(&workspace_root));
+	}
+
+	#[test]
+	fn clone_backed_workspace_copies_repo_local_identity_config() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+
+		run_git(&repo_root, &["config", "commit.gpgsign", "false"]);
+		run_git(&repo_root, &["config", "user.signingkey", "workspace-tests"]);
+
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
+
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "user.name"]),
+			"Maestro Tests"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "user.email"]),
+			"maestro-tests@example.com"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "commit.gpgsign"]),
+			"false"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "user.signingkey"]),
+			"workspace-tests"
+		);
 	}
 
 	#[test]
