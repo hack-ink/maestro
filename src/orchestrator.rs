@@ -25,7 +25,7 @@ use crate::{
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
-	state::{ProjectRunStatus, RunAttempt, StateStore, WorktreeMapping},
+	state::{ProjectRunStatus, RunAttempt, StateStore, WorkspaceMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
 	workflow::WorkflowDocument,
 	workspace::{WorkspaceManager, WorkspaceSpec},
@@ -39,7 +39,7 @@ struct RunSummary {
 	issue_id: String,
 	issue_identifier: String,
 	branch_name: String,
-	worktree_path: PathBuf,
+	workspace_path: PathBuf,
 	attempt_number: i64,
 	run_id: String,
 }
@@ -129,7 +129,7 @@ enum ActiveRunDisposition {
 struct ActiveRunReconciliation {
 	issue: TrackerIssue,
 	run_attempt: RunAttempt,
-	worktree_mapping: Option<WorktreeMapping>,
+	workspace_mapping: Option<WorkspaceMapping>,
 	disposition: ActiveRunDisposition,
 }
 
@@ -143,7 +143,7 @@ struct OperatorStatusSnapshot {
 	run_limit: usize,
 	active_runs: Vec<OperatorRunStatus>,
 	recent_runs: Vec<OperatorRunStatus>,
-	worktrees: Vec<OperatorWorktreeStatus>,
+	workspaces: Vec<OperatorWorkspaceStatus>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -159,14 +159,14 @@ struct OperatorRunStatus {
 	last_event_at: Option<String>,
 	event_count: i64,
 	branch_name: Option<String>,
-	worktree_path: Option<String>,
+	workspace_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct OperatorWorktreeStatus {
+struct OperatorWorkspaceStatus {
 	issue_id: String,
 	branch_name: String,
-	worktree_path: String,
+	workspace_path: String,
 }
 
 pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prelude::Result<()> {
@@ -188,20 +188,20 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prel
 	if let Some(summary) = run_configured_cycle(&config_path, &state_store, dry_run)? {
 		if dry_run {
 			println!(
-				"dry run: project={} issue={} branch={} worktree={} attempt={}",
+				"dry run: project={} issue={} branch={} workspace={} attempt={}",
 				summary.project_id,
 				summary.issue_identifier,
 				summary.branch_name,
-				summary.worktree_path.display(),
+				summary.workspace_path.display(),
 				summary.attempt_number
 			);
 		} else {
 			println!(
-				"run complete: project={} issue={} run_id={} worktree={}",
+				"run complete: project={} issue={} run_id={} workspace={}",
 				summary.project_id,
 				summary.issue_identifier,
 				summary.run_id,
-				summary.worktree_path.display()
+				summary.workspace_path.display()
 			);
 		}
 
@@ -419,7 +419,7 @@ where
 
 			tracing::info!(
 				issue = summary.issue_identifier,
-				worktree = %summary.worktree_path.display(),
+				workspace = %summary.workspace_path.display(),
 				"Spawned daemon child for active issue lane."
 			);
 
@@ -518,7 +518,7 @@ where
 			actions.push(ActiveRunReconciliation {
 				issue: issue.clone(),
 				run_attempt,
-				worktree_mapping: state_store.worktree_for_issue(&issue.id)?,
+				workspace_mapping: state_store.workspace_for_issue(&issue.id)?,
 				disposition,
 			});
 		}
@@ -580,7 +580,7 @@ where
 	Ok(vec![ActiveRunReconciliation {
 		issue,
 		run_attempt,
-		worktree_mapping: state_store.worktree_for_issue(issue_id)?,
+		workspace_mapping: state_store.workspace_for_issue(issue_id)?,
 		disposition: ActiveRunDisposition::Stalled { idle_for },
 	}])
 }
@@ -612,8 +612,8 @@ where
 
 				state_store.clear_lease(&action.issue.id)?;
 
-				if let Some(mapping) = &action.worktree_mapping {
-					cleanup_worktree_mapping(state_store, workspace_manager, mapping)?;
+				if let Some(mapping) = &action.workspace_mapping {
+					cleanup_workspace_mapping(state_store, workspace_manager, mapping)?;
 				}
 			},
 			ActiveRunDisposition::NonActive => {
@@ -648,12 +648,12 @@ where
 				state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
 				state_store.clear_lease(&action.issue.id)?;
 
-				let workspace = action.worktree_mapping.as_ref().map_or_else(
+				let workspace = action.workspace_mapping.as_ref().map_or_else(
 					|| workspace_manager.plan_for_issue(&action.issue.identifier),
 					|mapping| WorkspaceSpec {
 						branch_name: mapping.branch_name().to_owned(),
 						issue_identifier: action.issue.identifier.clone(),
-						path: mapping.worktree_path().to_path_buf(),
+						path: mapping.workspace_path().to_path_buf(),
 						reused_existing: true,
 					},
 				);
@@ -786,7 +786,7 @@ where
 	let workspace = workspace_manager.ensure_workspace(&issue.identifier, dry_run)?;
 
 	if !dry_run {
-		state_store.upsert_worktree(
+		state_store.upsert_workspace(
 			project.id(),
 			&issue.id,
 			&workspace.branch_name,
@@ -800,7 +800,12 @@ where
 
 	if !is_issue_eligible(&issue, workflow, state_store)? {
 		if !dry_run && is_terminal_issue(&issue, workflow) {
-			cleanup_terminal_worktree(state_store, &workspace_manager, &issue.id, &workspace.path)?;
+			cleanup_terminal_workspace(
+				state_store,
+				&workspace_manager,
+				&issue.id,
+				&workspace.path,
+			)?;
 		}
 
 		return Ok(None);
@@ -814,7 +819,7 @@ where
 			issue_id: issue_run.issue.id.clone(),
 			issue_identifier: issue_run.issue.identifier.clone(),
 			branch_name: issue_run.workspace.branch_name.clone(),
-			worktree_path: issue_run.workspace.path.clone(),
+			workspace_path: issue_run.workspace.path.clone(),
 			attempt_number: issue_run.attempt_number,
 			run_id: issue_run.run_id.clone(),
 		}));
@@ -836,9 +841,9 @@ where
 	T: IssueTracker,
 {
 	let leases = state_store.list_leases(project.id())?;
-	let worktrees = state_store.list_worktrees(project.id())?;
+	let workspaces = state_store.list_workspaces(project.id())?;
 
-	if leases.is_empty() && worktrees.is_empty() {
+	if leases.is_empty() && workspaces.is_empty() {
 		return Ok(());
 	}
 
@@ -847,7 +852,7 @@ where
 	for lease in &leases {
 		issue_ids.insert(lease.issue_id().to_owned());
 	}
-	for mapping in &worktrees {
+	for mapping in &workspaces {
 		issue_ids.insert(mapping.issue_id().to_owned());
 	}
 
@@ -867,12 +872,12 @@ where
 
 		state_store.clear_lease(lease.issue_id())?;
 	}
-	for mapping in &worktrees {
+	for mapping in &workspaces {
 		if issues_by_id
 			.get(mapping.issue_id())
 			.is_some_and(|issue| is_terminal_issue(issue, workflow))
 		{
-			cleanup_worktree_mapping(state_store, workspace_manager, mapping)?;
+			cleanup_workspace_mapping(state_store, workspace_manager, mapping)?;
 		}
 	}
 
@@ -941,12 +946,12 @@ where
 		run_id = issue_run.run_id,
 		attempt = issue_run.attempt_number,
 		branch = issue_run.workspace.branch_name,
-		worktree_path = %relative_worktree_path(project, &issue_run.workspace),
+		workspace_path = %relative_workspace_path(project, &issue_run.workspace),
 		"Starting issue run."
 	);
 
 	state_store.upsert_lease(project.id(), &issue_run.issue.id, &issue_run.run_id)?;
-	state_store.upsert_worktree(
+	state_store.upsert_workspace(
 		project.id(),
 		&issue_run.issue.id,
 		&issue_run.workspace.branch_name,
@@ -966,7 +971,7 @@ where
 				run_id = issue_run.run_id,
 				attempt = issue_run.attempt_number,
 				branch = issue_run.workspace.branch_name,
-				worktree_path = %relative_worktree_path(project, &issue_run.workspace),
+				workspace_path = %relative_workspace_path(project, &issue_run.workspace),
 				"Completed issue run."
 			);
 
@@ -1005,7 +1010,7 @@ where
 			attempt_number: issue_run.attempt_number,
 			branch_name: issue_run.workspace.branch_name.clone(),
 			run_id: issue_run.run_id.clone(),
-			worktree_path: relative_worktree_path(project, &issue_run.workspace),
+			workspace_path: relative_workspace_path(project, &issue_run.workspace),
 			cwd: issue_run.workspace.path.clone(),
 		},
 	);
@@ -1064,7 +1069,7 @@ where
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
 		branch_name: issue_run.workspace.branch_name.clone(),
-		worktree_path: issue_run.workspace.path.clone(),
+		workspace_path: issue_run.workspace.path.clone(),
 		attempt_number: issue_run.attempt_number,
 		run_id: issue_run.run_id.clone(),
 	})
@@ -1085,7 +1090,7 @@ where
 	let review_handoff_needs_attention =
 		error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some();
 	let stalled_run_needs_attention = error.downcast_ref::<StalledRunNeedsAttention>().is_some();
-	let worktree_path = relative_worktree_path(project, &issue_run.workspace);
+	let workspace_path = relative_workspace_path(project, &issue_run.workspace);
 
 	if !manual_attention_requested
 		&& !review_handoff_needs_attention
@@ -1100,7 +1105,7 @@ where
 			attempt = issue_run.attempt_number,
 			max_attempts,
 			branch = issue_run.workspace.branch_name,
-			worktree_path = %worktree_path,
+			workspace_path = %workspace_path,
 			error_class = "retryable_execution_failure",
 			"Run failed and remains retryable."
 		);
@@ -1111,7 +1116,7 @@ where
 				&issue_run.run_id,
 				issue_run.attempt_number,
 				max_attempts,
-				worktree_path,
+				workspace_path,
 				&issue_run.workspace.branch_name,
 				error,
 			),
@@ -1124,7 +1129,7 @@ where
 		tracker,
 		workflow,
 		issue_run,
-		&worktree_path,
+		&workspace_path,
 		manual_attention_requested,
 		error,
 	)?;
@@ -1136,7 +1141,7 @@ where
 		run_id = issue_run.run_id,
 		attempt = issue_run.attempt_number,
 		branch = issue_run.workspace.branch_name,
-		worktree_path = %worktree_path,
+		workspace_path = %workspace_path,
 		error_class = outcome.error_class,
 		"Run failed and now requires operator attention."
 	);
@@ -1148,7 +1153,7 @@ fn apply_terminal_failure_writeback<T>(
 	tracker: &T,
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
-	worktree_path: &str,
+	workspace_path: &str,
 	manual_attention_requested: bool,
 	error: &Report,
 ) -> crate::prelude::Result<TerminalFailureOutcome>
@@ -1199,7 +1204,7 @@ where
 		&format_terminal_failure_comment(
 			&issue_run.run_id,
 			issue_run.attempt_number,
-			worktree_path.to_owned(),
+			workspace_path.to_owned(),
 			&issue_run.workspace.branch_name,
 			&recovery_gate,
 			manual_attention_requested,
@@ -1343,25 +1348,25 @@ fn mark_run_attempt_if_active(
 	Ok(())
 }
 
-fn cleanup_worktree_mapping(
+fn cleanup_workspace_mapping(
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
-	mapping: &WorktreeMapping,
+	mapping: &WorkspaceMapping,
 ) -> crate::prelude::Result<()> {
-	workspace_manager.remove_workspace_path(mapping.worktree_path())?;
-	state_store.clear_worktree(mapping.issue_id())?;
+	workspace_manager.remove_workspace_path(mapping.workspace_path())?;
+	state_store.clear_workspace(mapping.issue_id())?;
 
 	Ok(())
 }
 
-fn cleanup_terminal_worktree(
+fn cleanup_terminal_workspace(
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
 	issue_id: &str,
-	worktree_path: &Path,
+	workspace_path: &Path,
 ) -> crate::prelude::Result<()> {
-	workspace_manager.remove_workspace_path(worktree_path)?;
-	state_store.clear_worktree(issue_id)?;
+	workspace_manager.remove_workspace_path(workspace_path)?;
+	state_store.clear_workspace(issue_id)?;
 
 	Ok(())
 }
@@ -1408,7 +1413,7 @@ fn build_user_input(
 	issue_run: &IssueRunPlan,
 ) -> String {
 	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current worktree.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.",
+		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.",
 		identifier = issue.identifier,
 		title = issue.title,
 		description = if issue.description.trim().is_empty() {
@@ -1448,22 +1453,22 @@ fn run_validation_commands(commands: &[String], cwd: &Path) -> crate::prelude::R
 	Ok(())
 }
 
-fn relative_worktree_path(project: &ServiceConfig, workspace: &WorkspaceSpec) -> String {
-	relative_worktree_path_for_path(project, &workspace.path)
+fn relative_workspace_path(project: &ServiceConfig, workspace: &WorkspaceSpec) -> String {
+	relative_workspace_path_for_path(project, &workspace.path)
 }
 
-fn relative_worktree_path_for_path(project: &ServiceConfig, worktree_path: &Path) -> String {
-	if let Ok(relative_path) = worktree_path.strip_prefix(project.repo_root()) {
+fn relative_workspace_path_for_path(project: &ServiceConfig, workspace_path: &Path) -> String {
+	if let Ok(relative_path) = workspace_path.strip_prefix(project.repo_root()) {
 		return relative_path.display().to_string();
 	}
 	if let Some(root_name) = project.workspace_root().file_name()
-		&& let Ok(relative_path) = worktree_path.strip_prefix(project.workspace_root())
+		&& let Ok(relative_path) = workspace_path.strip_prefix(project.workspace_root())
 	{
 		return Path::new(root_name).join(relative_path).display().to_string();
 	}
 
-	worktree_path.file_name().map_or_else(
-		|| worktree_path.display().to_string(),
+	workspace_path.file_name().map_or_else(
+		|| workspace_path.display().to_string(),
 		|path| path.to_string_lossy().into_owned(),
 	)
 }
@@ -1483,13 +1488,13 @@ fn build_operator_status_snapshot(
 		.into_iter()
 		.map(|run| operator_run_status(project, run))
 		.collect::<Vec<_>>();
-	let worktrees = state_store
-		.list_worktrees(project.id())?
+	let workspaces = state_store
+		.list_workspaces(project.id())?
 		.into_iter()
-		.map(|mapping| OperatorWorktreeStatus {
+		.map(|mapping| OperatorWorkspaceStatus {
 			issue_id: mapping.issue_id().to_owned(),
 			branch_name: mapping.branch_name().to_owned(),
-			worktree_path: relative_worktree_path_for_path(project, mapping.worktree_path()),
+			workspace_path: relative_workspace_path_for_path(project, mapping.workspace_path()),
 		})
 		.collect::<Vec<_>>();
 
@@ -1498,7 +1503,7 @@ fn build_operator_status_snapshot(
 		run_limit: limit,
 		active_runs,
 		recent_runs,
-		worktrees,
+		workspaces,
 	})
 }
 
@@ -1515,9 +1520,9 @@ fn operator_run_status(project: &ServiceConfig, run: ProjectRunStatus) -> Operat
 		last_event_at: run.last_event_at().map(str::to_owned),
 		event_count: run.event_count(),
 		branch_name: run.branch_name().map(str::to_owned),
-		worktree_path: run
-			.worktree_path()
-			.map(|path| relative_worktree_path_for_path(project, path)),
+		workspace_path: run
+			.workspace_path()
+			.map(|path| relative_workspace_path_for_path(project, path)),
 	}
 }
 
@@ -1527,7 +1532,7 @@ fn render_operator_status(snapshot: &OperatorStatusSnapshot) -> String {
 	output.push_str(&format!("Project: {}\n", snapshot.project_id));
 	output.push_str(&format!("Active runs: {}\n", snapshot.active_runs.len()));
 	output.push_str(&format!("Recent runs shown: {}\n", snapshot.recent_runs.len()));
-	output.push_str(&format!("Retained worktrees: {}\n", snapshot.worktrees.len()));
+	output.push_str(&format!("Retained workspaces: {}\n", snapshot.workspaces.len()));
 	output.push_str("\nActive Runs\n");
 
 	if snapshot.active_runs.is_empty() {
@@ -1548,15 +1553,15 @@ fn render_operator_status(snapshot: &OperatorStatusSnapshot) -> String {
 		}
 	}
 
-	output.push_str("\nRetained Worktrees\n");
+	output.push_str("\nRetained Workspaces\n");
 
-	if snapshot.worktrees.is_empty() {
+	if snapshot.workspaces.is_empty() {
 		output.push_str("- none\n");
 	} else {
-		for worktree in &snapshot.worktrees {
+		for workspace in &snapshot.workspaces {
 			output.push_str(&format!(
-				"- issue_id: {}\n  branch: {}\n  worktree_path: {}\n",
-				worktree.issue_id, worktree.branch_name, worktree.worktree_path
+				"- issue_id: {}\n  branch: {}\n  workspace_path: {}\n",
+				workspace.issue_id, workspace.branch_name, workspace.workspace_path
 			));
 		}
 	}
@@ -1573,10 +1578,10 @@ fn append_rendered_run(output: &mut String, run: &OperatorRunStatus) {
 	};
 	let thread_id = run.thread_id.as_deref().unwrap_or("none");
 	let branch_name = run.branch_name.as_deref().unwrap_or("none");
-	let worktree_path = run.worktree_path.as_deref().unwrap_or("none");
+	let workspace_path = run.workspace_path.as_deref().unwrap_or("none");
 
 	output.push_str(&format!(
-		"- run_id: {}\n  issue_id: {}\n  attempt: {}\n  status: {}\n  active_lease: {}\n  thread_id: {}\n  branch: {}\n  worktree_path: {}\n  updated_at: {}\n  last_event: {}\n  event_count: {}\n",
+		"- run_id: {}\n  issue_id: {}\n  attempt: {}\n  status: {}\n  active_lease: {}\n  thread_id: {}\n  branch: {}\n  workspace_path: {}\n  updated_at: {}\n  last_event: {}\n  event_count: {}\n",
 		run.run_id,
 		run.issue_id,
 		run.attempt_number,
@@ -1584,7 +1589,7 @@ fn append_rendered_run(output: &mut String, run: &OperatorRunStatus) {
 		if run.active_lease { "yes" } else { "no" },
 		thread_id,
 		branch_name,
-		worktree_path,
+		workspace_path,
 		run.updated_at,
 		last_event,
 		run.event_count
@@ -1623,22 +1628,22 @@ fn format_retry_comment(
 	run_id: &str,
 	attempt_number: i64,
 	max_attempts: i64,
-	worktree_path: String,
+	workspace_path: String,
 	branch_name: &str,
 	error: &Report,
 ) -> String {
 	format!(
-		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- worktree_path: `{worktree}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
+		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
-		worktree = worktree_path
+		workspace = workspace_path
 	)
 }
 
 fn format_terminal_failure_comment(
 	run_id: &str,
 	attempt_number: i64,
-	worktree_path: String,
+	workspace_path: String,
 	branch_name: &str,
 	recovery_gate: &str,
 	manual_attention_requested: bool,
@@ -1648,35 +1653,35 @@ fn format_terminal_failure_comment(
 		(
 			"human_attention_required",
 			format!(
-				"inspect the issue comment and worktree, resolve the blocker manually, {recovery_gate}"
+				"inspect the issue comment and workspace, resolve the blocker manually, {recovery_gate}"
 			),
 		)
 	} else if error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some() {
 		(
 			"review_handoff_writeback_failed",
 			format!(
-				"inspect the tracker state, PR, and worktree, repair the incomplete review handoff manually, {recovery_gate}"
+				"inspect the tracker state, PR, and workspace, repair the incomplete review handoff manually, {recovery_gate}"
 			),
 		)
 	} else if error.downcast_ref::<StalledRunNeedsAttention>().is_some() {
 		(
 			"stalled_run_detected",
 			format!(
-				"inspect the worktree and app-server activity for the stalled lane, resolve the blocker manually, {recovery_gate}"
+				"inspect the workspace and app-server activity for the stalled lane, resolve the blocker manually, {recovery_gate}"
 			),
 		)
 	} else {
 		(
 			"retry_budget_exhausted",
-			format!("inspect the worktree, resolve the issue manually, {recovery_gate}"),
+			format!("inspect the workspace, resolve the issue manually, {recovery_gate}"),
 		)
 	};
 
 	format!(
-		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- worktree_path: `{worktree}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error: `{error}`",
+		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error: `{error}`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
-		worktree = worktree_path
+		workspace = workspace_path
 	)
 }
 
@@ -2151,7 +2156,7 @@ read_first = [{read_first}]
 				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
 				branch_name: String::from("x/pubfi-pub-101"),
-				worktree_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
+				workspace_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
 				attempt_number: 1,
 				run_id: summary.run_id.clone(),
 			}
@@ -2299,16 +2304,19 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn failure_comments_use_repo_relative_worktree_paths() {
+	fn failure_comments_use_repo_relative_workspace_paths() {
 		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let workspace = WorkspaceSpec {
 			branch_name: String::from("x/pubfi-pub-101"),
 			issue_identifier: String::from("PUB-101"),
-			path: config.repo_root().join(".worktrees/PUB-101"),
+			path: config.repo_root().join(".workspaces/PUB-101"),
 			reused_existing: true,
 		};
 
-		assert_eq!(orchestrator::relative_worktree_path(&config, &workspace), ".worktrees/PUB-101");
+		assert_eq!(
+			orchestrator::relative_workspace_path(&config, &workspace),
+			".workspaces/PUB-101"
+		);
 	}
 
 	#[test]
@@ -2316,7 +2324,7 @@ read_first = [{read_first}]
 		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("Todo", &[]);
-		let worktree_path = config.workspace_root().join("PUB-101");
+		let workspace_path = config.workspace_root().join("PUB-101");
 
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
@@ -2324,13 +2332,13 @@ read_first = [{read_first}]
 		state_store.update_run_thread("run-1", "thread-1").expect("thread id should attach");
 		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
 		state_store
-			.upsert_worktree(
+			.upsert_workspace(
 				"pubfi",
 				&issue.id,
 				"x/pubfi-pub-101",
-				&worktree_path.display().to_string(),
+				&workspace_path.display().to_string(),
 			)
-			.expect("worktree should record");
+			.expect("workspace should record");
 		state_store
 			.append_event("run-1", 1, "turn/completed", "{\"turn\":\"1\"}")
 			.expect("event should record");
@@ -2344,9 +2352,9 @@ read_first = [{read_first}]
 		assert_eq!(snapshot.active_runs[0].run_id, "run-1");
 		assert_eq!(snapshot.active_runs[0].thread_id.as_deref(), Some("thread-1"));
 		assert_eq!(snapshot.active_runs[0].branch_name.as_deref(), Some("x/pubfi-pub-101"));
-		assert_eq!(snapshot.active_runs[0].worktree_path.as_deref(), Some("workspaces/PUB-101"));
+		assert_eq!(snapshot.active_runs[0].workspace_path.as_deref(), Some("workspaces/PUB-101"));
 		assert_eq!(snapshot.active_runs[0].last_event_type.as_deref(), Some("turn/completed"));
-		assert_eq!(snapshot.worktrees[0].worktree_path, "workspaces/PUB-101");
+		assert_eq!(snapshot.workspaces[0].workspace_path, "workspaces/PUB-101");
 	}
 
 	#[test]
@@ -2378,13 +2386,13 @@ read_first = [{read_first}]
 				.expect("run attempt should record");
 			state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
 			state_store
-				.upsert_worktree(
+				.upsert_workspace(
 					"pubfi",
 					&issue.id,
 					&format!("x/pubfi-pub-{branch_suffix}"),
 					&config.workspace_root().join(&issue.identifier).display().to_string(),
 				)
-				.expect("worktree should record");
+				.expect("workspace should record");
 		}
 
 		let snapshot = orchestrator::build_operator_status_snapshot(&config, &state_store, 1)
@@ -2413,13 +2421,13 @@ read_first = [{read_first}]
 				last_event_at: Some(String::from("2026-03-14 10:00:01")),
 				event_count: 4,
 				branch_name: Some(String::from("x/pubfi-pub-101")),
-				worktree_path: Some(String::from(".worktrees/PUB-101")),
+				workspace_path: Some(String::from(".workspaces/PUB-101")),
 			}],
 			recent_runs: vec![],
-			worktrees: vec![orchestrator::OperatorWorktreeStatus {
+			workspaces: vec![orchestrator::OperatorWorkspaceStatus {
 				issue_id: String::from("issue-1"),
 				branch_name: String::from("x/pubfi-pub-101"),
-				worktree_path: String::from(".worktrees/PUB-101"),
+				workspace_path: String::from(".workspaces/PUB-101"),
 			}],
 		};
 		let rendered = orchestrator::render_operator_status(&snapshot);
@@ -2428,8 +2436,8 @@ read_first = [{read_first}]
 		assert!(rendered.contains("Active Runs"));
 		assert!(rendered.contains("run_id: run-1"));
 		assert!(rendered.contains("last_event: turn/completed @ 2026-03-14 10:00:01"));
-		assert!(rendered.contains("Retained Worktrees"));
-		assert!(rendered.contains("worktree_path: .worktrees/PUB-101"));
+		assert!(rendered.contains("Retained Workspaces"));
+		assert!(rendered.contains("workspace_path: .workspaces/PUB-101"));
 	}
 
 	#[test]
@@ -2442,7 +2450,7 @@ read_first = [{read_first}]
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
-			String::from(".worktrees/PUB-101"),
+			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
 			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 			true,
@@ -2463,7 +2471,7 @@ read_first = [{read_first}]
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
-			String::from(".worktrees/PUB-101"),
+			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
 			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 			false,
@@ -2485,7 +2493,7 @@ read_first = [{read_first}]
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
-			String::from(".worktrees/PUB-101"),
+			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
 			"`maestro:needs-attention` could not be applied because it does not exist on the team; the issue remains in `In Progress` to block automatic retries, so move it back to a startable state manually if another automated run is desired",
 			false,
@@ -2516,25 +2524,25 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn reconciliation_clears_stale_leases_and_terminal_worktrees() {
+	fn reconciliation_clears_stale_leases_and_terminal_workspaces() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Done", &[]);
 		let tracker = FakeTracker::new(vec![issue.clone()]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let worktree_path = config.workspace_root().join("PUB-101");
+		let workspace_path = config.workspace_root().join("PUB-101");
 
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
 			.expect("run attempt should record");
 		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
 		state_store
-			.upsert_worktree(
+			.upsert_workspace(
 				"pubfi",
 				&issue.id,
 				"x/pubfi-pub-101",
-				&worktree_path.display().to_string(),
+				&workspace_path.display().to_string(),
 			)
-			.expect("worktree mapping should record");
+			.expect("workspace mapping should record");
 
 		let summary =
 			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
@@ -2546,8 +2554,8 @@ read_first = [{read_first}]
 		);
 		assert!(
 			state_store
-				.worktree_for_issue(&issue.id)
-				.expect("worktree lookup should work")
+				.workspace_for_issue(&issue.id)
+				.expect("workspace lookup should work")
 				.is_none()
 		);
 		assert_eq!(
@@ -2776,7 +2784,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn active_run_reconciliation_keeps_nonterminal_nonactive_worktrees() {
+	fn active_run_reconciliation_keeps_nonterminal_nonactive_workspaces() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -2787,20 +2795,20 @@ read_first = [{read_first}]
 		);
 		let issue = sample_issue("Todo", &[]);
 		let run_id = "run-nonactive";
-		let worktree_path = config.workspace_root().join("PUB-101");
+		let workspace_path = config.workspace_root().join("PUB-101");
 
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
 		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
 		state_store
-			.upsert_worktree(
+			.upsert_workspace(
 				"pubfi",
 				&issue.id,
 				"x/pubfi-pub-101",
-				&worktree_path.display().to_string(),
+				&workspace_path.display().to_string(),
 			)
-			.expect("worktree mapping should record");
+			.expect("workspace mapping should record");
 
 		let action = orchestrator::ActiveRunReconciliation {
 			issue: issue.clone(),
@@ -2808,9 +2816,9 @@ read_first = [{read_first}]
 				.run_attempt(run_id)
 				.expect("run attempt query should succeed")
 				.expect("run attempt should exist"),
-			worktree_mapping: state_store
-				.worktree_for_issue(&issue.id)
-				.expect("worktree query should succeed"),
+			workspace_mapping: state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace query should succeed"),
 			disposition: orchestrator::ActiveRunDisposition::NonActive,
 		};
 
@@ -2829,8 +2837,8 @@ read_first = [{read_first}]
 		);
 		assert!(
 			state_store
-				.worktree_for_issue(&issue.id)
-				.expect("worktree lookup should succeed")
+				.workspace_for_issue(&issue.id)
+				.expect("workspace lookup should succeed")
 				.is_some()
 		);
 		assert_eq!(
@@ -2855,20 +2863,20 @@ read_first = [{read_first}]
 		);
 		let issue = sample_issue("In Progress", &[]);
 		let run_id = "run-stalled";
-		let worktree_path = config.workspace_root().join("PUB-101");
+		let workspace_path = config.workspace_root().join("PUB-101");
 
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
 		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
 		state_store
-			.upsert_worktree(
+			.upsert_workspace(
 				"pubfi",
 				&issue.id,
 				"x/pubfi-pub-101",
-				&worktree_path.display().to_string(),
+				&workspace_path.display().to_string(),
 			)
-			.expect("worktree mapping should record");
+			.expect("workspace mapping should record");
 
 		let action = orchestrator::ActiveRunReconciliation {
 			issue: issue.clone(),
@@ -2876,9 +2884,9 @@ read_first = [{read_first}]
 				.run_attempt(run_id)
 				.expect("run attempt query should succeed")
 				.expect("run attempt should exist"),
-			worktree_mapping: state_store
-				.worktree_for_issue(&issue.id)
-				.expect("worktree query should succeed"),
+			workspace_mapping: state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace query should succeed"),
 			disposition: orchestrator::ActiveRunDisposition::Stalled {
 				idle_for: ACTIVE_RUN_IDLE_TIMEOUT + Duration::from_secs(1),
 			},
@@ -2899,8 +2907,8 @@ read_first = [{read_first}]
 		);
 		assert!(
 			state_store
-				.worktree_for_issue(&issue.id)
-				.expect("worktree lookup should succeed")
+				.workspace_for_issue(&issue.id)
+				.expect("workspace lookup should succeed")
 				.is_some()
 		);
 		assert_eq!(
@@ -3026,8 +3034,8 @@ read_first = [{read_first}]
 		);
 		assert!(
 			state_store
-				.worktree_for_issue(&listed_issue.id)
-				.expect("worktree lookup should work")
+				.workspace_for_issue(&listed_issue.id)
+				.expect("workspace lookup should work")
 				.is_some()
 		);
 		assert!(tracker.comments.borrow().is_empty());

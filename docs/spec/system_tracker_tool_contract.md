@@ -76,7 +76,7 @@ In either invalid case, `maestro` must fail the attempt rather than infer which 
 - `issue_review_handoff` and the human-attention exit are mutually exclusive terminal signals for the same turn.
 - Before a live run starts, `maestro` must preflight the local GitHub CLI dependency used for review handoff inspection instead of discovering a missing `gh` binary only after an otherwise successful turn.
 - Comment bodies should remain repository-controlled or agent-authored, but all tool calls must be journaled by `maestro` for recovery and audit.
-- Structured comment fields such as `worktree_path` must use repository-relative paths; absolute host paths should be rejected before writing to the tracker.
+- Structured comment fields such as `workspace_path` must use repository-relative paths; absolute host paths should be rejected before writing to the tracker.
 - Dynamic tool names must satisfy the `codex app-server` identifier restriction `^[a-zA-Z0-9_-]+$`; dotted names are invalid.
 
 ## Failure handling

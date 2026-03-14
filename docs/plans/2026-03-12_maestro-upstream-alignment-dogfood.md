@@ -9,7 +9,7 @@ Realign `maestro` with the important ownership and runtime boundaries from upstr
 - Keep `WORKFLOW.md` as Markdown plus TOML frontmatter and document that choice as a deliberate divergence from upstream.
 - Move tracker write ownership from service-owned Linear mutations toward agent-owned issue writes through a narrow issue-scoped tool contract.
 - Harden the Linear adapter to use a stable project identifier, pagination, and reconciliation-oriented reads instead of project-name equality only.
-- Add the missing orchestration behaviors that matter for self-dogfooding: startup reconciliation, ineligible-stop handling, and terminal worktree cleanup.
+- Add the missing orchestration behaviors that matter for self-dogfooding: startup reconciliation, ineligible-stop handling, and terminal workspace cleanup.
 - Make this repository a first-class target repo with its own root `WORKFLOW.md`, safe pilot config guidance, and one bounded pilot flow.
 
 ## Non-goals
@@ -45,9 +45,9 @@ Realign `maestro` with the important ownership and runtime boundaries from upstr
 - Preferred follow-up tracker tool transport: a client-side dynamic tool bridge handled inside the existing `app_server` JSON-RPC client, based on the local schema exposing server-driven tool call requests.
 - Dynamic tool registration shape is now verified locally: `initialize.capabilities.experimentalApi = true` plus `thread/start.dynamicTools = [...]`. `--experimental` is required for schema generation, but runtime enablement lives in the handshake rather than a `features.*` config flag.
 - Canonical Linear project identity for service config and workflow policy: `project_slug`, matching the upstream Symphony notion and mapping to Linear project `slugId` in the reader query layer.
-- Preserve the current worktree-first lane model. One Linear issue should still map to one isolated branch and one `git worktree` checkout.
+- Preserve the current workspace-first lane model. One Linear issue should still map to one isolated branch and one `git workspace` checkout.
 - Use `maestro` itself as the first target repo because it gives the cleanest dry-run and first-live-run path with the lowest external blast radius.
-- Local reconciliation state now scopes leases and worktree mappings by configured `id` so one `maestro.toml` manages one project lane without cross-project cleanup.
+- Local reconciliation state now scopes leases and workspace mappings by configured `id` so one `maestro.toml` manages one project lane without cross-project cleanup.
 - The first self-dogfood tracker scope is the bounded helixbox Linear project `Maestro MVP`, currently identified by project slug `maestro-mvp-10bbdae9b904`.
 
 ## Implementation Outline
@@ -198,7 +198,7 @@ done
 
 **Outcome**
 
-`maestro` behaves more like an upstream scheduler/runner: it can reconcile startup state, stop or skip runs whose issues became ineligible, and clean up worktrees once issues become terminal.
+`maestro` behaves more like an upstream scheduler/runner: it can reconcile startup state, stop or skip runs whose issues became ineligible, and clean up workspaces once issues become terminal.
 
 **Files**
 
@@ -212,9 +212,9 @@ done
 
 1. Add startup reconciliation that compares local leases and retained run state against current tracker state before starting new work.
 2. Implement the minimum stop/skip semantics needed when an issue becomes terminal or otherwise ineligible while `maestro` is preparing or reconsidering a lane.
-3. Add terminal worktree cleanup and retention rules that match the runtime spec instead of leaving cleanup as a future-only note.
+3. Add terminal workspace cleanup and retention rules that match the runtime spec instead of leaving cleanup as a future-only note.
 4. Document the operator-visible behavior for these transitions in the runtime spec and pilot guide.
-5. Scope local issue leases and worktree mappings by configured `id` so reconciliation and cleanup only operate within the current project lane.
+5. Scope local issue leases and workspace mappings by configured `id` so reconciliation and cleanup only operate within the current project lane.
 
 **Verification**
 
@@ -252,7 +252,7 @@ This repository can be targeted by `maestro` itself with an explicit root `WORKF
 
 1. Add a root `WORKFLOW.md` for this repository using TOML frontmatter plus repo-local policy body.
 2. Document the recommended self-dogfood scope and safety posture so the first pilot uses a bounded `maestro` issue stream rather than an open-ended backlog.
-3. Update the pilot guide so the default narrative is "run `maestro` against `maestro` first," including dry-run-first and worktree-root guidance.
+3. Update the pilot guide so the default narrative is "run `maestro` against `maestro` first," including dry-run-first and workspace-root guidance.
 4. Record the current self-dogfood project identity from helixbox Linear so the root `WORKFLOW.md` and pilot guide use the real `Maestro MVP` slug rather than a placeholder.
 
 **Verification**
@@ -287,7 +287,7 @@ One carefully chosen `maestro` issue has been exercised through the new ownershi
 **Changes**
 
 1. Run `protocol probe` and `run --once --dry-run` against the self-targeting config and record any contract drift discovered during the dry run.
-2. Execute one live run on a low-risk `maestro` issue and capture the observed tracker behavior, worktree lifecycle, and failure-recovery notes.
+2. Execute one live run on a low-risk `maestro` issue and capture the observed tracker behavior, workspace lifecycle, and failure-recovery notes.
 3. Update the plan and pilot guide with the real pilot evidence and any follow-up blockers before onboarding another target repo.
 
 **Verification**

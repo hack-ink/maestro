@@ -9,8 +9,8 @@ Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run 
 ## Alignment note
 
 - Normal-path tracker writes now belong to the coding agent through issue-scoped tools.
-- `maestro` still owns startup reconciliation, local leases, worktree lifecycle, retries, and fallback tracker writes when a run never reaches the normal agent-owned path.
-- Every live pass now starts with reconciliation of stale local leases and terminal worktree mappings before issue selection.
+- `maestro` still owns startup reconciliation, local leases, workspace lifecycle, retries, and fallback tracker writes when a run never reaches the normal agent-owned path.
+- Every live pass now starts with reconciliation of stale local leases and terminal workspace mappings before issue selection.
 
 ## Preconditions
 
@@ -32,7 +32,7 @@ If `protocol probe` does not return `PROBE_OK`, stop there. The orchestrator loo
 
 ## Recommended layout
 
-For the recommended first deployment, keep `maestro.toml` alongside the checked-out `maestro` repo and point it back at this repository. Keep issue worktrees under the repo-local `.worktrees/` directory.
+For the recommended first deployment, keep `maestro.toml` alongside the checked-out `maestro` repo and point it back at this repository. Keep issue workspaces under the repo-local `.workspaces/` directory.
 
 ```text
 /path/to/maestro/
@@ -42,7 +42,7 @@ For the recommended first deployment, keep `maestro.toml` alongside the checked-
   AGENTS.md
   WORKFLOW.md
 
-/path/to/maestro/.worktrees/
+/path/to/maestro/.workspaces/
   PUB-600/
   PUB-601/
 ```
@@ -62,7 +62,7 @@ The local state is scoped by configured `id`, so reconciliation and cleanup oper
 ```toml
 id = "maestro"
 repo_root = "/absolute/path/to/helixbox/maestro"
-workspace_root = "/absolute/path/to/helixbox/maestro/.worktrees"
+workspace_root = "/absolute/path/to/helixbox/maestro/.workspaces"
 workflow_path = "WORKFLOW.md"
 
 [tracker]
@@ -77,7 +77,7 @@ model = "gpt-5-codex"
 Notes:
 
 - `repo_root` should point at this repository for the first self-dogfood pilot.
-- `workspace_root` is where `maestro` creates per-issue `git worktree` lanes. For the first pilot, use a repo-local path such as `.worktrees`.
+- `workspace_root` is where `maestro` creates per-issue clone-backed workspaces. For the first pilot, use a repo-local path such as `.workspaces`.
 - `workflow_path` is repository-relative and defaults to `WORKFLOW.md`.
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
@@ -109,13 +109,13 @@ If `maestro:needs-attention` does not exist, the run will still fail correctly. 
 
 ## Recommended first scope
 
-Use `maestro` itself as the first target repo and keep the tracker scope bounded to the `Maestro Pilot Ops Hardening` project rather than a broad team backlog. That keeps the current dry run and live run inside one repo, one project, and one worktree root.
+Use `maestro` itself as the first target repo and keep the tracker scope bounded to the `Maestro Pilot Ops Hardening` project rather than a broad team backlog. That keeps the current dry run and live run inside one repo, one project, and one workspace root.
 
 ## Running the pilot
 
 ### Dry run
 
-Use dry run first to validate config loading, issue discovery, and workspace planning without mutating Linear or creating worktrees.
+Use dry run first to validate config loading, issue discovery, and workspace planning without mutating Linear or creating workspace directories.
 
 ```sh
 cargo run -- run --once --dry-run --config ./maestro.toml
@@ -127,7 +127,7 @@ Expected behavior:
 - loads the target repo `WORKFLOW.md`
 - queries Linear for the configured project slug
 - applies the eligibility filter
-- prints the selected issue, branch name, worktree path, and attempt number
+- prints the selected issue, branch name, workspace path, and attempt number
 
 If no config is found, the command exits cleanly with:
 
@@ -143,14 +143,14 @@ cargo run -- run --once --config ./maestro.toml
 
 On a normal successful run, `maestro` will:
 
-1. reconcile stale leases and terminal worktree mappings for the configured project
+1. reconcile stale leases and terminal workspace mappings for the configured project
 2. select one eligible Linear issue
-3. create or reuse a deterministic `git worktree`
+3. create or reuse a deterministic clone-backed workspace
 4. refresh the issue once more before execution and skip the lane if it became terminal or otherwise ineligible
 5. acquire a local lease
 6. let the coding agent perform the normal-path `In Progress` transition and start comment through issue-scoped tools
 7. run Codex through direct `app-server`
-8. run the configured validation commands inside the worktree
+8. run the configured validation commands inside the workspace
 9. require the coding agent to record a PR-backed review handoff through the issue-scoped tool bridge
 10. let `maestro` write the completion comment and `In Review` transition only after its own validation succeeds
 
@@ -167,13 +167,13 @@ During daemon mode, each poll tick now does two distinct things:
 
 The active-lane reconciliation rules are:
 
-- terminal issue: stop the lane, mark the run `terminated`, and remove the worktree
-- non-terminal issue that has left both `In Progress` and any configured startable pre-claim state: stop the lane, mark the run `interrupted`, and keep the worktree
+- terminal issue: stop the lane, mark the run `terminated`, and remove the workspace
+- non-terminal issue that has left both `In Progress` and any configured startable pre-claim state: stop the lane, mark the run `interrupted`, and keep the workspace
 - issue still sitting in a startable state during early startup: leave it alone for that tick so the child can finish its initial tracker transition
 - stalled lane with no app-server activity through the idle budget: stop the lane, mark the run `stalled`, and move the issue back through the human-attention failure path for manual repair
 - child already exited before the next tick: still inspect persisted protocol activity so idle-timeout exits converge as `stalled`
 
-## Worktree behavior
+## Workspace behavior
 
 Each issue gets a deterministic lane:
 
@@ -184,12 +184,14 @@ Example:
 
 ```text
 branch  x/maestro-pub-600
-path    /absolute/path/to/helixbox/maestro/.worktrees/PUB-600
+path    /absolute/path/to/helixbox/maestro/.workspaces/PUB-600
 ```
 
-Retries reuse the same worktree path.
+Retries reuse the same workspace path.
 
-If an issue becomes non-terminal but temporarily ineligible while the lane is being prepared, `maestro` skips execution for that pass and leaves the worktree in place for a later retry.
+If an issue becomes non-terminal but temporarily ineligible while the lane is being prepared, `maestro` skips execution for that pass and leaves the workspace in place for a later retry.
+
+Each workspace is self-contained even when the visible directory lives under `.workspaces/<ISSUE>`. `maestro` clones the source repository into that lane, rewrites `origin` back to the source repository's remote, and refuses to continue if `git_dir` or `git_common_dir` resolves outside the lane root.
 
 ## Inspecting a failed run
 
@@ -201,14 +203,14 @@ Start with Linear:
 - if the agent explicitly requested human attention, expect the issue to move back to `Todo` with `maestro:needs-attention` immediately instead of retrying
 - any issue that still carries `maestro:needs-attention` is intentionally ineligible for another automatic run until a human clears that label
 - if the failure comment says the label was unavailable on the team, expect the issue to remain in a non-startable guard state such as `In Progress` until a human moves it back to a startable state manually
-- if the issue is already terminal, expect the worktree to disappear on the next live pass or startup reconciliation
-- if the run failed as `stalled_run_detected`, expect the worktree to remain in place so you can inspect the partially completed lane before re-enabling automation
+- if the issue is already terminal, expect the workspace to disappear on the next live pass or startup reconciliation
+- if the run failed as `stalled_run_detected`, expect the workspace to remain in place so you can inspect the partially completed lane before re-enabling automation
 
-Then inspect the worktree mentioned in the comment:
+Then inspect the workspace mentioned in the comment:
 
 ```sh
-git -C /absolute/path/to/helixbox/maestro/.worktrees/PUB-600 status --short
-git -C /absolute/path/to/helixbox/maestro/.worktrees/PUB-600 log --oneline --decorate -5
+git -C /absolute/path/to/helixbox/maestro/.workspaces/PUB-600 status --short
+git -C /absolute/path/to/helixbox/maestro/.workspaces/PUB-600 log --oneline --decorate -5
 ```
 
 Before dropping to local storage internals, inspect the supported runtime surface:
@@ -218,7 +220,7 @@ cargo run -- status --config ./maestro.toml
 cargo run -- status --json --config ./maestro.toml
 ```
 
-Use the human-readable view when you need the current leased run, retained worktree, and recent attempt summary at a glance. Use `--json` when you want a machine-readable snapshot with stable identifiers such as `run_id`, `issue_id`, `thread_id`, `branch`, and repository-relative `worktree_path`.
+Use the human-readable view when you need the current leased run, retained workspace, and recent attempt summary at a glance. Use `--json` when you want a machine-readable snapshot with stable identifiers such as `run_id`, `issue_id`, `thread_id`, `branch`, and repository-relative `workspace_path`.
 
 If you still need the thin storage internals for deep forensics, inspect the SQLite file directly as a fallback:
 
@@ -227,7 +229,7 @@ DB_PATH=/absolute/path/to/maestro.sqlite3
 sqlite3 "$DB_PATH" 'select project_id, issue_id, run_id from issue_leases;'
 sqlite3 "$DB_PATH" 'select run_id, issue_id, attempt_number, status, thread_id from run_attempts order by updated_at desc;'
 sqlite3 "$DB_PATH" 'select run_id, sequence_number, event_type from event_journal order by id desc limit 50;'
-sqlite3 "$DB_PATH" 'select project_id, issue_id, branch_name, worktree_path from worktree_mappings;'
+sqlite3 "$DB_PATH" 'select project_id, issue_id, branch_name, workspace_path from workspace_mappings;'
 ```
 
 Use the event journal when the failure happened inside `app-server` transport or thread lifecycle rather than during repo validation commands.
@@ -235,7 +237,7 @@ Use the event journal when the failure happened inside `app-server` transport or
 ## Re-running after failure
 
 - If the run is still retryable, leave the issue in `In Progress` and let `maestro` retry.
-- If the run moved back to `Todo` with `maestro:needs-attention`, inspect the worktree, fix the blocking problem, clear `maestro:needs-attention`, and then move the issue back into a startable state for another automated attempt.
+- If the run moved back to `Todo` with `maestro:needs-attention`, inspect the workspace, fix the blocking problem, clear `maestro:needs-attention`, and then move the issue back into a startable state for another automated attempt.
 - If the issue should never be automated again, add `maestro:manual-only`.
 
 ## Verification commands

@@ -10,7 +10,7 @@ Defines: The runtime scope, source-of-truth boundaries, eligibility rules, lane 
 
 - One `maestro` service instance.
 - One configured Linear project scope at a time.
-- One isolated `git worktree` lane per eligible issue.
+- One isolated clone-backed workspace lane per eligible issue.
 - One direct `codex app-server` session per run attempt.
 
 ## Upstream alignment
@@ -44,7 +44,7 @@ Defines: The runtime scope, source-of-truth boundaries, eligibility rules, lane 
 - Eligible issue: An issue that currently satisfies the `eligibility` rule in this specification.
 - Lease: A local guarantee that only one active `maestro` run is processing a given issue.
 - Run attempt: One bounded orchestration pass for one issue.
-- Lane: The branch plus `git worktree` checkout associated with one issue.
+- Lane: The branch plus clone-backed workspace checkout associated with one issue.
 - Terminal tracker state: A state that should not be auto-started by `maestro`. The default set is `Done`, `Canceled`, and `Duplicate`.
 
 ## Eligibility
@@ -70,11 +70,12 @@ Optional future expansion:
 
 ## Lane model
 
-- One eligible issue maps to one branch and one `git worktree`.
+- One eligible issue maps to one branch and one clone-backed workspace.
 - One active run attempt owns the lane at a time.
 - The lane path must be deterministic from issue identity so retries reuse the same checkout.
-- Worktrees must be created and removed with `git worktree` commands, not manual directory copying or deletion.
-- Worktree mappings and active leases must remain scoped to the configured `maestro.toml` `id` so reconciliation does not cross project boundaries.
+- The visible lane path may still live under a repo-local directory such as `.workspaces/<ISSUE>`, but the backing checkout must be self-contained and keep both `git_dir` and `git_common_dir` inside the lane.
+- Before starting a live run, `maestro` must reject any prepared lane whose Git metadata escapes the writable workspace boundary.
+- Workspace mappings and active leases must remain scoped to the configured `maestro.toml` `id` so reconciliation does not cross project boundaries.
 
 ## Runtime state machine
 
@@ -111,7 +112,7 @@ After the `app-server` turn completes, `maestro` must resolve exactly one comple
   - crash recovery
   - terminal fallback when the agent never reached the point of writing the tracker
 - The service must never grant the coding agent broad tracker write access outside the currently leased issue.
-- Before starting a live run, the service must reconcile stale local leases and any terminal worktree mappings against current tracker state.
+- Before starting a live run, the service must reconcile stale local leases and any terminal workspace mappings against current tracker state.
 - Before starting a live run, the service must fail fast if the local `gh` CLI needed for PR-backed review handoff inspection is unavailable.
 
 ## Linear writeback model
@@ -129,7 +130,7 @@ Required run-start comment fields:
 - `run_id`
 - `attempt`
 - `started_at`
-- `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
+- `workspace_path` as a repository-relative lane path such as `.workspaces/PUB-606`
 - `transport`
 - `model` when configured
 
@@ -170,7 +171,7 @@ Required completion comment fields:
 - `finished_at`
 - `branch`
 - `pr_url`
-- `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
+- `workspace_path` as a repository-relative lane path such as `.workspaces/PUB-606`
 - `validation_result`
 - `summary`
 
@@ -203,7 +204,7 @@ Required failure comment fields:
 - `failed_at`
 - `error_class`
 - `next_action`
-- `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
+- `workspace_path` as a repository-relative lane path such as `.workspaces/PUB-606`
 
 ## Local operational state
 
@@ -213,7 +214,7 @@ The local persistence layer may store only the data needed to operate safely:
 - run attempt identifiers
 - thread or session identifiers
 - protocol event journals
-- worktree mappings
+- workspace mappings
 - tracker-write fallback metadata when the service must repair state after an interrupted run
 
 The local persistence layer must not become the operator-facing source of workflow truth.
@@ -224,14 +225,14 @@ The local persistence layer must not become the operator-facing source of workfl
 
 The minimum supported surface is:
 
-- structured runtime logs with stable identifiers such as `project_id`, `issue_id`, `issue`, `run_id`, `attempt`, `branch`, and repository-relative `worktree_path`
+- structured runtime logs with stable identifiers such as `project_id`, `issue_id`, `issue`, `run_id`, `attempt`, `branch`, and repository-relative `workspace_path`
 - a local status command that renders the current project-scoped snapshot in both human-readable and JSON forms
 
 The status surface should describe only current local execution state, for example:
 
 - active leased runs
 - recent run attempts with local status, thread id, and latest persisted protocol event
-- retained worktree mappings
+- retained workspace mappings
 
 It is acceptable for deeper historical forensics to continue using the retained local store directly, but that store is a fallback implementation detail rather than the supported first-line operator interface.
 
@@ -239,16 +240,16 @@ It is acceptable for deeper historical forensics to continue using the retained 
 
 - Lease and session mappings: remove when the run closes.
 - Attempt and event journals: retain for 14 days.
-- Worktrees: retain while the issue is non-terminal.
-- Terminal issue cleanup: once the issue reaches a terminal tracker state, remove the worktree during reconciliation or startup cleanup.
-- If an issue becomes non-terminal but no longer eligible while `maestro` is still preparing the lane, keep the worktree and skip execution for that pass.
+- Workspaces: retain while the issue is non-terminal.
+- Terminal issue cleanup: once the issue reaches a terminal tracker state, remove the workspace during reconciliation or startup cleanup.
+- If an issue becomes non-terminal but no longer eligible while `maestro` is still preparing the lane, keep the workspace and skip execution for that pass.
 
 ## Recovery rules
 
 - On service startup, `maestro` must reconcile local leases against current Linear state before starting new work.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
-- If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the worktree.
-- If the leased issue becomes non-terminal and leaves both the `In Progress` lane state and any configured startable pre-claim state, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the worktree for inspection.
+- If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the workspace.
+- If the leased issue becomes non-terminal and leaves both the `In Progress` lane state and any configured startable pre-claim state, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the workspace for inspection.
 - A leased issue that is still in a configured startable state during early daemon ticks must be treated as a lane that has not finished claiming tracker ownership yet, not as an immediate non-active interruption.
 - If a running attempt exceeds the app-server idle timeout with no persisted protocol activity, `maestro` must treat it as stalled, stop the active run, mark the attempt `stalled`, and converge the issue through the human-required failure path instead of silently retrying in this phase.
 - If the supervised child already exited before the next daemon tick, stalled reconciliation must still inspect the just-finished lane using persisted protocol activity rather than skipping directly to generic failure handling.

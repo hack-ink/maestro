@@ -28,7 +28,7 @@ Build a standalone `maestro` MVP in this repository that can poll one configured
 - `cargo make fmt-check` currently shells out to `cargo +nightly fmt --all -- --check`, so nightly `rustfmt` is an execution prerequisite even though [rust-toolchain.toml](../../rust-toolchain.toml) defaults to stable.
 - The local Codex CLI already exposes `codex app-server` and `codex app-server generate-json-schema`, so the MVP can be grounded in the local protocol surface instead of reverse-engineering from prose docs alone.
 - The MVP should prefer `stdio://` transport for `app-server` first. `ws://` can be added later if remote or browser-driven controllers become necessary.
-- Workspace provisioning should use `git worktree` lifecycle operations rather than ad hoc cloned directories, and the service should follow the same branch-isolated lane model used by the local worktree workflow.
+- Workspace provisioning should use `git workspace` lifecycle operations rather than ad hoc cloned directories, and the service should follow the same branch-isolated lane model used by the local workspace workflow.
 
 ## Open Questions
 
@@ -48,13 +48,13 @@ Build a standalone `maestro` MVP in this repository that can poll one configured
 - For the local MVP, `app-server` transport should start over stdio because `codex app-server --listen stdio://` is already available locally and avoids adding a second network lifecycle before the first end-to-end loop works.
 - `maestro` should integrate with Linear directly inside the service runtime rather than depending on the interactive Codex MCP tool surface that is available to the agent during development.
 - Downstream `WORKFLOW.md` should use Markdown with TOML frontmatter so the contract stays human-readable while remaining natural to parse in Rust.
-- Workspace provisioning should be built on `git worktree` from the start instead of one-fresh-clone-per-issue directories.
+- Workspace provisioning should be built on `git workspace` from the start instead of one-fresh-clone-per-issue directories.
 - `eligibility` should be status-first and conservative: an issue is eligible only when it belongs to the configured project, is in the configured startable states, is not in a terminal state, is not explicitly opted out of automation, and does not already have an active `maestro` run.
 - Labels should remain auxiliary metadata rather than the primary workflow state machine. Use labels for opt-out, routing, or exceptional conditions, not for normal execution progression.
 - The start writeback should be `In Progress` plus a structured comment. The success writeback should be `In Review` plus a structured comment. Do not auto-transition successful agent runs directly to `Done`.
 - The default failure policy should be: while automatic retries are still active, keep the issue in `In Progress` and append failure/retry comments; once retry budget is exhausted or human intervention is required, move the issue back to `Todo`, add the label `maestro:needs-attention`, and post a structured failure comment.
 - The standard opt-out label should be `maestro:manual-only`.
-- Local operational-state retention should be thin and bounded: clear lease/session mappings when a run closes, retain attempt/event journals for 14 days, and keep worktrees only while the issue remains non-terminal; once the issue reaches a terminal tracker state, remove the worktree during reconciliation/startup cleanup.
+- Local operational-state retention should be thin and bounded: clear lease/session mappings when a run closes, retain attempt/event journals for 14 days, and keep workspaces only while the issue remains non-terminal; once the issue reaches a terminal tracker state, remove the workspace during reconciliation/startup cleanup.
 - These workflow choices follow the Symphony-style handoff model plus issue-tracker best practices: keep the state machine small, represent active work in status, and use comments for auditable execution detail.
 - The direct `app-server` client should filter notifications by the target `threadId` before classifying run outcomes or recording events because the local desktop transport can emit unrelated thread traffic on the same connection during development.
 
@@ -62,9 +62,9 @@ Build a standalone `maestro` MVP in this repository that can poll one configured
 
 The core implementation should be a Rust control plane with five stable seams: configuration loading, repo-local workflow parsing, Linear tracker access, workspace lifecycle management, and an `app-server` client that speaks JSON-RPC over the child process stdio transport. The local schema export already shows the important protocol objects for the MVP: `ThreadStartParams`, `TurnStartParams`, `TurnCompletedNotification`, and `ThreadStatusChangedNotification`. That is enough to model one deterministic run loop without inventing an abstraction layer first.
 
-The runtime should treat a Linear issue as a leaseable work item while keeping Linear as the coarse-grained source of truth. `maestro` should keep only thin local operational state such as a lease table, in-flight run/session mapping, and protocol event journal so a crashed process can resume or safely mark a run as failed. The service should map one eligible issue to one isolated workspace path backed by `git worktree`, then pass `cwd`, `approvalPolicy`, `sandbox`, `developerInstructions`, and the user input payload into `app-server` using the downstream repository's `WORKFLOW.md` contract.
+The runtime should treat a Linear issue as a leaseable work item while keeping Linear as the coarse-grained source of truth. `maestro` should keep only thin local operational state such as a lease table, in-flight run/session mapping, and protocol event journal so a crashed process can resume or safely mark a run as failed. The service should map one eligible issue to one isolated workspace path backed by `git workspace`, then pass `cwd`, `approvalPolicy`, `sandbox`, `developerInstructions`, and the user input payload into `app-server` using the downstream repository's `WORKFLOW.md` contract.
 
-The first execution checkpoint should stop at a one-shot `run --once` path rather than a forever daemon. That keeps the initial surface reviewable: prove that `maestro` can discover exactly one issue via the status-first eligibility filter, build exactly one worktree-backed workspace, launch exactly one Codex thread/turn, observe completion notifications, write `In Progress` and `In Review` transitions plus structured comments back to Linear, and retain only the local data needed for debugging or retry safety. Once that works, the poll loop and reconciliation become incremental additions rather than guesses.
+The first execution checkpoint should stop at a one-shot `run --once` path rather than a forever daemon. That keeps the initial surface reviewable: prove that `maestro` can discover exactly one issue via the status-first eligibility filter, build exactly one workspace-backed workspace, launch exactly one Codex thread/turn, observe completion notifications, write `In Progress` and `In Review` transitions plus structured comments back to Linear, and retain only the local data needed for debugging or retry safety. Once that works, the poll loop and reconciliation become incremental additions rather than guesses.
 
 ## Task 1: Normalize the repository scaffold for Maestro
 
@@ -136,7 +136,7 @@ The repository has explicit specs for the orchestration state machine, the downs
 4. Document the direct `app-server` contract for MVP execution: thread creation, turn submission, stdio JSON-RPC framing, completion/error notifications, and which protocol fields `maestro` owns versus which come from repo workflow policy.
 5. Document the default writeback policy: on start, transition to `In Progress` and post a structured run-start comment; on success, transition to `In Review` and post a structured completion comment; on retry-exhausted failure, transition to `Todo`, add `maestro:needs-attention`, and post a structured failure comment.
 6. Document the standard automation-control labels, including `maestro:manual-only` for opt-out and `maestro:needs-attention` for failed runs requiring human follow-up.
-7. Document the retention policy for thin local operational state, including lease/session cleanup, 14-day journal retention, and worktree cleanup once issues reach terminal tracker states.
+7. Document the retention policy for thin local operational state, including lease/session cleanup, 14-day journal retention, and workspace cleanup once issues reach terminal tracker states.
 8. Verification completed with `rg -n "system_maestro_runtime|system_workflow_contract|system_app_server_contract" docs/spec/index.md docs/index.md` and `cargo make fmt-check`.
 
 **Verification**
@@ -245,7 +245,7 @@ done
 
 **Outcome**
 
-`maestro run --once` can discover one eligible issue from a configured Linear scope, acquire a local lease, prepare the target repository workspace using `git worktree`, run the direct `app-server` execution path, and write the final coarse outcome back to Linear.
+`maestro run --once` can discover one eligible issue from a configured Linear scope, acquire a local lease, prepare the target repository workspace using `git workspace`, run the direct `app-server` execution path, and write the final coarse outcome back to Linear.
 
 **Files**
 
@@ -260,8 +260,8 @@ done
 **Changes**
 
 1. Implement direct Linear client reads and writes for the chosen pilot scope, including issue listing, eligibility filtering, and the agreed in-progress and terminal writeback actions.
-2. Implement workspace provisioning that maps issue identity to a deterministic local path and bootstraps the target repository checkout through `git worktree` lifecycle operations.
-3. Add lease acquisition, run attempt creation, and orchestration glue that ties Linear issue data, `WORKFLOW.md`, worktree setup, and `app-server` execution into one `run --once` command.
+2. Implement workspace provisioning that maps issue identity to a deterministic local path and bootstraps the target repository checkout through `git workspace` lifecycle operations.
+3. Add lease acquisition, run attempt creation, and orchestration glue that ties Linear issue data, `WORKFLOW.md`, workspace setup, and `app-server` execution into one `run --once` command.
 4. Implement the default status-first writeback flow: move the issue to `In Progress` and post a run-start comment before execution, then move it to `In Review` and post a run-completion comment on success.
 5. Implement the default failure flow: keep retrying runs in `In Progress`, and when retry budget is exhausted move the issue to `Todo`, add `maestro:needs-attention`, and post a structured failure comment.
 6. Retain only the local retry/debug data needed for operators to diagnose failures, while leaving the authoritative coarse outcome in Linear and pruning local state according to the plan's retention defaults.

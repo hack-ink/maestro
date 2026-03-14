@@ -8,9 +8,11 @@ use std::{
 
 use rusqlite::{self, Connection, OptionalExtension, Row};
 
+use crate::prelude::eyre;
+
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 
-/// Local state store for leases, attempts, worktrees, and protocol events.
+/// Local state store for leases, attempts, workspaces, and protocol events.
 pub struct StateStore {
 	connection: Connection,
 }
@@ -338,50 +340,50 @@ impl StateStore {
 		Ok(latest_activity)
 	}
 
-	/// Create or replace the worktree mapping for one issue.
-	pub fn upsert_worktree(
+	/// Create or replace the workspace mapping for one issue.
+	pub fn upsert_workspace(
 		&self,
 		project_id: &str,
 		issue_id: &str,
 		branch_name: &str,
-		worktree_path: &str,
+		workspace_path: &str,
 	) -> crate::prelude::Result<()> {
 		self.connection.execute(
 			"
-			INSERT INTO worktree_mappings (project_id, issue_id, branch_name, worktree_path)
+			INSERT INTO workspace_mappings (project_id, issue_id, branch_name, workspace_path)
 			VALUES (?1, ?2, ?3, ?4)
 			ON CONFLICT(issue_id) DO UPDATE SET
 				project_id = excluded.project_id,
 				branch_name = excluded.branch_name,
-				worktree_path = excluded.worktree_path,
+				workspace_path = excluded.workspace_path,
 				updated_at = CURRENT_TIMESTAMP
 			",
-			rusqlite::params![project_id, issue_id, branch_name, worktree_path],
+			rusqlite::params![project_id, issue_id, branch_name, workspace_path],
 		)?;
 
 		Ok(())
 	}
 
-	/// Read the worktree mapping for one issue.
-	pub fn worktree_for_issue(
+	/// Read the workspace mapping for one issue.
+	pub fn workspace_for_issue(
 		&self,
 		issue_id: &str,
-	) -> crate::prelude::Result<Option<WorktreeMapping>> {
+	) -> crate::prelude::Result<Option<WorkspaceMapping>> {
 		let mapping = self
 			.connection
 			.query_row(
 				"
-				SELECT project_id, issue_id, branch_name, worktree_path
-				FROM worktree_mappings
+				SELECT project_id, issue_id, branch_name, workspace_path
+				FROM workspace_mappings
 				WHERE issue_id = ?1
 				",
 				rusqlite::params![issue_id],
 				|row| {
-					Ok(WorktreeMapping {
+					Ok(WorkspaceMapping {
 						project_id: row.get(0)?,
 						issue_id: row.get(1)?,
 						branch_name: row.get(2)?,
-						worktree_path: PathBuf::from(row.get::<_, String>(3)?),
+						workspace_path: PathBuf::from(row.get::<_, String>(3)?),
 					})
 				},
 			)
@@ -390,22 +392,25 @@ impl StateStore {
 		Ok(mapping)
 	}
 
-	/// List all known worktree mappings.
-	pub fn list_worktrees(&self, project_id: &str) -> crate::prelude::Result<Vec<WorktreeMapping>> {
+	/// List all known workspace mappings.
+	pub fn list_workspaces(
+		&self,
+		project_id: &str,
+	) -> crate::prelude::Result<Vec<WorkspaceMapping>> {
 		let mut statement = self.connection.prepare(
 			"
-			SELECT project_id, issue_id, branch_name, worktree_path
-			FROM worktree_mappings
+			SELECT project_id, issue_id, branch_name, workspace_path
+			FROM workspace_mappings
 			WHERE project_id = ?1
 			ORDER BY issue_id
 			",
 		)?;
 		let rows = statement.query_map(rusqlite::params![project_id], |row| {
-			Ok(WorktreeMapping {
+			Ok(WorkspaceMapping {
 				project_id: row.get(0)?,
 				issue_id: row.get(1)?,
 				branch_name: row.get(2)?,
-				worktree_path: PathBuf::from(row.get::<_, String>(3)?),
+				workspace_path: PathBuf::from(row.get::<_, String>(3)?),
 			})
 		})?;
 		let mappings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -413,10 +418,10 @@ impl StateStore {
 		Ok(mappings)
 	}
 
-	/// Remove the worktree mapping for one issue.
-	pub fn clear_worktree(&self, issue_id: &str) -> crate::prelude::Result<()> {
+	/// Remove the workspace mapping for one issue.
+	pub fn clear_workspace(&self, issue_id: &str) -> crate::prelude::Result<()> {
 		self.connection.execute(
-			"DELETE FROM worktree_mappings WHERE issue_id = ?1",
+			"DELETE FROM workspace_mappings WHERE issue_id = ?1",
 			rusqlite::params![issue_id],
 		)?;
 
@@ -424,6 +429,12 @@ impl StateStore {
 	}
 
 	fn initialize(&self) -> crate::prelude::Result<()> {
+		if legacy_workspace_table_exists(&self.connection)? {
+			eyre::bail!(
+				"Unsupported local state schema: found pre-workspace table `worktree_mappings`. Remove or reset the local state database before running this build."
+			);
+		}
+
 		self.connection.execute_batch(INIT_SQL)?;
 
 		Ok(())
@@ -500,7 +511,7 @@ pub struct ProjectRunStatus {
 	thread_id: Option<String>,
 	updated_at: String,
 	branch_name: Option<String>,
-	worktree_path: Option<PathBuf>,
+	workspace_path: Option<PathBuf>,
 	active_lease: bool,
 	event_count: i64,
 	last_event_type: Option<String>,
@@ -542,9 +553,9 @@ impl ProjectRunStatus {
 		self.branch_name.as_deref()
 	}
 
-	/// Filesystem path to the retained worktree, when known.
-	pub fn worktree_path(&self) -> Option<&Path> {
-		self.worktree_path.as_deref()
+	/// Filesystem path to the retained workspace, when known.
+	pub fn workspace_path(&self) -> Option<&Path> {
+		self.workspace_path.as_deref()
 	}
 
 	/// Whether this run still holds the active local lease.
@@ -568,15 +579,15 @@ impl ProjectRunStatus {
 	}
 }
 
-/// Worktree mapping for one issue lane.
+/// Workspace mapping for one issue lane.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorktreeMapping {
+pub struct WorkspaceMapping {
 	project_id: String,
 	issue_id: String,
 	branch_name: String,
-	worktree_path: PathBuf,
+	workspace_path: PathBuf,
 }
-impl WorktreeMapping {
+impl WorkspaceMapping {
 	/// Local project identifier owning this lane.
 	pub fn project_id(&self) -> &str {
 		&self.project_id
@@ -592,10 +603,27 @@ impl WorktreeMapping {
 		&self.branch_name
 	}
 
-	/// Filesystem path to the worktree checkout.
-	pub fn worktree_path(&self) -> &Path {
-		&self.worktree_path
+	/// Filesystem path to the workspace checkout.
+	pub fn workspace_path(&self) -> &Path {
+		&self.workspace_path
 	}
+}
+
+fn legacy_workspace_table_exists(connection: &Connection) -> crate::prelude::Result<bool> {
+	let exists = connection.query_row(
+		"
+		SELECT EXISTS(
+			SELECT 1
+			FROM sqlite_master
+			WHERE type = 'table'
+				AND name = 'worktree_mappings'
+		)
+		",
+		[],
+		|row| row.get::<_, i64>(0),
+	)?;
+
+	Ok(exists != 0)
 }
 
 fn project_run_status_select_sql() -> &'static str {
@@ -608,7 +636,7 @@ fn project_run_status_select_sql() -> &'static str {
 		r.thread_id,
 		r.updated_at,
 		m.branch_name,
-		m.worktree_path,
+		m.workspace_path,
 		EXISTS(
 			SELECT 1
 			FROM issue_leases l
@@ -636,7 +664,7 @@ fn project_run_status_select_sql() -> &'static str {
 			LIMIT 1
 		) AS last_event_at
 	FROM run_attempts r
-	LEFT JOIN worktree_mappings m
+	LEFT JOIN workspace_mappings m
 		ON m.issue_id = r.issue_id
 		AND m.project_id = ?1
 	"
@@ -651,7 +679,7 @@ fn map_project_run_status_row(row: &Row<'_>) -> rusqlite::Result<ProjectRunStatu
 		thread_id: row.get(4)?,
 		updated_at: row.get(5)?,
 		branch_name: row.get(6)?,
-		worktree_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+		workspace_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
 		active_lease: row.get::<_, i64>(8)? != 0,
 		event_count: row.get(9)?,
 		last_event_type: row.get(10)?,
@@ -662,6 +690,8 @@ fn map_project_run_status_row(row: &Row<'_>) -> rusqlite::Result<ProjectRunStatu
 #[cfg(test)]
 mod tests {
 	use std::path::Path;
+
+	use tempfile::NamedTempFile;
 
 	use crate::state::StateStore;
 
@@ -726,27 +756,27 @@ mod tests {
 	}
 
 	#[test]
-	fn manages_worktree_mappings() {
+	fn manages_workspace_mappings() {
 		let store = StateStore::open_in_memory().expect("in-memory state store should open");
 
 		store
-			.upsert_worktree("pubfi", "PUB-101", "x/pub-101", "/tmp/worktrees/pub-101")
-			.expect("worktree mapping should be recorded");
+			.upsert_workspace("pubfi", "PUB-101", "x/pub-101", "/tmp/workspaces/pub-101")
+			.expect("workspace mapping should be recorded");
 
 		let mapping = store
-			.worktree_for_issue("PUB-101")
+			.workspace_for_issue("PUB-101")
 			.expect("mapping lookup should succeed")
 			.expect("mapping should exist");
 
 		assert_eq!(mapping.issue_id(), "PUB-101");
 		assert_eq!(mapping.branch_name(), "x/pub-101");
-		assert_eq!(mapping.worktree_path(), Path::new("/tmp/worktrees/pub-101"));
+		assert_eq!(mapping.workspace_path(), Path::new("/tmp/workspaces/pub-101"));
 		assert_eq!(mapping.project_id(), "pubfi");
-		assert_eq!(store.list_worktrees("pubfi").expect("list should succeed").len(), 1);
+		assert_eq!(store.list_workspaces("pubfi").expect("list should succeed").len(), 1);
 
-		store.clear_worktree("PUB-101").expect("mapping should be deleted");
+		store.clear_workspace("PUB-101").expect("mapping should be deleted");
 
-		assert!(store.worktree_for_issue("PUB-101").expect("lookup should succeed").is_none());
+		assert!(store.workspace_for_issue("PUB-101").expect("lookup should succeed").is_none());
 	}
 
 	#[test]
@@ -777,11 +807,11 @@ mod tests {
 		store.update_run_thread("run-1", "thread-1").expect("thread id should attach");
 		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should record");
 		store
-			.upsert_worktree("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/worktrees/pub-101")
-			.expect("active worktree should record");
+			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
+			.expect("active workspace should record");
 		store
-			.upsert_worktree("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/worktrees/pub-102")
-			.expect("retained worktree should record");
+			.upsert_workspace("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/workspaces/pub-102")
+			.expect("retained workspace should record");
 		store
 			.append_event("run-1", 1, "turn/started", "{\"turn\":\"1\"}")
 			.expect("event should record");
@@ -795,7 +825,7 @@ mod tests {
 		assert_eq!(runs[0].run_id(), "run-1");
 		assert!(runs[0].active_lease());
 		assert_eq!(runs[0].branch_name(), Some("x/pubfi-pub-101"));
-		assert_eq!(runs[0].worktree_path(), Some(Path::new("/tmp/worktrees/pub-101")));
+		assert_eq!(runs[0].workspace_path(), Some(Path::new("/tmp/workspaces/pub-101")));
 		assert_eq!(runs[0].event_count(), 2);
 		assert_eq!(runs[0].last_event_type(), Some("turn/completed"));
 		assert_eq!(runs[0].thread_id(), Some("thread-1"));
@@ -815,11 +845,11 @@ mod tests {
 			.record_run_attempt("run-2", "PUB-102", 1, "failed")
 			.expect("second run should record");
 		store
-			.upsert_worktree("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/worktrees/pub-101")
-			.expect("first worktree should record");
+			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
+			.expect("first workspace should record");
 		store
-			.upsert_worktree("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/worktrees/pub-102")
-			.expect("second worktree should record");
+			.upsert_workspace("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/workspaces/pub-102")
+			.expect("second workspace should record");
 
 		let runs = store.list_recent_runs("pubfi", 1).expect("status query should succeed");
 
@@ -839,11 +869,11 @@ mod tests {
 		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("first lease should record");
 		store.upsert_lease("pubfi", "PUB-102", "run-2").expect("second lease should record");
 		store
-			.upsert_worktree("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/worktrees/pub-101")
-			.expect("first worktree should record");
+			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
+			.expect("first workspace should record");
 		store
-			.upsert_worktree("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/worktrees/pub-102")
-			.expect("second worktree should record");
+			.upsert_workspace("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/workspaces/pub-102")
+			.expect("second workspace should record");
 
 		let recent_runs = store.list_recent_runs("pubfi", 1).expect("recent runs should query");
 		let active_runs = store.list_active_runs("pubfi").expect("active runs should query");
@@ -851,5 +881,37 @@ mod tests {
 		assert_eq!(recent_runs.len(), 1);
 		assert_eq!(active_runs.len(), 2);
 		assert!(active_runs.iter().all(|run| run.active_lease()));
+	}
+
+	#[test]
+	fn rejects_legacy_worktree_mappings_table_on_open() {
+		let db_file = NamedTempFile::new().expect("temp db file should exist");
+		let connection =
+			rusqlite::Connection::open(db_file.path()).expect("raw sqlite connection should open");
+
+		connection
+			.execute_batch(
+				"
+				CREATE TABLE worktree_mappings (
+					project_id TEXT NOT NULL,
+					issue_id TEXT PRIMARY KEY,
+					branch_name TEXT NOT NULL,
+					worktree_path TEXT NOT NULL,
+					updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+				);
+				",
+			)
+			.expect("legacy table should seed");
+
+		drop(connection);
+
+		let error = match StateStore::open(db_file.path()) {
+			Ok(_) => panic!("legacy local state should be rejected"),
+			Err(error) => error,
+		};
+
+		assert!(error.to_string().contains(
+			"Unsupported local state schema: found pre-workspace table `worktree_mappings`"
+		));
 	}
 }

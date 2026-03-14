@@ -25,10 +25,10 @@ CREATE TABLE IF NOT EXISTS event_journal (
     UNIQUE(run_id, sequence_number)
 );
 
-CREATE TABLE IF NOT EXISTS worktree_mappings (
+CREATE TABLE IF NOT EXISTS workspace_mappings (
     project_id TEXT NOT NULL,
     issue_id TEXT PRIMARY KEY,
     branch_name TEXT NOT NULL,
-    worktree_path TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

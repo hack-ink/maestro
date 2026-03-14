@@ -30,7 +30,7 @@ These commands are intentionally early-stage entrypoints. The `protocol probe` c
 
 ## Pilot Guide
 
-For the first real pilot, target `maestro` itself before onboarding another repository. Keep the service config in the repository root as `./maestro.toml` and keep issue lanes under the repo-local `.worktrees/` directory.
+For the first real pilot, target `maestro` itself before onboarding another repository. Keep the service config in the repository root as `./maestro.toml` and keep issue workspaces under the repo-local `.workspaces/` directory. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage.
 
 Recommended order:
 

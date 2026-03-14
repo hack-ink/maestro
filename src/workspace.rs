@@ -1,4 +1,5 @@
 use std::{
+	ffi::OsStr,
 	fs,
 	path::{Path, PathBuf},
 	process::Command,
@@ -54,29 +55,19 @@ impl WorkspaceManager {
 	) -> Result<WorkspaceSpec> {
 		let spec = self.plan_for_issue(issue_identifier);
 
-		if dry_run || spec.reused_existing {
+		if dry_run {
+			return Ok(spec);
+		}
+		if spec.reused_existing {
+			self.validate_workspace_boundary(&spec.path)?;
+
 			return Ok(spec);
 		}
 
 		fs::create_dir_all(&self.workspace_root)?;
 
-		let mut command = Command::new("git");
-
-		command.arg("-C").arg(&self.repo_root).arg("worktree").arg("add");
-
-		if branch_exists(&self.repo_root, &spec.branch_name)? {
-			command.arg(&spec.path).arg(&spec.branch_name);
-		} else {
-			command.arg("-b").arg(&spec.branch_name).arg(&spec.path).arg("HEAD");
-		}
-
-		let output = command.output()?;
-
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr);
-
-			eyre::bail!("Failed to create worktree `{}`: {}", spec.path.display(), stderr.trim());
-		}
+		self.create_clone_backed_workspace(&spec)?;
+		self.validate_workspace_boundary(&spec.path)?;
 
 		Ok(spec)
 	}
@@ -86,34 +77,168 @@ impl WorkspaceManager {
 			return Ok(false);
 		}
 
-		let output = Command::new("git")
-			.arg("-C")
-			.arg(&self.repo_root)
-			.arg("worktree")
-			.arg("remove")
-			.arg("--force")
-			.arg(path)
-			.output()?;
+		let workspace_root = fs::canonicalize(&self.workspace_root)?;
+		let canonical_path = fs::canonicalize(path)?;
 
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr);
-
-			eyre::bail!("Failed to remove worktree `{}`: {}", path.display(), stderr.trim());
+		if !canonical_path.starts_with(&workspace_root) || canonical_path == workspace_root {
+			eyre::bail!(
+				"Refusing to remove workspace `{}` outside workspace_root `{}`.",
+				path.display(),
+				self.workspace_root.display()
+			);
 		}
+
+		fs::remove_dir_all(&canonical_path)?;
 
 		Ok(true)
 	}
+
+	fn create_clone_backed_workspace(&self, spec: &WorkspaceSpec) -> Result<()> {
+		let source_origin_url = try_git_stdout(
+			&self.repo_root,
+			["remote", "get-url", "origin"],
+			"read the source repository origin URL",
+		)?;
+		let source_head =
+			git_stdout(&self.repo_root, ["rev-parse", "HEAD"], "read the source repository HEAD")?;
+
+		if spec.path.exists() {
+			eyre::bail!(
+				"Workspace path `{}` already exists but does not look reusable.",
+				spec.path.display()
+			);
+		}
+
+		let clone_output = Command::new("git")
+			.arg("-C")
+			.arg(&self.repo_root)
+			.args(["clone", "--quiet", "--no-checkout", "."])
+			.arg(&spec.path)
+			.output()?;
+
+		if !clone_output.status.success() {
+			let _ = fs::remove_dir_all(&spec.path);
+			let stderr = String::from_utf8_lossy(&clone_output.stderr);
+
+			eyre::bail!(
+				"Failed to clone workspace `{}` from `{}`: {}",
+				spec.path.display(),
+				self.repo_root.display(),
+				stderr.trim()
+			);
+		}
+
+		let setup_result = (|| -> Result<()> {
+			if let Some(source_origin_url) = source_origin_url.as_deref() {
+				run_git(
+					&spec.path,
+					["remote", "set-url", "origin", source_origin_url],
+					"rewrite the workspace origin remote",
+				)?;
+			}
+
+			run_git(
+				&spec.path,
+				["checkout", "--quiet", "-B", spec.branch_name.as_str(), source_head.as_str()],
+				"checkout the workspace branch",
+			)?;
+
+			Ok(())
+		})();
+
+		if let Err(error) = setup_result {
+			let _ = fs::remove_dir_all(&spec.path);
+
+			return Err(error);
+		}
+
+		Ok(())
+	}
+
+	fn validate_workspace_boundary(&self, workspace_path: &Path) -> Result<()> {
+		let workspace_root = fs::canonicalize(workspace_path)?;
+		let git_dir = git_stdout(
+			workspace_path,
+			["rev-parse", "--path-format=absolute", "--git-dir"],
+			"resolve workspace git dir",
+		)?;
+		let git_common_dir = git_stdout(
+			workspace_path,
+			["rev-parse", "--path-format=absolute", "--git-common-dir"],
+			"resolve workspace git common dir",
+		)?;
+		let git_dir = fs::canonicalize(PathBuf::from(git_dir))?;
+		let git_common_dir = fs::canonicalize(PathBuf::from(git_common_dir))?;
+
+		if !git_dir.starts_with(&workspace_root) {
+			eyre::bail!(
+				"Workspace `{}` is not self-contained: git dir `{}` escapes the workspace root.",
+				workspace_path.display(),
+				git_dir.display()
+			);
+		}
+		if !git_common_dir.starts_with(&workspace_root) {
+			eyre::bail!(
+				"Workspace `{}` is not self-contained: git common dir `{}` escapes the workspace root.",
+				workspace_path.display(),
+				git_common_dir.display()
+			);
+		}
+
+		Ok(())
+	}
 }
 
-fn branch_exists(repo_root: &Path, branch_name: &str) -> Result<bool> {
-	let output = Command::new("git")
-		.arg("-C")
-		.arg(repo_root)
-		.args(["rev-parse", "--verify", "--quiet"])
-		.arg(format!("refs/heads/{branch_name}"))
-		.output()?;
+fn git_stdout<I, S>(repo_root: &Path, args: I, action: &str) -> Result<String>
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<OsStr>,
+{
+	let output = Command::new("git").arg("-C").arg(repo_root).args(args).output()?;
 
-	Ok(output.status.success())
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+
+		eyre::bail!("Failed to {action} in `{}`: {}", repo_root.display(), stderr.trim());
+	}
+
+	Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn try_git_stdout<I, S>(repo_root: &Path, args: I, action: &str) -> Result<Option<String>>
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<OsStr>,
+{
+	let output = Command::new("git").arg("-C").arg(repo_root).args(args).output()?;
+
+	if output.status.success() {
+		return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()));
+	}
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	if stderr.contains("No such remote") {
+		return Ok(None);
+	}
+
+	eyre::bail!("Failed to {action} in `{}`: {}", repo_root.display(), stderr.trim());
+}
+
+fn run_git<I, S>(repo_root: &Path, args: I, action: &str) -> Result<()>
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<OsStr>,
+{
+	let output = Command::new("git").arg("-C").arg(repo_root).args(args).output()?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+
+		eyre::bail!("Failed to {action} in `{}`: {}", repo_root.display(), stderr.trim());
+	}
+
+	Ok(())
 }
 
 fn sanitize_branch_component(value: &str) -> String {
@@ -132,17 +257,176 @@ fn sanitize_branch_component(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-	use std::path::Path;
+	use std::{
+		fs,
+		path::{Path, PathBuf},
+		process::Command,
+	};
+
+	use tempfile::TempDir;
 
 	use crate::workspace::WorkspaceManager;
 
+	fn run_git(repo_root: &Path, args: &[&str]) {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(repo_root)
+			.args(args)
+			.output()
+			.expect("git command should run");
+
+		assert!(
+			output.status.success(),
+			"git {:?} failed in {}: {}",
+			args,
+			repo_root.display(),
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+
+	fn git_stdout(repo_root: &Path, args: &[&str]) -> String {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(repo_root)
+			.args(args)
+			.output()
+			.expect("git command should run");
+
+		assert!(
+			output.status.success(),
+			"git {:?} failed in {}: {}",
+			args,
+			repo_root.display(),
+			String::from_utf8_lossy(&output.stderr)
+		);
+
+		String::from_utf8_lossy(&output.stdout).trim().to_owned()
+	}
+
+	fn init_repo() -> (TempDir, PathBuf) {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let repo_root = temp_dir.path().join("repo");
+
+		fs::create_dir_all(&repo_root).expect("repo root should exist");
+
+		run_git(&repo_root, &["init", "--initial-branch", "main"]);
+		run_git(&repo_root, &["config", "user.name", "Maestro Tests"]);
+		run_git(&repo_root, &["config", "user.email", "maestro-tests@example.com"]);
+		run_git(&repo_root, &["remote", "add", "origin", "https://github.com/example/maestro.git"]);
+
+		fs::write(repo_root.join("README.md"), "hello\n").expect("seed file should write");
+
+		run_git(&repo_root, &["add", "README.md"]);
+		run_git(&repo_root, &["commit", "-m", "seed"]);
+
+		(temp_dir, repo_root)
+	}
+
 	#[test]
 	fn plans_workspace_paths_and_branch_names() {
-		let manager = WorkspaceManager::new("pubfi", "/tmp/pubfi", "/tmp/pubfi/.worktrees");
+		let manager = WorkspaceManager::new("pubfi", "/tmp/pubfi", "/tmp/pubfi/.workspaces");
 		let spec = manager.plan_for_issue("PUB-101");
 
 		assert_eq!(spec.branch_name, "x/pubfi-pub-101");
-		assert_eq!(spec.path, Path::new("/tmp/pubfi/.worktrees/PUB-101"));
+		assert_eq!(spec.path, Path::new("/tmp/pubfi/.workspaces/PUB-101"));
 		assert!(!spec.reused_existing);
+	}
+
+	#[test]
+	fn creates_clone_backed_workspace() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
+
+		assert_eq!(spec.branch_name, "x/pubfi-pub-101");
+		assert!(spec.path.join(".git").exists());
+		assert_eq!(
+			git_stdout(&spec.path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+			"x/pubfi-pub-101"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["remote", "get-url", "origin"]),
+			"https://github.com/example/maestro.git"
+		);
+
+		let git_dir = PathBuf::from(git_stdout(
+			&spec.path,
+			&["rev-parse", "--path-format=absolute", "--git-dir"],
+		));
+		let git_common_dir = PathBuf::from(git_stdout(
+			&spec.path,
+			&["rev-parse", "--path-format=absolute", "--git-common-dir"],
+		));
+		let workspace_root =
+			fs::canonicalize(&spec.path).expect("workspace path should canonicalize");
+		let git_dir = fs::canonicalize(git_dir).expect("git dir should canonicalize");
+		let git_common_dir =
+			fs::canonicalize(git_common_dir).expect("git common dir should canonicalize");
+
+		assert!(git_dir.starts_with(&workspace_root));
+		assert!(git_common_dir.starts_with(&workspace_root));
+	}
+
+	#[test]
+	fn rejects_reused_workspace_with_external_git_metadata() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let workspace_path = workspace_root.join("PUB-101");
+		let external_git_dir = repo_root.join(".workspace-admin/PUB-101.git");
+
+		fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+		fs::create_dir_all(external_git_dir.parent().unwrap())
+			.expect("external git dir parent should exist");
+
+		run_git(
+			&repo_root,
+			&[
+				"clone",
+				"--quiet",
+				"--no-checkout",
+				"--separate-git-dir",
+				external_git_dir.to_str().unwrap(),
+				".",
+				workspace_path.to_str().unwrap(),
+			],
+		);
+
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+		let error = manager
+			.ensure_workspace("PUB-101", false)
+			.expect_err("non-self-contained workspace should be rejected");
+
+		assert!(error.to_string().contains("is not self-contained: git "));
+	}
+
+	#[test]
+	fn removes_clone_backed_workspace_path() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should exist");
+
+		assert!(manager.remove_workspace_path(&spec.path).expect("workspace should remove"));
+		assert!(!spec.path.exists());
+	}
+
+	#[test]
+	fn rejects_workspace_removal_when_path_escapes_root_via_parent_components() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let escaped_target = repo_root.join("outside").join("PUB-101");
+
+		fs::create_dir_all(&workspace_root).expect("workspace root should exist");
+		fs::create_dir_all(&escaped_target).expect("escaped target should exist");
+
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+		let escaped_path = workspace_root.join("../outside/PUB-101");
+		let error = manager
+			.remove_workspace_path(&escaped_path)
+			.expect_err("escaped workspace path should be rejected");
+
+		assert!(error.to_string().contains("outside workspace_root"));
+		assert!(escaped_target.exists());
 	}
 }

@@ -658,7 +658,7 @@ pub(crate) struct ReviewHandoffContext {
 	pub(crate) attempt_number: i64,
 	pub(crate) branch_name: String,
 	pub(crate) run_id: String,
-	pub(crate) worktree_path: String,
+	pub(crate) workspace_path: String,
 	pub(crate) cwd: PathBuf,
 }
 
@@ -959,11 +959,11 @@ fn parse_github_remote_with_authority(remote_url: &str) -> std::result::Result<&
 
 fn validate_public_comment_body(body: &str) -> Result<(), String> {
 	for line in body.lines() {
-		let Some(worktree_path) = extract_structured_field_value(line, "worktree_path") else {
+		let Some(workspace_path) = extract_structured_field_value(line, "workspace_path") else {
 			continue;
 		};
 
-		validate_repo_relative_path(worktree_path)?;
+		validate_repo_relative_path(workspace_path)?;
 	}
 
 	Ok(())
@@ -979,16 +979,16 @@ fn extract_structured_field_value<'a>(line: &'a str, field_name: &str) -> Option
 
 fn validate_repo_relative_path(path: &str) -> Result<(), String> {
 	if path.is_empty() {
-		return Err(String::from("`worktree_path` must not be empty."));
+		return Err(String::from("`workspace_path` must not be empty."));
 	}
 	if path.starts_with('/') || path.starts_with("~/") || is_windows_absolute_path(path) {
-		return Err(format!("`worktree_path` must be repository-relative, not `{path}`."));
+		return Err(format!("`workspace_path` must be repository-relative, not `{path}`."));
 	}
 
 	let components = std::path::Path::new(path).components();
 
 	if components.into_iter().any(|component| matches!(component, Component::ParentDir)) {
-		return Err(format!("`worktree_path` must stay within the repository, not `{path}`."));
+		return Err(format!("`workspace_path` must stay within the repository, not `{path}`."));
 	}
 
 	Ok(())
@@ -1012,13 +1012,13 @@ fn format_review_handoff_comment(
 	pending_review_handoff: &PendingReviewHandoff,
 ) -> String {
 	format!(
-		"maestro run completed and is ready for review\n\n- run_id: `{run_id}`\n- attempt: `{attempt}`\n- finished_at: `{finished_at}`\n- branch: `{branch}`\n- pr_url: `{pr_url}`\n- worktree_path: `{worktree_path}`\n- validation_result: `passed`\n- summary: {summary}",
+		"maestro run completed and is ready for review\n\n- run_id: `{run_id}`\n- attempt: `{attempt}`\n- finished_at: `{finished_at}`\n- branch: `{branch}`\n- pr_url: `{pr_url}`\n- workspace_path: `{workspace_path}`\n- validation_result: `passed`\n- summary: {summary}",
 		run_id = review_context.run_id,
 		attempt = review_context.attempt_number,
 		finished_at = current_timestamp(),
 		branch = review_context.branch_name,
 		pr_url = pending_review_handoff.pr_url,
-		worktree_path = review_context.worktree_path,
+		workspace_path = review_context.workspace_path,
 		summary = pending_review_handoff.summary,
 	)
 }
@@ -1252,7 +1252,7 @@ Use the tracker tools.
 			attempt_number: 2,
 			branch_name: String::from("x/maestro-pub-618"),
 			run_id: String::from("pub-618-attempt-2-123"),
-			worktree_path: String::from(".worktrees/PUB-618"),
+			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: PathBuf::from("/tmp/PUB-618"),
 		}
 	}
@@ -1375,7 +1375,7 @@ Use the tracker tools.
 	}
 
 	#[test]
-	fn accepts_comment_without_structured_worktree_path() {
+	fn accepts_comment_without_structured_workspace_path() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
 		let workflow = sample_workflow();
@@ -1394,7 +1394,7 @@ Use the tracker tools.
 	}
 
 	#[test]
-	fn accepts_repo_relative_worktree_path_in_comment_body() {
+	fn accepts_repo_relative_workspace_path_in_comment_body() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
 		let workflow = sample_workflow();
@@ -1403,19 +1403,19 @@ Use the tracker tools.
 			&bridge,
 			ISSUE_COMMENT_TOOL_NAME,
 			serde_json::json!({
-				"body": "maestro run failed and will retry\n\n- worktree_path: `.worktrees/MAE-1`"
+				"body": "maestro run failed and will retry\n\n- workspace_path: `.workspaces/MAE-1`"
 			}),
 		);
 
 		assert!(response.success);
 		assert_eq!(
 			tracker.comments.borrow().as_slice(),
-			["maestro run failed and will retry\n\n- worktree_path: `.worktrees/MAE-1`"]
+			["maestro run failed and will retry\n\n- workspace_path: `.workspaces/MAE-1`"]
 		);
 	}
 
 	#[test]
-	fn rejects_absolute_worktree_path_in_comment_body() {
+	fn rejects_absolute_workspace_path_in_comment_body() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
 		let workflow = sample_workflow();
@@ -1424,7 +1424,7 @@ Use the tracker tools.
 			&bridge,
 			ISSUE_COMMENT_TOOL_NAME,
 			serde_json::json!({
-				"body": "maestro run failed and will retry\n\n- worktree_path: `/absolute/path/to/repo/.worktrees/MAE-1`"
+				"body": "maestro run failed and will retry\n\n- workspace_path: `/absolute/path/to/repo/.workspaces/MAE-1`"
 			}),
 		);
 
@@ -1434,14 +1434,14 @@ Use the tracker tools.
 			response.content_items,
 			vec![super::DynamicToolContentItem::InputText {
 				text: String::from(
-					"`worktree_path` must be repository-relative, not `/absolute/path/to/repo/.worktrees/MAE-1`."
+					"`workspace_path` must be repository-relative, not `/absolute/path/to/repo/.workspaces/MAE-1`."
 				),
 			}]
 		);
 	}
 
 	#[test]
-	fn rejects_windows_absolute_worktree_path_in_comment_body() {
+	fn rejects_windows_absolute_workspace_path_in_comment_body() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
 		let workflow = sample_workflow();
@@ -1450,7 +1450,7 @@ Use the tracker tools.
 			&bridge,
 			ISSUE_COMMENT_TOOL_NAME,
 			serde_json::json!({
-				"body": "maestro run failed and will retry\n\n- worktree_path: `C:/absolute/path/to/repo/.worktrees/MAE-1`"
+				"body": "maestro run failed and will retry\n\n- workspace_path: `C:/absolute/path/to/repo/.workspaces/MAE-1`"
 			}),
 		);
 
@@ -1460,7 +1460,7 @@ Use the tracker tools.
 			response.content_items,
 			vec![super::DynamicToolContentItem::InputText {
 				text: String::from(
-					"`worktree_path` must be repository-relative, not `C:/absolute/path/to/repo/.worktrees/MAE-1`."
+					"`workspace_path` must be repository-relative, not `C:/absolute/path/to/repo/.workspaces/MAE-1`."
 				),
 			}]
 		);
@@ -1679,7 +1679,7 @@ Use the tracker tools.
 		assert_eq!(comments.len(), 1);
 		assert!(comments[0].contains("- pr_url: `https://github.com/helixbox/maestro/pull/42`"));
 		assert!(comments[0].contains("- validation_result: `passed`"));
-		assert!(comments[0].contains("- worktree_path: `.worktrees/PUB-618`"));
+		assert!(comments[0].contains("- workspace_path: `.workspaces/PUB-618`"));
 	}
 
 	#[test]

@@ -171,7 +171,7 @@ mod tests {
 			r#"
 				id = "pubfi"
 				repo_root = "/tmp/pubfi"
-					workspace_root = "/tmp/pubfi/.worktrees"
+					workspace_root = "/tmp/pubfi/.workspaces"
 
 				[tracker]
 				project_slug = "pubfi"
