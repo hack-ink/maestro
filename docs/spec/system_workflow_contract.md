@@ -68,6 +68,7 @@ Supported keys:
   - type: string
   - optional
   - default: `"In Review"`
+  - note: `maestro` treats this as a PR-backed review handoff state, not a terminal completion state
 - `failure_state`
   - type: string
   - optional
@@ -197,3 +198,4 @@ Use the issue-scoped tracker tools autonomously when tracker updates are require
 - Issue-scoped developer instructions should rely on `context.read_first` files plus the explicit tracker tool contract by default instead of inlining the raw body.
 - The body should contain durable repo rules, not ephemeral run notes.
 - The body should instruct the coding agent to use the issue-scoped tracker tools autonomously when tracker writes are part of the repo workflow.
+- If the repository expects PR-backed review handoff, the body should state that the lane must produce a reviewable PR before the success state can be reached.

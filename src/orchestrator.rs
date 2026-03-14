@@ -1,6 +1,8 @@
 use std::{
 	cmp::Ordering,
 	collections::{HashMap, HashSet},
+	error::Error,
+	fmt::{self, Display, Formatter},
 	fs,
 	path::{Path, PathBuf},
 	process::Command,
@@ -15,10 +17,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
 	agent::{
 		self, AppServerRunRequest, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
-		ISSUE_TRANSITION_TOOL_NAME,
+		ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
+		ReviewHandoffWritebackFailed, RunCompletionDisposition,
 	},
 	config::{self, ServiceConfig},
-	prelude::{Result, eyre},
+	prelude::eyre,
 	state::{StateStore, WorktreeMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
 	workflow::WorkflowDocument,
@@ -43,7 +46,42 @@ struct IssueRunPlan {
 	run_id: String,
 }
 
-pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> {
+#[derive(Debug)]
+struct ManualAttentionRequested {
+	issue_identifier: String,
+	label: String,
+	run_id: String,
+}
+impl Display for ManualAttentionRequested {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"Run `{}` for issue `{}` requested human attention via label `{}`; stop automatic retries and hand off manually.",
+			self.run_id, self.issue_identifier, self.label
+		)
+	}
+}
+
+impl Error for ManualAttentionRequested {}
+
+#[derive(Debug)]
+struct ReviewHandoffNeedsAttention {
+	issue_identifier: String,
+	run_id: String,
+}
+impl Display for ReviewHandoffNeedsAttention {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"Run `{}` for issue `{}` partially applied review handoff writeback; stop retries and repair the issue manually.",
+			self.run_id, self.issue_identifier
+		)
+	}
+}
+
+impl Error for ReviewHandoffNeedsAttention {}
+
+pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prelude::Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
 			println!("dry run: no maestro config found; nothing to execute.");
@@ -87,7 +125,10 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> Result<()> 
 	Ok(())
 }
 
-pub(crate) fn run_daemon(config_path: Option<&Path>, poll_interval: Duration) -> Result<()> {
+pub(crate) fn run_daemon(
+	config_path: Option<&Path>,
+	poll_interval: Duration,
+) -> crate::prelude::Result<()> {
 	if poll_interval.is_zero() {
 		eyre::bail!("`daemon --poll-interval-s` must be greater than zero.");
 	}
@@ -132,7 +173,7 @@ fn run_configured_cycle(
 	config_path: &Path,
 	state_store: &StateStore,
 	dry_run: bool,
-) -> Result<Option<RunSummary>> {
+) -> crate::prelude::Result<Option<RunSummary>> {
 	let config = ServiceConfig::from_path(config_path)?;
 	let workflow_path = config.repo_root().join(config.workflow_path());
 	let workflow = WorkflowDocument::from_path(&workflow_path)?;
@@ -148,7 +189,7 @@ fn run_project_once<T>(
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	dry_run: bool,
-) -> Result<Option<RunSummary>>
+) -> crate::prelude::Result<Option<RunSummary>>
 where
 	T: IssueTracker,
 {
@@ -161,6 +202,7 @@ where
 
 	validate_project_contract(project, workflow)?;
 	validate_tracker_project(tracker, project.tracker().project_slug())?;
+	validate_review_handoff_runtime(dry_run)?;
 
 	let project_slug = project.tracker().project_slug();
 	let issues = tracker.list_project_issues(project_slug)?;
@@ -225,7 +267,7 @@ fn reconcile_project_state<T>(
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
-) -> Result<()>
+) -> crate::prelude::Result<()>
 where
 	T: IssueTracker,
 {
@@ -273,7 +315,7 @@ where
 	Ok(())
 }
 
-fn validate_tracker_project<T>(tracker: &T, project_slug: &str) -> Result<()>
+fn validate_tracker_project<T>(tracker: &T, project_slug: &str) -> crate::prelude::Result<()>
 where
 	T: IssueTracker,
 {
@@ -284,13 +326,47 @@ where
 	Ok(())
 }
 
+fn validate_review_handoff_runtime(dry_run: bool) -> crate::prelude::Result<()> {
+	if dry_run {
+		return Ok(());
+	}
+
+	validate_command_available("gh", "PR-backed review handoff")?;
+
+	Ok(())
+}
+
+fn validate_command_available(command: &str, purpose: &str) -> crate::prelude::Result<()> {
+	let output = Command::new(command).arg("--version").output().map_err(|error| {
+		eyre::eyre!("Required command `{command}` is unavailable for {purpose}: {error}")
+	})?;
+
+	if output.status.success() {
+		return Ok(());
+	}
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+
+	if detail.is_empty() {
+		eyre::bail!(
+			"Required command `{command}` is unavailable for {purpose}: `{command} --version` exited unsuccessfully."
+		);
+	}
+
+	eyre::bail!(
+		"Required command `{command}` is unavailable for {purpose}: `{command} --version` failed with `{detail}`."
+	);
+}
+
 fn execute_issue_run<T>(
 	tracker: &T,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	issue_run: IssueRunPlan,
-) -> Result<RunSummary>
+) -> crate::prelude::Result<RunSummary>
 where
 	T: IssueTracker,
 {
@@ -322,7 +398,7 @@ fn execute_issue_run_inner<T>(
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	issue_run: &IssueRunPlan,
-) -> Result<RunSummary>
+) -> crate::prelude::Result<RunSummary>
 where
 	T: IssueTracker,
 {
@@ -333,8 +409,18 @@ where
 		.to_owned();
 	let model =
 		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
-	let tracker_tool_bridge =
-		crate::agent::TrackerToolBridge::new(tracker, &issue_run.issue, workflow);
+	let tracker_tool_bridge = crate::agent::TrackerToolBridge::with_run_context(
+		tracker,
+		&issue_run.issue,
+		workflow,
+		ReviewHandoffContext {
+			attempt_number: issue_run.attempt_number,
+			branch_name: issue_run.workspace.branch_name.clone(),
+			run_id: issue_run.run_id.clone(),
+			worktree_path: relative_worktree_path(project, &issue_run.workspace),
+			cwd: issue_run.workspace.path.clone(),
+		},
+	);
 
 	agent::execute_app_server_run(
 		&AppServerRunRequest {
@@ -356,10 +442,34 @@ where
 		state_store,
 	)?;
 
-	run_validation_commands(
-		workflow.frontmatter().execution().validation_commands(),
-		&issue_run.workspace.path,
-	)?;
+	match tracker_tool_bridge.completion_disposition()? {
+		RunCompletionDisposition::ReviewHandoff => {
+			run_validation_commands(
+				workflow.frontmatter().execution().validation_commands(),
+				&issue_run.workspace.path,
+			)?;
+
+			tracker_tool_bridge.apply_review_handoff().map_err(|error| {
+				if let Some(writeback_error) = error.downcast_ref::<ReviewHandoffWritebackFailed>()
+				{
+					Report::new(ReviewHandoffNeedsAttention {
+						issue_identifier: writeback_error.issue_identifier.clone(),
+						run_id: writeback_error.run_id.clone(),
+					})
+					.wrap_err(error)
+				} else {
+					error
+				}
+			})?;
+		},
+		RunCompletionDisposition::ManualAttention => {
+			return Err(Report::new(ManualAttentionRequested {
+				issue_identifier: issue_run.issue.identifier.clone(),
+				label: workflow.frontmatter().tracker().needs_attention_label().to_owned(),
+				run_id: issue_run.run_id.clone(),
+			}));
+		},
+	}
 
 	Ok(RunSummary {
 		project_id: project.id().to_owned(),
@@ -377,13 +487,19 @@ fn handle_failure<T>(
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
 	error: &Report,
-) -> Result<()>
+) -> crate::prelude::Result<()>
 where
 	T: IssueTracker,
 {
 	let max_attempts = i64::from(workflow.frontmatter().execution().max_attempts());
+	let manual_attention_requested = error.downcast_ref::<ManualAttentionRequested>().is_some();
+	let review_handoff_needs_attention =
+		error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some();
 
-	if issue_run.attempt_number < max_attempts {
+	if !manual_attention_requested
+		&& !review_handoff_needs_attention
+		&& issue_run.attempt_number < max_attempts
+	{
 		tracker.create_comment(
 			&issue_run.issue.id,
 			&format_retry_comment(
@@ -437,6 +553,8 @@ where
 			issue_run.attempt_number,
 			relative_worktree_path(project, &issue_run.workspace),
 			&issue_run.workspace.branch_name,
+			workflow.frontmatter().tracker().needs_attention_label(),
+			manual_attention_requested,
 			error,
 		),
 	)?;
@@ -444,7 +562,10 @@ where
 	Ok(())
 }
 
-fn validate_project_contract(project: &ServiceConfig, workflow: &WorkflowDocument) -> Result<()> {
+fn validate_project_contract(
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+) -> crate::prelude::Result<()> {
 	if project.tracker().project_slug() != workflow.frontmatter().tracker().project_slug() {
 		eyre::bail!(
 			"Project config tracker slug `{}` does not match WORKFLOW.md tracker slug `{}`.",
@@ -460,7 +581,7 @@ fn is_issue_eligible(
 	issue: &TrackerIssue,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
-) -> Result<bool> {
+) -> crate::prelude::Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
 
 	if tracker_policy.terminal_states().iter().any(|state| state == &issue.state.name) {
@@ -472,11 +593,14 @@ fn is_issue_eligible(
 	if issue.has_label(tracker_policy.opt_out_label()) {
 		return Ok(false);
 	}
+	if issue.has_label(tracker_policy.needs_attention_label()) {
+		return Ok(false);
+	}
 
 	Ok(state_store.lease_for_issue(&issue.id)?.is_none())
 }
 
-fn refresh_issue<T>(tracker: &T, issue_id: &str) -> Result<Option<TrackerIssue>>
+fn refresh_issue<T>(tracker: &T, issue_id: &str) -> crate::prelude::Result<Option<TrackerIssue>>
 where
 	T: IssueTracker,
 {
@@ -499,7 +623,7 @@ fn mark_run_attempt_if_active(
 	state_store: &StateStore,
 	run_id: &str,
 	reconciled_status: &str,
-) -> Result<()> {
+) -> crate::prelude::Result<()> {
 	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
 		return Ok(());
 	};
@@ -515,7 +639,7 @@ fn cleanup_worktree_mapping(
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
 	mapping: &WorktreeMapping,
-) -> Result<()> {
+) -> crate::prelude::Result<()> {
 	workspace_manager.remove_workspace_path(mapping.worktree_path())?;
 	state_store.clear_worktree(mapping.issue_id())?;
 
@@ -527,7 +651,7 @@ fn cleanup_terminal_worktree(
 	workspace_manager: &WorkspaceManager,
 	issue_id: &str,
 	worktree_path: &Path,
-) -> Result<()> {
+) -> crate::prelude::Result<()> {
 	workspace_manager.remove_workspace_path(worktree_path)?;
 	state_store.clear_worktree(issue_id)?;
 
@@ -538,7 +662,7 @@ fn build_developer_instructions(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
-) -> Result<String> {
+) -> crate::prelude::Result<String> {
 	let mut sections = Vec::new();
 
 	for relative_path in workflow.frontmatter().context().read_first() {
@@ -553,14 +677,16 @@ fn build_developer_instructions(
 	));
 
 	sections.push(format!(
-		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When implementation and repo validation are complete, call `{transition_tool}` to move the issue to `{success}` and add a brief `{comment_tool}` comment summarizing the result.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.\n- Never write to any other issue.",
+		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
 		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
 		label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+		review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 		in_progress = workflow.frontmatter().tracker().in_progress_state(),
 		run_id = issue_run.run_id,
 		attempt = issue_run.attempt_number,
+		branch = issue_run.workspace.branch_name,
 		success = workflow.frontmatter().tracker().success_state(),
 		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
 	));
@@ -574,7 +700,7 @@ fn build_user_input(
 	issue_run: &IssueRunPlan,
 ) -> String {
 	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current worktree.\n- Run the repository validation needed to justify moving the issue to `{success}`.\n- When done, move the issue to `{success}` with `{transition_tool}` and leave a short `{comment_tool}` completion comment with the result.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.",
+		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current worktree.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.",
 		identifier = issue.identifier,
 		title = issue.title,
 		description = if issue.description.trim().is_empty() {
@@ -585,15 +711,17 @@ fn build_user_input(
 		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
 		label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+		review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 		in_progress = workflow.frontmatter().tracker().in_progress_state(),
 		run_id = issue_run.run_id,
 		attempt = issue_run.attempt_number,
+		branch = issue_run.workspace.branch_name,
 		success = workflow.frontmatter().tracker().success_state(),
 		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
 	)
 }
 
-fn run_validation_commands(commands: &[String], cwd: &Path) -> Result<()> {
+fn run_validation_commands(commands: &[String], cwd: &Path) -> crate::prelude::Result<()> {
 	for command in commands {
 		let output = Command::new("zsh").arg("-lc").arg(command).current_dir(cwd).output()?;
 
@@ -632,7 +760,7 @@ fn select_issue_candidate(
 	issues: Vec<TrackerIssue>,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
-) -> Result<Option<TrackerIssue>> {
+) -> crate::prelude::Result<Option<TrackerIssue>> {
 	let mut eligible_issues = Vec::new();
 
 	for issue in issues {
@@ -677,10 +805,35 @@ fn format_terminal_failure_comment(
 	attempt_number: i64,
 	worktree_path: String,
 	branch_name: &str,
+	needs_attention_label: &str,
+	manual_attention_requested: bool,
 	error: &Report,
 ) -> String {
+	let (error_class, next_action) = if manual_attention_requested {
+		(
+			"human_attention_required",
+			format!(
+				"inspect the issue comment and worktree, resolve the blocker manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+			),
+		)
+	} else if error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some() {
+		(
+			"review_handoff_writeback_failed",
+			format!(
+				"inspect the tracker state, PR, and worktree, repair the incomplete review handoff manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+			),
+		)
+	} else {
+		(
+			"retry_budget_exhausted",
+			format!(
+				"inspect the worktree, resolve the issue manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+			),
+		)
+	};
+
 	format!(
-		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- worktree_path: `{worktree}`\n- error_class: `retry_budget_exhausted`\n- next_action: `inspect the worktree, resolve the issue manually, then move the issue back to a startable state if another automated run is desired`\n- error: `{error}`",
+		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- worktree_path: `{worktree}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error: `{error}`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
 		worktree = worktree_path
@@ -691,13 +844,13 @@ fn current_timestamp() -> String {
 	OffsetDateTime::now_utc().format(&Rfc3339).expect("timestamp formatting should succeed")
 }
 
-fn build_run_id(issue_identifier: &str, attempt_number: i64) -> Result<String> {
+fn build_run_id(issue_identifier: &str, attempt_number: i64) -> crate::prelude::Result<String> {
 	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
 	Ok(format!("{}-attempt-{attempt_number}-{timestamp}", issue_identifier.to_lowercase()))
 }
 
-fn resolve_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> {
+fn resolve_config_path(explicit_path: Option<&Path>) -> crate::prelude::Result<Option<PathBuf>> {
 	if let Some(path) = explicit_path {
 		return Ok(Some(path.to_path_buf()));
 	}
@@ -717,7 +870,7 @@ fn resolve_config_path(explicit_path: Option<&Path>) -> Result<Option<PathBuf>> 
 	Ok(None)
 }
 
-fn default_state_store_path() -> Result<PathBuf> {
+fn default_state_store_path() -> crate::prelude::Result<PathBuf> {
 	let project_dirs = ProjectDirs::from("", "helixbox", env!("CARGO_PKG_NAME"))
 		.ok_or_else(|| eyre::eyre!("Failed to resolve project directories."))?;
 
@@ -736,13 +889,14 @@ fn sleep_until_next_tick(poll_interval: Duration, tick_started_at: Instant) {
 mod tests {
 	use std::{cell::RefCell, fs, path::Path, process::Command};
 
+	use color_eyre::Report;
 	use tempfile::TempDir;
 
 	use crate::{
 		config::ServiceConfig,
 		orchestrator::{
-			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME,
-			RunSummary,
+			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, RunSummary,
 		},
 		prelude::Result,
 		state::StateStore,
@@ -1046,14 +1200,16 @@ read_first = [{read_first}]
 		));
 
 		sections.push(format!(
-			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When implementation and repo validation are complete, call `{transition_tool}` to move the issue to `{success}` and add a brief `{comment_tool}` comment summarizing the result.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment.\n- Never write to any other issue.",
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
 			issue = issue_run.issue.identifier,
 			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 			comment_tool = ISSUE_COMMENT_TOOL_NAME,
 			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 			in_progress = workflow.frontmatter().tracker().in_progress_state(),
 			run_id = issue_run.run_id,
 			attempt = issue_run.attempt_number,
+			branch = issue_run.workspace.branch_name,
 			success = workflow.frontmatter().tracker().success_state(),
 			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
 		));
@@ -1067,6 +1223,7 @@ read_first = [{read_first}]
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let eligible_issue = sample_issue("Todo", &[]);
 		let opted_out_issue = sample_issue("Todo", &["maestro:manual-only"]);
+		let needs_attention_issue = sample_issue("Todo", &["maestro:needs-attention"]);
 		let wrong_state_issue = sample_issue("In Progress", &[]);
 
 		assert!(
@@ -1075,6 +1232,10 @@ read_first = [{read_first}]
 		);
 		assert!(
 			!orchestrator::is_issue_eligible(&opted_out_issue, &workflow, &state_store)
+				.expect("eligibility should succeed")
+		);
+		assert!(
+			!orchestrator::is_issue_eligible(&needs_attention_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
 		);
 		assert!(
@@ -1138,6 +1299,7 @@ read_first = [{read_first}]
 		assert!(instructions.contains("Do not browse upstream references"));
 		assert!(instructions.contains("Tracker tool contract"));
 		assert!(instructions.contains("You own issue-scoped tracker writes for `PUB-101`."));
+		assert!(instructions.contains(ISSUE_REVIEW_HANDOFF_TOOL_NAME));
 		assert!(!instructions.contains("WORKFLOW.md\n"));
 		assert!(!instructions.contains("Follow the repository policy."));
 	}
@@ -1263,6 +1425,67 @@ read_first = [{read_first}]
 		};
 
 		assert_eq!(orchestrator::relative_worktree_path(&config, &workspace), ".worktrees/PUB-101");
+	}
+
+	#[test]
+	fn human_required_terminal_failure_comments_use_manual_attention_error_class() {
+		let error = Report::new(super::ManualAttentionRequested {
+			issue_identifier: String::from("PUB-101"),
+			label: String::from("maestro:needs-attention"),
+			run_id: String::from("pub-101-attempt-1-123"),
+		});
+		let comment = orchestrator::format_terminal_failure_comment(
+			"pub-101-attempt-1-123",
+			1,
+			String::from(".worktrees/PUB-101"),
+			"x/pubfi-pub-101",
+			"maestro:needs-attention",
+			true,
+			&error,
+		);
+
+		assert!(comment.contains("- error_class: `human_attention_required`"));
+		assert!(comment.contains("stop automatic retries and hand off manually"));
+		assert!(comment.contains("clear label `maestro:needs-attention`"));
+	}
+
+	#[test]
+	fn review_handoff_writeback_failures_use_nonretryable_terminal_failure_comment() {
+		let error = Report::new(super::ReviewHandoffNeedsAttention {
+			issue_identifier: String::from("PUB-101"),
+			run_id: String::from("pub-101-attempt-1-123"),
+		});
+		let comment = orchestrator::format_terminal_failure_comment(
+			"pub-101-attempt-1-123",
+			1,
+			String::from(".worktrees/PUB-101"),
+			"x/pubfi-pub-101",
+			"maestro:needs-attention",
+			false,
+			&error,
+		);
+
+		assert!(comment.contains("- error_class: `review_handoff_writeback_failed`"));
+		assert!(comment.contains("repair the incomplete review handoff manually"));
+		assert!(comment.contains("clear label `maestro:needs-attention`"));
+	}
+
+	#[test]
+	fn live_runs_require_gh_preflight() {
+		assert!(orchestrator::validate_review_handoff_runtime(true).is_ok());
+		assert!(orchestrator::validate_command_available("git", "test preflight").is_ok());
+
+		let error = orchestrator::validate_command_available(
+			"__maestro_missing_command__",
+			"PR-backed review handoff",
+		)
+		.expect_err("missing command should fail preflight");
+
+		assert!(
+			error
+				.to_string()
+				.contains("Required command `__maestro_missing_command__` is unavailable")
+		);
 	}
 
 	#[test]

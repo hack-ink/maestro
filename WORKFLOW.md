@@ -36,6 +36,8 @@ Use `cargo make` whenever an equivalent task exists.
 
 Use the issue-scoped tracker tools autonomously for normal-path state changes and comments on the currently leased issue.
 
+Treat `In Review` as a PR-backed handoff state. A normal success path must push the lane branch, create or update a non-draft PR, and only then ask `maestro` to complete the `In Review` handoff.
+
 Keep changes scoped to the current issue. Do not widen scope into unrelated cleanup or parallel feature work.
 
 When runtime behavior changes, update the relevant specs and operator docs in the same lane so the repo stays self-describing.

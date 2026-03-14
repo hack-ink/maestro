@@ -2,7 +2,7 @@
 
 Goal: Run the `maestro` MVP against one configured Linear project and one target repository, with `maestro` itself as the default first pilot target.
 Read this when: You are preparing a dry run or live self-dogfood pilot and need the bounded operator procedure for config, target-repo requirements, and expected run behavior.
-Preconditions: `codex app-server` is available locally; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is configured through `tracker.api_key` in `maestro.toml`.
+Preconditions: `codex app-server` is available locally; `gh` is available locally for live PR-backed handoff validation; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is configured through `tracker.api_key` in `maestro.toml`.
 Depends on: `docs/spec/system_maestro_runtime.md`, `docs/spec/system_workflow_contract.md`, `docs/spec/system_app_server_contract.md`, the target repository root `WORKFLOW.md`, and `Makefile.toml` for repo-native verification tasks.
 Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run --config ./maestro.toml`; and, when the environment is ready, `cargo run -- run --once --config ./maestro.toml`.
 
@@ -15,6 +15,7 @@ Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run 
 ## Preconditions
 
 - `codex app-server` is available locally.
+- `gh` is available locally for live runs that must validate PR-backed review handoff.
 - The target repository already exists on disk as a normal Git checkout.
 - The target repository has a root `WORKFLOW.md`.
 - The target repository files referenced by `WORKFLOW.md [context.read_first]` exist.
@@ -102,7 +103,7 @@ The target Linear team should also expose:
 - handoff state such as `In Review`
 - terminal states such as `Done`, `Canceled`, and `Duplicate`
 - optional label `maestro:manual-only` to opt out of automation
-- optional label `maestro:needs-attention` for retry-exhausted failures
+- optional label `maestro:needs-attention` for retry-exhausted or human-required failures
 
 If `maestro:needs-attention` does not exist, the run will still fail correctly, but `maestro` will only post the failure comment and log a warning instead of adding the label.
 
@@ -150,7 +151,8 @@ On a normal successful run, `maestro` will:
 6. let the coding agent perform the normal-path `In Progress` transition and start comment through issue-scoped tools
 7. run Codex through direct `app-server`
 8. run the configured validation commands inside the worktree
-9. let the coding agent perform the normal-path `In Review` transition and completion comment through issue-scoped tools
+9. require the coding agent to record a PR-backed review handoff through the issue-scoped tool bridge
+10. let `maestro` write the completion comment and `In Review` transition only after its own validation succeeds
 
 After `protocol probe`, `run --once --dry-run`, and `run --once` all behave as expected, use daemon mode for the long-running pilot loop:
 
@@ -183,6 +185,8 @@ Start with Linear:
 - check the issue state
 - read the latest `maestro` comment for `run_id`, attempt number, timestamps, and next action
 - if retries were exhausted, look for the `maestro:needs-attention` label
+- if the agent explicitly requested human attention, expect the issue to move back to `Todo` with `maestro:needs-attention` immediately instead of retrying
+- any issue that still carries `maestro:needs-attention` is intentionally ineligible for another automatic run until a human clears that label
 - if the issue is already terminal, expect the worktree to disappear on the next live pass or startup reconciliation
 
 Then inspect the worktree mentioned in the comment:
@@ -207,7 +211,7 @@ Use the event journal when the failure happened inside `app-server` transport or
 ## Re-running after failure
 
 - If the run is still retryable, leave the issue in `In Progress` and let `maestro` retry.
-- If the run moved back to `Todo` with `maestro:needs-attention`, inspect the worktree, fix the blocking problem, and then move the issue back into a startable state for another automated attempt.
+- If the run moved back to `Todo` with `maestro:needs-attention`, inspect the worktree, fix the blocking problem, clear `maestro:needs-attention`, and then move the issue back into a startable state for another automated attempt.
 - If the issue should never be automated again, add `maestro:manual-only`.
 
 ## Verification commands

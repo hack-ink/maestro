@@ -55,7 +55,8 @@ An issue is eligible only when all of the following are true:
 2. The issue state is in the configured `startable_states`.
 3. The issue state is not in the configured terminal states.
 4. The issue does not have the opt-out label `maestro:manual-only`.
-5. The issue does not already have an active `maestro` lease.
+5. The issue does not have the human-attention label `maestro:needs-attention`.
+6. The issue does not already have an active `maestro` lease.
 
 Default `startable_states`:
 
@@ -91,6 +92,17 @@ The runtime state machine is local to `maestro`. It is not a replacement for Lin
 | `succeeded` | The attempt finished, validations passed, and the success writeback was committed to Linear. | Local cleanup begins. |
 | `closed` | Local cleanup finished and the lease is gone. | None. |
 
+After the `app-server` turn completes, `maestro` must resolve exactly one completion disposition before deciding whether the lane enters `validating`, `needs_attention`, or a retry path:
+
+- `review_handoff`
+  - The agent recorded a valid PR-backed review handoff and did not request human attention.
+  - `maestro` proceeds into `validating`, then applies the success writeback if validation passes.
+- `manual_attention`
+  - The agent explicitly requested human attention by adding `maestro:needs-attention` and did not also record review handoff.
+  - `maestro` skips success writeback and post-run validation commands, then enters the human-required failure flow immediately.
+- invalid completion signaling
+  - If the turn records both signals or neither signal, the attempt is invalid and must fail rather than guessing a completion path.
+
 ## Tracker write ownership
 
 - Preferred steady state: the coding agent writes tracker state transitions, comments, and handoff data for the currently leased issue through issue-scoped runtime tools.
@@ -100,6 +112,7 @@ The runtime state machine is local to `maestro`. It is not a replacement for Lin
   - terminal fallback when the agent never reached the point of writing the tracker
 - The service must never grant the coding agent broad tracker write access outside the currently leased issue.
 - Before starting a live run, the service must reconcile stale local leases and any terminal worktree mappings against current tracker state.
+- Before starting a live run, the service must fail fast if the local `gh` CLI needed for PR-backed review handoff inspection is unavailable.
 
 ## Linear writeback model
 
@@ -120,12 +133,35 @@ Required run-start comment fields:
 - `transport`
 - `model` when configured
 
+### Completion disposition
+
+Before applying success or failure writeback, `maestro` must classify the finished turn into one and only one terminal completion disposition:
+
+| Disposition | Required agent signal | Forbidden co-signal | Runtime effect |
+| --- | --- | --- | --- |
+| `review_handoff` | `issue_review_handoff` | `maestro:needs-attention` | Run validation commands, revalidate PR state, post completion comment, transition to `In Review`. |
+| `manual_attention` | `maestro:needs-attention` plus an explanatory issue comment | `issue_review_handoff` | Skip PR-backed success writeback and validation commands, then treat the run as a human-required failure immediately. |
+
+If neither signal exists, or both signals exist, `maestro` must fail the attempt instead of inferring operator intent.
+If the label is recorded without the required explanatory comment, `maestro` must also fail the attempt instead of treating it as a valid `manual_attention` exit.
+
 ### Success writeback
 
-After agent execution and post-run validation succeed, the coding agent should:
+This path applies only when the resolved completion disposition is `review_handoff`.
 
-1. Transition the issue to `In Review`.
-2. Post a structured completion comment.
+During the run, the coding agent should prepare a PR-backed handoff by:
+
+1. pushing the lane branch
+2. creating or updating a non-draft PR for that branch
+3. calling the dedicated review handoff tool with the PR URL and a short summary
+
+After agent execution and post-run validation succeed, `maestro` should:
+
+1. confirm that the recorded PR still belongs to the current repository and branch and that its head commit matches the validated lane HEAD
+2. transition the issue to `In Review`
+3. post the structured completion comment from the recorded handoff
+
+If the `In Review` transition succeeds but the completion comment fails, `maestro` must stop automatic retries for that attempt and converge the lane through the human-required failure path instead of treating it as retryable work.
 
 Required completion comment fields:
 
@@ -133,13 +169,16 @@ Required completion comment fields:
 - `attempt`
 - `finished_at`
 - `branch`
+- `pr_url`
 - `worktree_path` as a repository-relative lane path such as `.worktrees/PUB-606`
 - `validation_result`
 - `summary`
 
-Successful runs must not auto-transition directly to `Done`.
+`In Review` is a PR-backed handoff state. Successful runs must not auto-transition directly to `Done`, and generic issue transitions must not move straight into the success state without the recorded PR handoff.
 
 ### Failure writeback
+
+This path applies to retryable failures, retry exhaustion, and explicit `manual_attention` exits.
 
 Retryable failures with remaining budget:
 
@@ -150,6 +189,10 @@ Retry-exhausted or human-required failures:
 1. Transition the issue to `Todo`.
 2. Add the label `maestro:needs-attention`.
 3. Post a structured failure comment.
+
+If the coding agent explicitly requests human attention by adding `maestro:needs-attention`, `maestro` must stop automatic retries for that attempt, skip PR-backed success writeback, and treat the lane as a human-required failure immediately.
+
+Any issue carrying `maestro:needs-attention` is ineligible for another automatic run until a human clears the label and returns the issue to a startable state.
 
 Required failure comment fields:
 
