@@ -22,8 +22,8 @@ Realign `maestro` with the important ownership and runtime boundaries from upstr
 
 ## Constraints
 
-- The completed MVP plan at [2026-03-12_maestro-app-server-mvp.md](/Users/xavier/code/trusted/helixbox/maestro/docs/plans/2026-03-12_maestro-app-server-mvp.md) is the baseline. This follow-up plan should extend, not relitigate, the finished scaffolding.
-- Repo-native verification must continue to run through `cargo make` from the repository root because [Makefile.toml](/Users/xavier/code/trusted/helixbox/maestro/Makefile.toml) remains the source of truth for checks.
+- The completed MVP plan at [2026-03-12_maestro-app-server-mvp.md](./2026-03-12_maestro-app-server-mvp.md) is the baseline. This follow-up plan should extend, not relitigate, the finished scaffolding.
+- Repo-native verification must continue to run through `cargo make` from the repository root because [Makefile.toml](../../Makefile.toml) remains the source of truth for checks.
 - The direct `app-server` path stays in scope. Do not pivot to the SDK bridge while doing this alignment pass.
 - The live pilot should keep blast radius low. `dry-run` remains the first gate, and the first live run should target `maestro` itself rather than a different downstream repo.
 - The service must continue to own leases, workspace lifecycle, retries, and crash recovery even after tracker writes move toward the coding agent.

@@ -23,9 +23,9 @@ Build a standalone `maestro` MVP in this repository that can poll one configured
 
 ## Constraints
 
-- The repository is still on a placeholder scaffold today: [README.md](/Users/xavier/code/trusted/helixbox/maestro/README.md), [src/main.rs](/Users/xavier/code/trusted/helixbox/maestro/src/main.rs), and [src/cli.rs](/Users/xavier/code/trusted/helixbox/maestro/src/cli.rs) must be normalized before the runtime is meaningful.
-- Repo-native verification should continue to go through `cargo make` because [Makefile.toml](/Users/xavier/code/trusted/helixbox/maestro/Makefile.toml) is the local source of truth for checks.
-- `cargo make fmt-check` currently shells out to `cargo +nightly fmt --all -- --check`, so nightly `rustfmt` is an execution prerequisite even though [rust-toolchain.toml](/Users/xavier/code/trusted/helixbox/maestro/rust-toolchain.toml) defaults to stable.
+- The repository is still on a placeholder scaffold today: [README.md](../../README.md), [src/main.rs](../../src/main.rs), and [src/cli.rs](../../src/cli.rs) must be normalized before the runtime is meaningful.
+- Repo-native verification should continue to go through `cargo make` because [Makefile.toml](../../Makefile.toml) is the local source of truth for checks.
+- `cargo make fmt-check` currently shells out to `cargo +nightly fmt --all -- --check`, so nightly `rustfmt` is an execution prerequisite even though [rust-toolchain.toml](../../rust-toolchain.toml) defaults to stable.
 - The local Codex CLI already exposes `codex app-server` and `codex app-server generate-json-schema`, so the MVP can be grounded in the local protocol surface instead of reverse-engineering from prose docs alone.
 - The MVP should prefer `stdio://` transport for `app-server` first. `ws://` can be added later if remote or browser-driven controllers become necessary.
 - Workspace provisioning should use `git worktree` lifecycle operations rather than ad hoc cloned directories, and the service should follow the same branch-isolated lane model used by the local worktree workflow.
