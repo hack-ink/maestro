@@ -360,7 +360,7 @@ fn copy_repo_local_git_config(source_repo_root: &Path, workspace_path: &Path) ->
 
 	let local_entries = git_stdout(
 		source_repo_root,
-		["config", "--local", "--null", "--list"],
+		["config", "--local", "--includes", "--null", "--list"],
 		"read source repository local git config",
 	)?;
 
@@ -634,6 +634,39 @@ mod tests {
 		assert_eq!(
 			git_stdout(&spec.path, &["config", "--local", "--get", "user.signingkey"]),
 			"workspace-tests"
+		);
+	}
+
+	#[test]
+	fn clone_backed_workspace_copies_repo_local_identity_from_included_config() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+		let included_config = repo_root.parent().unwrap().join("identity.inc");
+
+		run_git(&repo_root, &["config", "--unset-all", "user.name"]);
+		run_git(&repo_root, &["config", "--unset-all", "user.email"]);
+
+		fs::write(
+			&included_config,
+			"[user]\n\tname = Included Tests\n\temail = included@example.com\n",
+		)
+		.expect("included config should write");
+
+		run_git(
+			&repo_root,
+			&["config", "--local", "include.path", included_config.to_str().unwrap()],
+		);
+
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
+
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "user.name"]),
+			"Included Tests"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "user.email"]),
+			"included@example.com"
 		);
 	}
 
