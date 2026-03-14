@@ -292,7 +292,17 @@ fn fetch_remote_branch_if_present(workspace_path: &Path, branch_name: &str) -> R
 		.output()?;
 
 	if !branch_check.status.success() {
-		return Ok(false);
+		if branch_check.status.code() == Some(2) {
+			return Ok(false);
+		}
+
+		let stderr = String::from_utf8_lossy(&branch_check.stderr);
+
+		eyre::bail!(
+			"Failed to inspect remote workspace branch `{branch_name}` in `{}`: {}",
+			workspace_path.display(),
+			stderr.trim()
+		);
 	}
 
 	let remote_tracking_ref = format!("refs/remotes/origin/{branch_name}");
@@ -531,13 +541,18 @@ mod tests {
 	fn init_repo() -> (TempDir, PathBuf) {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let repo_root = temp_dir.path().join("repo");
+		let default_origin = repo_root.parent().unwrap().join("source-origin.git");
 
 		fs::create_dir_all(&repo_root).expect("repo root should exist");
 
+		run_git(
+			default_origin.parent().unwrap(),
+			&["init", "--bare", default_origin.to_str().unwrap()],
+		);
 		run_git(&repo_root, &["init", "--initial-branch", "main"]);
 		run_git(&repo_root, &["config", "user.name", "Maestro Tests"]);
 		run_git(&repo_root, &["config", "user.email", "maestro-tests@example.com"]);
-		run_git(&repo_root, &["remote", "add", "origin", "https://github.com/example/maestro.git"]);
+		run_git(&repo_root, &["remote", "add", "origin", default_origin.to_str().unwrap()]);
 
 		fs::write(repo_root.join("README.md"), "hello\n").expect("seed file should write");
 
@@ -572,7 +587,7 @@ mod tests {
 		);
 		assert_eq!(
 			git_stdout(&spec.path, &["remote", "get-url", "origin"]),
-			"https://github.com/example/maestro.git"
+			repo_root.parent().unwrap().join("source-origin.git").display().to_string()
 		);
 
 		let git_dir = PathBuf::from(git_stdout(
@@ -625,12 +640,12 @@ mod tests {
 	#[test]
 	fn clone_backed_workspace_normalizes_relative_origin_remote() {
 		let (_temp_dir, repo_root) = init_repo();
-		let bare_remote = repo_root.parent().unwrap().join("remote.git");
+		let bare_remote = repo_root.parent().unwrap().join("relative-remote.git");
 		let workspace_root = repo_root.join(".workspaces");
 		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
 
 		run_git(bare_remote.parent().unwrap(), &["init", "--bare", bare_remote.to_str().unwrap()]);
-		run_git(&repo_root, &["remote", "set-url", "origin", "../remote.git"]);
+		run_git(&repo_root, &["remote", "set-url", "origin", "../relative-remote.git"]);
 
 		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
 
@@ -661,7 +676,7 @@ mod tests {
 	#[test]
 	fn clone_backed_workspace_uses_existing_remote_lane_branch_when_present() {
 		let (_temp_dir, repo_root) = init_repo();
-		let bare_remote = repo_root.parent().unwrap().join("remote.git");
+		let bare_remote = repo_root.parent().unwrap().join("lane-remote.git");
 		let workspace_root = repo_root.join(".workspaces");
 		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
 		let lane_branch = "x/pubfi-pub-101";
@@ -685,6 +700,24 @@ mod tests {
 			fs::read_to_string(spec.path.join("LANE.md")).expect("lane file should exist"),
 			"lane branch\n"
 		);
+	}
+
+	#[test]
+	fn clone_backed_workspace_fails_when_remote_branch_probe_errors() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+
+		run_git(
+			&repo_root,
+			&["remote", "set-url", "origin", "https://github.com/example/maestro.git"],
+		);
+
+		let error = manager
+			.ensure_workspace("PUB-101", false)
+			.expect_err("workspace create should fail when remote probe errors");
+
+		assert!(error.to_string().contains("Failed to inspect remote workspace branch"));
 	}
 
 	#[test]
