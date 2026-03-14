@@ -60,6 +60,7 @@ impl WorkspaceManager {
 		}
 		if spec.reused_existing {
 			self.validate_workspace_boundary(&spec.path)?;
+			self.refresh_workspace_git_metadata(&spec.path)?;
 
 			return Ok(spec);
 		}
@@ -94,12 +95,6 @@ impl WorkspaceManager {
 	}
 
 	fn create_clone_backed_workspace(&self, spec: &WorkspaceSpec) -> Result<()> {
-		let source_origin_url = try_git_stdout(
-			&self.repo_root,
-			["remote", "get-url", "origin"],
-			"read the source repository origin URL",
-		)?
-		.map(|url| normalize_remote_url(&self.repo_root, &url));
 		let source_head =
 			git_stdout(&self.repo_root, ["rev-parse", "HEAD"], "read the source repository HEAD")?;
 
@@ -130,15 +125,7 @@ impl WorkspaceManager {
 		}
 
 		let setup_result = (|| -> Result<()> {
-			copy_repo_local_git_config(&self.repo_root, &spec.path)?;
-
-			if let Some(source_origin_url) = source_origin_url.as_deref() {
-				run_git(
-					&spec.path,
-					["remote", "set-url", "origin", source_origin_url],
-					"rewrite the workspace origin remote",
-				)?;
-			}
+			self.refresh_workspace_git_metadata(&spec.path)?;
 
 			run_git(
 				&spec.path,
@@ -153,6 +140,26 @@ impl WorkspaceManager {
 			let _ = fs::remove_dir_all(&spec.path);
 
 			return Err(error);
+		}
+
+		Ok(())
+	}
+
+	fn refresh_workspace_git_metadata(&self, workspace_path: &Path) -> Result<()> {
+		copy_repo_local_git_config(&self.repo_root, workspace_path)?;
+
+		if let Some(source_origin_url) = try_git_stdout(
+			&self.repo_root,
+			["remote", "get-url", "origin"],
+			"read the source repository origin URL",
+		)?
+		.map(|url| normalize_remote_url(&self.repo_root, &url))
+		{
+			run_git(
+				workspace_path,
+				["remote", "set-url", "origin", source_origin_url.as_str()],
+				"rewrite the workspace origin remote",
+			)?;
 		}
 
 		Ok(())
@@ -245,6 +252,8 @@ where
 }
 
 fn copy_repo_local_git_config(source_repo_root: &Path, workspace_path: &Path) -> Result<()> {
+	clear_managed_workspace_git_config(workspace_path)?;
+
 	let local_entries = git_stdout(
 		source_repo_root,
 		["config", "--local", "--null", "--list"],
@@ -268,6 +277,55 @@ fn copy_repo_local_git_config(source_repo_root: &Path, workspace_path: &Path) ->
 	}
 
 	Ok(())
+}
+
+fn clear_managed_workspace_git_config(workspace_path: &Path) -> Result<()> {
+	let local_entries = git_stdout(
+		workspace_path,
+		["config", "--local", "--null", "--list"],
+		"read workspace local git config",
+	)?;
+	let mut managed_keys = Vec::new();
+
+	for raw_entry in local_entries.split('\0').filter(|entry| !entry.is_empty()) {
+		let Some((key, _value)) = raw_entry.split_once('\n') else {
+			continue;
+		};
+
+		if should_copy_local_git_config(key) && !managed_keys.iter().any(|item| item == key) {
+			managed_keys.push(key.to_owned());
+		}
+	}
+	for key in managed_keys {
+		unset_all_local_config(workspace_path, &key)?;
+	}
+
+	Ok(())
+}
+
+fn unset_all_local_config(repo_root: &Path, key: &str) -> Result<()> {
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(repo_root)
+		.args(["config", "--local", "--unset-all", key])
+		.output()?;
+
+	if output.status.success() {
+		return Ok(());
+	}
+
+	match output.status.code() {
+		Some(5) => Ok(()),
+		_ => {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+
+			eyre::bail!(
+				"Failed to clear workspace local git config `{key}` in `{}`: {}",
+				repo_root.display(),
+				stderr.trim()
+			);
+		},
+	}
 }
 
 fn normalize_remote_url(source_repo_root: &Path, remote_url: &str) -> String {
@@ -491,6 +549,69 @@ mod tests {
 		);
 
 		run_git(&spec.path, &["ls-remote", "origin"]);
+	}
+
+	#[test]
+	fn reused_clone_backed_workspace_refreshes_git_metadata_from_source_repo() {
+		let (_temp_dir, repo_root) = init_repo();
+		let first_remote = repo_root.parent().unwrap().join("remote-one.git");
+		let second_remote = repo_root.parent().unwrap().join("remote-two.git");
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+
+		run_git(
+			first_remote.parent().unwrap(),
+			&["init", "--bare", first_remote.to_str().unwrap()],
+		);
+		run_git(
+			second_remote.parent().unwrap(),
+			&["init", "--bare", second_remote.to_str().unwrap()],
+		);
+		run_git(&repo_root, &["remote", "set-url", "origin", "../remote-one.git"]);
+		run_git(&repo_root, &["config", "user.name", "Initial Tests"]);
+
+		let initial_spec =
+			manager.ensure_workspace("PUB-101", false).expect("initial workspace should exist");
+
+		assert_eq!(
+			git_stdout(&initial_spec.path, &["config", "--local", "--get", "user.name"]),
+			"Initial Tests"
+		);
+		assert_eq!(
+			git_stdout(&initial_spec.path, &["remote", "get-url", "origin"]),
+			fs::canonicalize(&first_remote)
+				.expect("first remote should canonicalize")
+				.display()
+				.to_string()
+		);
+
+		run_git(&repo_root, &["config", "user.name", "Updated Tests"]);
+		run_git(&repo_root, &["config", "user.email", "updated@example.com"]);
+		run_git(&repo_root, &["remote", "set-url", "origin", "../remote-two.git"]);
+
+		let reused_spec =
+			manager.ensure_workspace("PUB-101", false).expect("reused workspace should exist");
+
+		assert!(reused_spec.reused_existing);
+		assert_eq!(
+			git_stdout(&reused_spec.path, &["config", "--local", "--get", "user.name"]),
+			"Updated Tests"
+		);
+		assert_eq!(
+			git_stdout(&reused_spec.path, &["config", "--local", "--get", "user.email"]),
+			"updated@example.com"
+		);
+		assert_eq!(
+			git_stdout(&reused_spec.path, &["config", "--local", "--get-all", "user.name"]),
+			"Updated Tests"
+		);
+		assert_eq!(
+			git_stdout(&reused_spec.path, &["remote", "get-url", "origin"]),
+			fs::canonicalize(&second_remote)
+				.expect("second remote should canonicalize")
+				.display()
+				.to_string()
+		);
 	}
 
 	#[test]
