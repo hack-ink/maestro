@@ -11,7 +11,9 @@ use crate::{
 		json_rpc::{
 			JsonRpcConnection, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, WireMessage,
 		},
-		tracker_tool_bridge::{DynamicToolCallResponse, DynamicToolHandler, DynamicToolSpec},
+		tracker_tool_bridge::{
+			DynamicToolCallResponse, DynamicToolContentItem, DynamicToolHandler, DynamicToolSpec,
+		},
 	},
 	prelude::{Result, eyre},
 	state::StateStore,
@@ -623,11 +625,9 @@ fn handle_dynamic_tool_call(
 		Ok(payload) => payload,
 		Err(error) => {
 			return DynamicToolCallResponse {
-				content_items: vec![
-					crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-						text: format!("Invalid `item/tool/call` payload: {error}"),
-					},
-				],
+				content_items: vec![DynamicToolContentItem::InputText {
+					text: format!("Invalid `item/tool/call` payload: {error}"),
+				}],
 				success: false,
 			};
 		},
@@ -635,38 +635,32 @@ fn handle_dynamic_tool_call(
 
 	if payload.thread_id != target_thread_id {
 		return DynamicToolCallResponse {
-			content_items: vec![
-				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-					text: format!(
-						"Dynamic tool call targeted thread `{}`, but the active thread is `{target_thread_id}`.",
-						payload.thread_id
-					),
-				},
-			],
+			content_items: vec![DynamicToolContentItem::InputText {
+				text: format!(
+					"Dynamic tool call targeted thread `{}`, but the active thread is `{target_thread_id}`.",
+					payload.thread_id
+				),
+			}],
 			success: false,
 		};
 	}
 	if payload.turn_id != target_turn_id {
 		return DynamicToolCallResponse {
-			content_items: vec![
-				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-					text: format!(
-						"Dynamic tool call targeted turn `{}`, but the active turn is `{target_turn_id}`.",
-						payload.turn_id
-					),
-				},
-			],
+			content_items: vec![DynamicToolContentItem::InputText {
+				text: format!(
+					"Dynamic tool call targeted turn `{}`, but the active turn is `{target_turn_id}`.",
+					payload.turn_id
+				),
+			}],
 			success: false,
 		};
 	}
 
 	let Some(dynamic_tool_handler) = dynamic_tool_handler else {
 		return DynamicToolCallResponse {
-			content_items: vec![
-				crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText {
-					text: String::from("Dynamic tool bridge is unavailable for this run attempt."),
-				},
-			],
+			content_items: vec![DynamicToolContentItem::InputText {
+				text: String::from("Dynamic tool bridge is unavailable for this run attempt."),
+			}],
 			success: false,
 		};
 	};

@@ -216,6 +216,23 @@ The local persistence layer may store only the data needed to operate safely:
 
 The local persistence layer must not become the operator-facing source of workflow truth.
 
+## Supported operator visibility surface
+
+`maestro` must expose a supported local visibility surface for current runtime state without requiring operators to read source code or write ad hoc SQL.
+
+The minimum supported surface is:
+
+- structured runtime logs with stable identifiers such as `project_id`, `issue_id`, `issue`, `run_id`, `attempt`, `branch`, and repository-relative `worktree_path`
+- a local status command that renders the current project-scoped snapshot in both human-readable and JSON forms
+
+The status surface should describe only current local execution state, for example:
+
+- active leased runs
+- recent run attempts with local status, thread id, and latest persisted protocol event
+- retained worktree mappings
+
+It is acceptable for deeper historical forensics to continue using the retained local store directly, but that store is a fallback implementation detail rather than the supported first-line operator interface.
+
 ## Retention and cleanup
 
 - Lease and session mappings: remove when the run closes.

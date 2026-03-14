@@ -38,6 +38,7 @@ impl Cli {
 		match &self.command {
 			Command::Run(args) => args.run(),
 			Command::Daemon(args) => args.run(),
+			Command::Status(args) => args.run(),
 			Command::Protocol(args) => args.run(),
 		}
 	}
@@ -49,6 +50,8 @@ enum Command {
 	Run(RunCommand),
 	/// Start the long-running poll loop.
 	Daemon(DaemonCommand),
+	/// Inspect the current local runtime state for one configured project.
+	Status(StatusCommand),
 	/// Inspect or validate the local app-server integration boundary.
 	Protocol(ProtocolCommand),
 }
@@ -87,6 +90,24 @@ struct DaemonCommand {
 impl DaemonCommand {
 	fn run(&self) -> Result<()> {
 		orchestrator::run_daemon(self.config.as_deref(), Duration::from_secs(self.poll_interval_s))
+	}
+}
+
+#[derive(Debug, Args)]
+struct StatusCommand {
+	/// Override the service config path.
+	#[arg(long, value_name = "PATH")]
+	config: Option<PathBuf>,
+	/// Emit structured JSON instead of human-readable text.
+	#[arg(long)]
+	json: bool,
+	/// Maximum number of recent runs to display.
+	#[arg(long, value_name = "COUNT", default_value_t = orchestrator::DEFAULT_STATUS_RUN_LIMIT)]
+	limit: usize,
+}
+impl StatusCommand {
+	fn run(&self) -> Result<()> {
+		orchestrator::print_status(self.config.as_deref(), self.json, self.limit)
 	}
 }
 
@@ -150,7 +171,7 @@ mod tests {
 
 	use crate::cli::{
 		Cli, Command, DaemonCommand, ProtocolCommand, ProtocolProbeCommand, ProtocolSubcommand,
-		RunCommand,
+		RunCommand, StatusCommand,
 	};
 
 	#[test]
@@ -190,6 +211,24 @@ mod tests {
 		assert!(matches!(
 			cli.command,
 			Command::Daemon(DaemonCommand { poll_interval_s: 5, config: Some(_) })
+		));
+	}
+
+	#[test]
+	fn parses_status_with_json_limit_and_config() {
+		let cli = Cli::parse_from([
+			"maestro",
+			"status",
+			"--json",
+			"--limit",
+			"5",
+			"--config",
+			"./maestro.toml",
+		]);
+
+		assert!(matches!(
+			cli.command,
+			Command::Status(StatusCommand { json: true, limit: 5, config: Some(_) })
 		));
 	}
 }

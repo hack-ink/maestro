@@ -6,6 +6,7 @@ use std::{
 	process::Command,
 };
 
+use color_eyre::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -627,7 +628,7 @@ impl<'a> TrackerToolBridge<'a> {
 		self.tracker.update_issue_state(&self.issue.id, success_state_id)?;
 
 		if let Err(error) = self.tracker.create_comment(&self.issue.id, &completion_comment) {
-			return Err(eyre::Report::new(ReviewHandoffWritebackFailed {
+			return Err(Report::new(ReviewHandoffWritebackFailed {
 				issue_identifier: self.issue.identifier.clone(),
 				run_id: review_context.run_id.clone(),
 				pr_url: pending_review_handoff.pr_url,

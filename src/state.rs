@@ -210,6 +210,86 @@ impl StateStore {
 		Ok(attempt)
 	}
 
+	/// List recent run attempts for one project, including lease and protocol summary fields.
+	pub fn list_recent_runs(
+		&self,
+		project_id: &str,
+		limit: usize,
+	) -> crate::prelude::Result<Vec<ProjectRunStatus>> {
+		let mut statement = self.connection.prepare(
+			"
+			SELECT
+				r.run_id,
+				r.issue_id,
+				r.attempt_number,
+				r.status,
+				r.thread_id,
+				r.updated_at,
+				m.branch_name,
+				m.worktree_path,
+				EXISTS(
+					SELECT 1
+					FROM issue_leases l
+					WHERE l.project_id = ?1
+						AND l.issue_id = r.issue_id
+						AND l.run_id = r.run_id
+				) AS active_lease,
+				(
+					SELECT COUNT(*)
+					FROM event_journal e
+					WHERE e.run_id = r.run_id
+				) AS event_count,
+				(
+					SELECT e.event_type
+					FROM event_journal e
+					WHERE e.run_id = r.run_id
+					ORDER BY e.sequence_number DESC
+					LIMIT 1
+				) AS last_event_type,
+				(
+					SELECT e.created_at
+					FROM event_journal e
+					WHERE e.run_id = r.run_id
+					ORDER BY e.sequence_number DESC
+					LIMIT 1
+				) AS last_event_at
+			FROM run_attempts r
+			LEFT JOIN worktree_mappings m
+				ON m.issue_id = r.issue_id
+				AND m.project_id = ?1
+			WHERE m.project_id = ?1
+				OR EXISTS(
+					SELECT 1
+					FROM issue_leases l
+					WHERE l.project_id = ?1
+						AND l.issue_id = r.issue_id
+						AND l.run_id = r.run_id
+				)
+			ORDER BY active_lease DESC, r.updated_at DESC, r.attempt_number DESC, r.run_id DESC
+			LIMIT ?2
+			",
+		)?;
+		let rows = statement.query_map(rusqlite::params![project_id, limit as i64], |row| {
+			Ok(ProjectRunStatus {
+				run_id: row.get(0)?,
+				issue_id: row.get(1)?,
+				attempt_number: row.get(2)?,
+				status: row.get(3)?,
+				thread_id: row.get(4)?,
+				updated_at: row.get(5)?,
+				branch_name: row.get(6)?,
+				worktree_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+				active_lease: row.get::<_, i64>(8)? != 0,
+				event_count: row.get(9)?,
+				last_event_type: row.get(10)?,
+				last_event_at: row.get(11)?,
+			})
+		})?;
+		let runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+		Ok(runs)
+	}
+
 	/// Append one protocol event to the journal for a run.
 	pub fn append_event(
 		&self,
@@ -435,6 +515,84 @@ impl RunAttempt {
 	}
 }
 
+/// Project-scoped operator view of one run attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectRunStatus {
+	run_id: String,
+	issue_id: String,
+	attempt_number: i64,
+	status: String,
+	thread_id: Option<String>,
+	updated_at: String,
+	branch_name: Option<String>,
+	worktree_path: Option<PathBuf>,
+	active_lease: bool,
+	event_count: i64,
+	last_event_type: Option<String>,
+	last_event_at: Option<String>,
+}
+impl ProjectRunStatus {
+	/// Stable run identifier.
+	pub fn run_id(&self) -> &str {
+		&self.run_id
+	}
+
+	/// Issue identifier for the run.
+	pub fn issue_id(&self) -> &str {
+		&self.issue_id
+	}
+
+	/// Attempt number for this run.
+	pub fn attempt_number(&self) -> i64 {
+		self.attempt_number
+	}
+
+	/// Current local status for the run.
+	pub fn status(&self) -> &str {
+		&self.status
+	}
+
+	/// Thread identifier returned by `app-server`, when known.
+	pub fn thread_id(&self) -> Option<&str> {
+		self.thread_id.as_deref()
+	}
+
+	/// Timestamp of the latest run-attempt status update.
+	pub fn updated_at(&self) -> &str {
+		&self.updated_at
+	}
+
+	/// Branch name for the retained lane, when known.
+	pub fn branch_name(&self) -> Option<&str> {
+		self.branch_name.as_deref()
+	}
+
+	/// Filesystem path to the retained worktree, when known.
+	pub fn worktree_path(&self) -> Option<&Path> {
+		self.worktree_path.as_deref()
+	}
+
+	/// Whether this run still holds the active local lease.
+	pub fn active_lease(&self) -> bool {
+		self.active_lease
+	}
+
+	/// Number of persisted protocol events for the run.
+	pub fn event_count(&self) -> i64 {
+		self.event_count
+	}
+
+	/// Latest persisted protocol event type, when one exists.
+	pub fn last_event_type(&self) -> Option<&str> {
+		self.last_event_type.as_deref()
+	}
+
+	/// Timestamp of the latest persisted protocol event, when one exists.
+	pub fn last_event_at(&self) -> Option<&str> {
+		self.last_event_at.as_deref()
+	}
+}
+
 /// Worktree mapping for one issue lane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeMapping {
@@ -568,5 +726,67 @@ mod tests {
 		assert_eq!(leases[0].project_id(), "pubfi");
 		assert_eq!(leases[0].issue_id(), "PUB-101");
 		assert_eq!(leases[1].issue_id(), "PUB-102");
+	}
+
+	#[test]
+	fn lists_recent_project_runs_with_protocol_summary() {
+		let store = StateStore::open_in_memory().expect("in-memory state store should open");
+
+		store
+			.record_run_attempt("run-2", "PUB-102", 2, "failed")
+			.expect("older run attempt should be recorded");
+		store
+			.record_run_attempt("run-1", "PUB-101", 1, "running")
+			.expect("active run attempt should be recorded");
+		store.update_run_thread("run-1", "thread-1").expect("thread id should attach");
+		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should record");
+		store
+			.upsert_worktree("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/worktrees/pub-101")
+			.expect("active worktree should record");
+		store
+			.upsert_worktree("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/worktrees/pub-102")
+			.expect("retained worktree should record");
+		store
+			.append_event("run-1", 1, "turn/started", "{\"turn\":\"1\"}")
+			.expect("event should record");
+		store
+			.append_event("run-1", 2, "turn/completed", "{\"turn\":\"1\"}")
+			.expect("second event should record");
+
+		let runs = store.list_recent_runs("pubfi", 10).expect("status query should succeed");
+
+		assert_eq!(runs.len(), 2);
+		assert_eq!(runs[0].run_id(), "run-1");
+		assert!(runs[0].active_lease());
+		assert_eq!(runs[0].branch_name(), Some("x/pubfi-pub-101"));
+		assert_eq!(runs[0].worktree_path(), Some(Path::new("/tmp/worktrees/pub-101")));
+		assert_eq!(runs[0].event_count(), 2);
+		assert_eq!(runs[0].last_event_type(), Some("turn/completed"));
+		assert_eq!(runs[0].thread_id(), Some("thread-1"));
+		assert_eq!(runs[1].run_id(), "run-2");
+		assert!(!runs[1].active_lease());
+		assert_eq!(runs[1].branch_name(), Some("x/pubfi-pub-102"));
+		assert_eq!(runs[1].event_count(), 0);
+		assert_eq!(runs[1].last_event_type(), None);
+	}
+
+	#[test]
+	fn recent_project_runs_respect_limit() {
+		let store = StateStore::open_in_memory().expect("in-memory state store should open");
+
+		store.record_run_attempt("run-1", "PUB-101", 1, "failed").expect("first run should record");
+		store
+			.record_run_attempt("run-2", "PUB-102", 1, "failed")
+			.expect("second run should record");
+		store
+			.upsert_worktree("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/worktrees/pub-101")
+			.expect("first worktree should record");
+		store
+			.upsert_worktree("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/worktrees/pub-102")
+			.expect("second worktree should record");
+
+		let runs = store.list_recent_runs("pubfi", 1).expect("status query should succeed");
+
+		assert_eq!(runs.len(), 1);
 	}
 }

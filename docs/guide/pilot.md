@@ -210,7 +210,16 @@ git -C /absolute/path/to/helixbox/maestro/.worktrees/PUB-600 status --short
 git -C /absolute/path/to/helixbox/maestro/.worktrees/PUB-600 log --oneline --decorate -5
 ```
 
-If you need the thin operational state, inspect the SQLite file directly:
+Before dropping to local storage internals, inspect the supported runtime surface:
+
+```sh
+cargo run -- status --config ./maestro.toml
+cargo run -- status --json --config ./maestro.toml
+```
+
+Use the human-readable view when you need the current leased run, retained worktree, and recent attempt summary at a glance. Use `--json` when you want a machine-readable snapshot with stable identifiers such as `run_id`, `issue_id`, `thread_id`, `branch`, and repository-relative `worktree_path`.
+
+If you still need the thin storage internals for deep forensics, inspect the SQLite file directly as a fallback:
 
 ```sh
 DB_PATH=/absolute/path/to/maestro.sqlite3

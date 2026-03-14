@@ -13,6 +13,7 @@ use std::{
 
 use color_eyre::Report;
 use directories::ProjectDirs;
+use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -20,14 +21,17 @@ use crate::{
 		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, ISSUE_COMMENT_TOOL_NAME,
 		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME,
 		ReviewHandoffContext, ReviewHandoffWritebackFailed, RunCompletionDisposition,
+		TrackerToolBridge,
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
-	state::{RunAttempt, StateStore, WorktreeMapping},
+	state::{ProjectRunStatus, RunAttempt, StateStore, WorktreeMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
 	workflow::WorkflowDocument,
 	workspace::{WorkspaceManager, WorkspaceSpec},
 };
+
+pub(crate) const DEFAULT_STATUS_RUN_LIMIT: usize = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RunSummary {
@@ -129,6 +133,38 @@ struct ActiveRunReconciliation {
 	disposition: ActiveRunDisposition,
 }
 
+#[derive(Debug, Serialize)]
+struct OperatorStatusSnapshot {
+	project_id: String,
+	run_limit: usize,
+	active_runs: Vec<OperatorRunStatus>,
+	recent_runs: Vec<OperatorRunStatus>,
+	worktrees: Vec<OperatorWorktreeStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OperatorRunStatus {
+	run_id: String,
+	issue_id: String,
+	attempt_number: i64,
+	status: String,
+	thread_id: Option<String>,
+	active_lease: bool,
+	updated_at: String,
+	last_event_type: Option<String>,
+	last_event_at: Option<String>,
+	event_count: i64,
+	branch_name: Option<String>,
+	worktree_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OperatorWorktreeStatus {
+	issue_id: String,
+	branch_name: String,
+	worktree_path: String,
+}
+
 pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prelude::Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
@@ -207,6 +243,31 @@ pub(crate) fn run_daemon(
 
 		sleep_until_next_tick(poll_interval, tick_started_at);
 	}
+}
+
+pub(crate) fn print_status(
+	config_path: Option<&Path>,
+	json: bool,
+	limit: usize,
+) -> crate::prelude::Result<()> {
+	if limit == 0 {
+		eyre::bail!("`status --limit` must be greater than zero.");
+	}
+
+	let Some(config_path) = resolve_config_path(config_path)? else {
+		eyre::bail!("No maestro config found. Pass --config or create maestro.toml.");
+	};
+	let config = ServiceConfig::from_path(&config_path)?;
+	let state_store = StateStore::open(default_state_store_path()?)?;
+	let snapshot = build_operator_status_snapshot(&config, &state_store, limit)?;
+
+	if json {
+		println!("{}", serde_json::to_string_pretty(&snapshot)?);
+	} else {
+		print!("{}", render_operator_status(&snapshot));
+	}
+
+	Ok(())
 }
 
 fn load_daemon_tick_context(config_path: &Path) -> crate::prelude::Result<DaemonTickContext> {
@@ -511,6 +572,15 @@ where
 	for action in actions {
 		match action.disposition {
 			ActiveRunDisposition::Terminal => {
+				tracing::info!(
+					project_id = project.id(),
+					issue_id = action.issue.id,
+					issue = action.issue.identifier,
+					run_id = action.run_attempt.run_id(),
+					disposition = "terminal",
+					"Reconciling terminal active run."
+				);
+
 				mark_run_attempt_if_active(state_store, action.run_attempt.run_id(), "terminated")?;
 
 				state_store.clear_lease(&action.issue.id)?;
@@ -520,6 +590,15 @@ where
 				}
 			},
 			ActiveRunDisposition::NonActive => {
+				tracing::info!(
+					project_id = project.id(),
+					issue_id = action.issue.id,
+					issue = action.issue.identifier,
+					run_id = action.run_attempt.run_id(),
+					disposition = "non_active",
+					"Reconciling non-active run."
+				);
+
 				mark_run_attempt_if_active(
 					state_store,
 					action.run_attempt.run_id(),
@@ -529,6 +608,16 @@ where
 				state_store.clear_lease(&action.issue.id)?;
 			},
 			ActiveRunDisposition::Stalled { idle_for } => {
+				tracing::warn!(
+					project_id = project.id(),
+					issue_id = action.issue.id,
+					issue = action.issue.identifier,
+					run_id = action.run_attempt.run_id(),
+					disposition = "stalled",
+					idle_for_s = idle_for.as_secs(),
+					"Reconciling stalled run."
+				);
+
 				state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
 				state_store.clear_lease(&action.issue.id)?;
 
@@ -809,6 +898,17 @@ fn execute_issue_run<T>(
 where
 	T: IssueTracker,
 {
+	tracing::info!(
+		project_id = project.id(),
+		issue_id = issue_run.issue.id,
+		issue = issue_run.issue.identifier,
+		run_id = issue_run.run_id,
+		attempt = issue_run.attempt_number,
+		branch = issue_run.workspace.branch_name,
+		worktree_path = %relative_worktree_path(project, &issue_run.workspace),
+		"Starting issue run."
+	);
+
 	state_store.upsert_lease(project.id(), &issue_run.issue.id, &issue_run.run_id)?;
 	state_store.upsert_worktree(
 		project.id(),
@@ -822,7 +922,20 @@ where
 	state_store.clear_lease(&issue_run.issue.id)?;
 
 	match result {
-		Ok(summary) => Ok(summary),
+		Ok(summary) => {
+			tracing::info!(
+				project_id = project.id(),
+				issue_id = issue_run.issue.id,
+				issue = issue_run.issue.identifier,
+				run_id = issue_run.run_id,
+				attempt = issue_run.attempt_number,
+				branch = issue_run.workspace.branch_name,
+				worktree_path = %relative_worktree_path(project, &issue_run.workspace),
+				"Completed issue run."
+			);
+
+			Ok(summary)
+		},
 		Err(error) => {
 			handle_failure(tracker, project, workflow, &issue_run, &error)?;
 
@@ -848,7 +961,7 @@ where
 		.to_owned();
 	let model =
 		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
-	let tracker_tool_bridge = crate::agent::TrackerToolBridge::with_run_context(
+	let tracker_tool_bridge = TrackerToolBridge::with_run_context(
 		tracker,
 		&issue_run.issue,
 		workflow,
@@ -936,19 +1049,33 @@ where
 	let review_handoff_needs_attention =
 		error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some();
 	let stalled_run_needs_attention = error.downcast_ref::<StalledRunNeedsAttention>().is_some();
+	let worktree_path = relative_worktree_path(project, &issue_run.workspace);
 
 	if !manual_attention_requested
 		&& !review_handoff_needs_attention
 		&& !stalled_run_needs_attention
 		&& issue_run.attempt_number < max_attempts
 	{
+		tracing::warn!(
+			project_id = project.id(),
+			issue_id = issue_run.issue.id,
+			issue = issue_run.issue.identifier,
+			run_id = issue_run.run_id,
+			attempt = issue_run.attempt_number,
+			max_attempts,
+			branch = issue_run.workspace.branch_name,
+			worktree_path = %worktree_path,
+			error_class = "retryable_execution_failure",
+			"Run failed and remains retryable."
+		);
+
 		tracker.create_comment(
 			&issue_run.issue.id,
 			&format_retry_comment(
 				&issue_run.run_id,
 				issue_run.attempt_number,
 				max_attempts,
-				relative_worktree_path(project, &issue_run.workspace),
+				worktree_path,
 				&issue_run.workspace.branch_name,
 				error,
 			),
@@ -993,13 +1120,33 @@ where
 		&format_terminal_failure_comment(
 			&issue_run.run_id,
 			issue_run.attempt_number,
-			relative_worktree_path(project, &issue_run.workspace),
+			worktree_path.clone(),
 			&issue_run.workspace.branch_name,
 			workflow.frontmatter().tracker().needs_attention_label(),
 			manual_attention_requested,
 			error,
 		),
 	)?;
+
+	tracing::warn!(
+		project_id = project.id(),
+		issue_id = issue_run.issue.id,
+		issue = issue_run.issue.identifier,
+		run_id = issue_run.run_id,
+		attempt = issue_run.attempt_number,
+		branch = issue_run.workspace.branch_name,
+		worktree_path = %worktree_path,
+		error_class = if manual_attention_requested {
+			"human_attention_required"
+		} else if review_handoff_needs_attention {
+			"review_handoff_writeback_failed"
+		} else if stalled_run_needs_attention {
+			"stalled_run_detected"
+		} else {
+			"retry_budget_exhausted"
+		},
+		"Run failed and now requires operator attention."
+	);
 
 	Ok(())
 }
@@ -1199,19 +1346,143 @@ fn run_validation_commands(commands: &[String], cwd: &Path) -> crate::prelude::R
 }
 
 fn relative_worktree_path(project: &ServiceConfig, workspace: &WorkspaceSpec) -> String {
-	if let Ok(relative_path) = workspace.path.strip_prefix(project.repo_root()) {
+	relative_worktree_path_for_path(project, &workspace.path)
+}
+
+fn relative_worktree_path_for_path(project: &ServiceConfig, worktree_path: &Path) -> String {
+	if let Ok(relative_path) = worktree_path.strip_prefix(project.repo_root()) {
 		return relative_path.display().to_string();
 	}
 	if let Some(root_name) = project.workspace_root().file_name()
-		&& let Ok(relative_path) = workspace.path.strip_prefix(project.workspace_root())
+		&& let Ok(relative_path) = worktree_path.strip_prefix(project.workspace_root())
 	{
 		return Path::new(root_name).join(relative_path).display().to_string();
 	}
 
-	workspace.path.file_name().map_or_else(
-		|| workspace.path.display().to_string(),
+	worktree_path.file_name().map_or_else(
+		|| worktree_path.display().to_string(),
 		|path| path.to_string_lossy().into_owned(),
 	)
+}
+
+fn build_operator_status_snapshot(
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	limit: usize,
+) -> crate::prelude::Result<OperatorStatusSnapshot> {
+	let recent_runs = state_store
+		.list_recent_runs(project.id(), limit)?
+		.into_iter()
+		.map(|run| operator_run_status(project, run))
+		.collect::<Vec<_>>();
+	let active_runs =
+		recent_runs.iter().filter(|run| run.active_lease).cloned().collect::<Vec<_>>();
+	let worktrees = state_store
+		.list_worktrees(project.id())?
+		.into_iter()
+		.map(|mapping| OperatorWorktreeStatus {
+			issue_id: mapping.issue_id().to_owned(),
+			branch_name: mapping.branch_name().to_owned(),
+			worktree_path: relative_worktree_path_for_path(project, mapping.worktree_path()),
+		})
+		.collect::<Vec<_>>();
+
+	Ok(OperatorStatusSnapshot {
+		project_id: project.id().to_owned(),
+		run_limit: limit,
+		active_runs,
+		recent_runs,
+		worktrees,
+	})
+}
+
+fn operator_run_status(project: &ServiceConfig, run: ProjectRunStatus) -> OperatorRunStatus {
+	OperatorRunStatus {
+		run_id: run.run_id().to_owned(),
+		issue_id: run.issue_id().to_owned(),
+		attempt_number: run.attempt_number(),
+		status: run.status().to_owned(),
+		thread_id: run.thread_id().map(str::to_owned),
+		active_lease: run.active_lease(),
+		updated_at: run.updated_at().to_owned(),
+		last_event_type: run.last_event_type().map(str::to_owned),
+		last_event_at: run.last_event_at().map(str::to_owned),
+		event_count: run.event_count(),
+		branch_name: run.branch_name().map(str::to_owned),
+		worktree_path: run
+			.worktree_path()
+			.map(|path| relative_worktree_path_for_path(project, path)),
+	}
+}
+
+fn render_operator_status(snapshot: &OperatorStatusSnapshot) -> String {
+	let mut output = String::new();
+
+	output.push_str(&format!("Project: {}\n", snapshot.project_id));
+	output.push_str(&format!("Active runs: {}\n", snapshot.active_runs.len()));
+	output.push_str(&format!("Recent runs shown: {}\n", snapshot.recent_runs.len()));
+	output.push_str(&format!("Retained worktrees: {}\n", snapshot.worktrees.len()));
+	output.push_str("\nActive Runs\n");
+
+	if snapshot.active_runs.is_empty() {
+		output.push_str("- none\n");
+	} else {
+		for run in &snapshot.active_runs {
+			append_rendered_run(&mut output, run);
+		}
+	}
+
+	output.push_str("\nRecent Runs\n");
+
+	if snapshot.recent_runs.is_empty() {
+		output.push_str("- none\n");
+	} else {
+		for run in &snapshot.recent_runs {
+			append_rendered_run(&mut output, run);
+		}
+	}
+
+	output.push_str("\nRetained Worktrees\n");
+
+	if snapshot.worktrees.is_empty() {
+		output.push_str("- none\n");
+	} else {
+		for worktree in &snapshot.worktrees {
+			output.push_str(&format!(
+				"- issue_id: {}\n  branch: {}\n  worktree_path: {}\n",
+				worktree.issue_id, worktree.branch_name, worktree.worktree_path
+			));
+		}
+	}
+
+	output
+}
+
+fn append_rendered_run(output: &mut String, run: &OperatorRunStatus) {
+	let last_event = match (&run.last_event_type, &run.last_event_at) {
+		(Some(event_type), Some(timestamp)) => format!("{event_type} @ {timestamp}"),
+		(Some(event_type), None) => event_type.clone(),
+		(None, Some(timestamp)) => timestamp.clone(),
+		(None, None) => String::from("none"),
+	};
+	let thread_id = run.thread_id.as_deref().unwrap_or("none");
+	let branch_name = run.branch_name.as_deref().unwrap_or("none");
+	let worktree_path = run.worktree_path.as_deref().unwrap_or("none");
+
+	output.push_str(&format!(
+		"- run_id: {}\n  issue_id: {}\n  attempt: {}\n  status: {}\n  active_lease: {}\n  thread_id: {}\n  branch: {}\n  worktree_path: {}\n  updated_at: {}\n  last_event: {}\n  event_count: {}\n",
+		run.run_id,
+		run.issue_id,
+		run.attempt_number,
+		run.status,
+		if run.active_lease { "yes" } else { "no" },
+		thread_id,
+		branch_name,
+		worktree_path,
+		run.updated_at,
+		last_event,
+		run.event_count
+	));
 }
 
 fn select_issue_candidate(
@@ -1893,6 +2164,80 @@ read_first = [{read_first}]
 		};
 
 		assert_eq!(orchestrator::relative_worktree_path(&config, &workspace), ".worktrees/PUB-101");
+	}
+
+	#[test]
+	fn operator_status_snapshot_includes_active_runs_and_repo_relative_paths() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("Todo", &[]);
+		let worktree_path = config.workspace_root().join("PUB-101");
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.update_run_thread("run-1", "thread-1").expect("thread id should attach");
+		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+		state_store
+			.upsert_worktree(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&worktree_path.display().to_string(),
+			)
+			.expect("worktree should record");
+		state_store
+			.append_event("run-1", 1, "turn/completed", "{\"turn\":\"1\"}")
+			.expect("event should record");
+
+		let snapshot = orchestrator::build_operator_status_snapshot(&config, &state_store, 10)
+			.expect("snapshot should build");
+
+		assert_eq!(snapshot.project_id, "pubfi");
+		assert_eq!(snapshot.active_runs.len(), 1);
+		assert_eq!(snapshot.recent_runs.len(), 1);
+		assert_eq!(snapshot.active_runs[0].run_id, "run-1");
+		assert_eq!(snapshot.active_runs[0].thread_id.as_deref(), Some("thread-1"));
+		assert_eq!(snapshot.active_runs[0].branch_name.as_deref(), Some("x/pubfi-pub-101"));
+		assert_eq!(snapshot.active_runs[0].worktree_path.as_deref(), Some("workspaces/PUB-101"));
+		assert_eq!(snapshot.active_runs[0].last_event_type.as_deref(), Some("turn/completed"));
+		assert_eq!(snapshot.worktrees[0].worktree_path, "workspaces/PUB-101");
+	}
+
+	#[test]
+	fn operator_status_text_renders_human_readable_sections() {
+		let snapshot = orchestrator::OperatorStatusSnapshot {
+			project_id: String::from("pubfi"),
+			run_limit: 10,
+			active_runs: vec![orchestrator::OperatorRunStatus {
+				run_id: String::from("run-1"),
+				issue_id: String::from("issue-1"),
+				attempt_number: 1,
+				status: String::from("running"),
+				thread_id: Some(String::from("thread-1")),
+				active_lease: true,
+				updated_at: String::from("2026-03-14 10:00:00"),
+				last_event_type: Some(String::from("turn/completed")),
+				last_event_at: Some(String::from("2026-03-14 10:00:01")),
+				event_count: 4,
+				branch_name: Some(String::from("x/pubfi-pub-101")),
+				worktree_path: Some(String::from(".worktrees/PUB-101")),
+			}],
+			recent_runs: vec![],
+			worktrees: vec![orchestrator::OperatorWorktreeStatus {
+				issue_id: String::from("issue-1"),
+				branch_name: String::from("x/pubfi-pub-101"),
+				worktree_path: String::from(".worktrees/PUB-101"),
+			}],
+		};
+		let rendered = orchestrator::render_operator_status(&snapshot);
+
+		assert!(rendered.contains("Project: pubfi"));
+		assert!(rendered.contains("Active Runs"));
+		assert!(rendered.contains("run_id: run-1"));
+		assert!(rendered.contains("last_event: turn/completed @ 2026-03-14 10:00:01"));
+		assert!(rendered.contains("Retained Worktrees"));
+		assert!(rendered.contains("worktree_path: .worktrees/PUB-101"));
 	}
 
 	#[test]
