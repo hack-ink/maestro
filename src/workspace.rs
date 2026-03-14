@@ -126,12 +126,7 @@ impl WorkspaceManager {
 
 		let setup_result = (|| -> Result<()> {
 			self.refresh_workspace_git_metadata(&spec.path)?;
-
-			run_git(
-				&spec.path,
-				["checkout", "--quiet", "-B", spec.branch_name.as_str(), source_head.as_str()],
-				"checkout the workspace branch",
-			)?;
+			self.checkout_workspace_branch(&spec.path, spec.branch_name.as_str(), &source_head)?;
 
 			Ok(())
 		})();
@@ -159,6 +154,33 @@ impl WorkspaceManager {
 				workspace_path,
 				["remote", "set-url", "origin", source_origin_url.as_str()],
 				"rewrite the workspace origin remote",
+			)?;
+		} else {
+			remove_git_remote_if_present(workspace_path, "origin")?;
+		}
+
+		Ok(())
+	}
+
+	fn checkout_workspace_branch(
+		&self,
+		workspace_path: &Path,
+		branch_name: &str,
+		source_head: &str,
+	) -> Result<()> {
+		if fetch_remote_branch_if_present(workspace_path, branch_name)? {
+			let remote_tracking_ref = format!("refs/remotes/origin/{branch_name}");
+
+			run_git(
+				workspace_path,
+				["checkout", "--quiet", "-B", branch_name, remote_tracking_ref.as_str()],
+				"checkout the workspace branch from the remote lane head",
+			)?;
+		} else {
+			run_git(
+				workspace_path,
+				["checkout", "--quiet", "-B", branch_name, source_head],
+				"checkout the workspace branch",
 			)?;
 		}
 
@@ -249,6 +271,78 @@ where
 	}
 
 	Ok(())
+}
+
+fn fetch_remote_branch_if_present(workspace_path: &Path, branch_name: &str) -> Result<bool> {
+	if try_git_stdout(
+		workspace_path,
+		["remote", "get-url", "origin"],
+		"read workspace origin remote",
+	)?
+	.is_none()
+	{
+		return Ok(false);
+	}
+
+	let remote_ref = format!("refs/heads/{branch_name}");
+	let branch_check = Command::new("git")
+		.arg("-C")
+		.arg(workspace_path)
+		.args(["ls-remote", "--exit-code", "--heads", "origin", remote_ref.as_str()])
+		.output()?;
+
+	if !branch_check.status.success() {
+		return Ok(false);
+	}
+
+	let remote_tracking_ref = format!("refs/remotes/origin/{branch_name}");
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(workspace_path)
+		.args([
+			"fetch",
+			"--quiet",
+			"--no-tags",
+			"origin",
+			&format!("refs/heads/{branch_name}:{remote_tracking_ref}"),
+		])
+		.output()?;
+
+	if output.status.success() {
+		return Ok(true);
+	}
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	eyre::bail!(
+		"Failed to fetch remote workspace branch `{branch_name}` in `{}`: {}",
+		workspace_path.display(),
+		stderr.trim()
+	);
+}
+
+fn remove_git_remote_if_present(repo_root: &Path, remote_name: &str) -> Result<()> {
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(repo_root)
+		.args(["remote", "remove", remote_name])
+		.output()?;
+
+	if output.status.success() {
+		return Ok(());
+	}
+
+	let stderr = String::from_utf8_lossy(&output.stderr);
+
+	if stderr.contains("No such remote") {
+		return Ok(());
+	}
+
+	eyre::bail!(
+		"Failed to remove git remote `{remote_name}` in `{}`: {}",
+		repo_root.display(),
+		stderr.trim()
+	);
 }
 
 fn copy_repo_local_git_config(source_repo_root: &Path, workspace_path: &Path) -> Result<()> {
@@ -549,6 +643,48 @@ mod tests {
 		);
 
 		run_git(&spec.path, &["ls-remote", "origin"]);
+	}
+
+	#[test]
+	fn clone_backed_workspace_removes_default_origin_when_source_has_no_origin() {
+		let (_temp_dir, repo_root) = init_repo();
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+
+		run_git(&repo_root, &["remote", "remove", "origin"]);
+
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
+
+		assert_eq!(git_stdout(&spec.path, &["remote"]), "");
+	}
+
+	#[test]
+	fn clone_backed_workspace_uses_existing_remote_lane_branch_when_present() {
+		let (_temp_dir, repo_root) = init_repo();
+		let bare_remote = repo_root.parent().unwrap().join("remote.git");
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+		let lane_branch = "x/pubfi-pub-101";
+
+		run_git(bare_remote.parent().unwrap(), &["init", "--bare", bare_remote.to_str().unwrap()]);
+		run_git(&repo_root, &["remote", "set-url", "origin", bare_remote.to_str().unwrap()]);
+		run_git(&repo_root, &["push", "-u", "origin", "main"]);
+		run_git(&repo_root, &["checkout", "-b", lane_branch]);
+
+		fs::write(repo_root.join("LANE.md"), "lane branch\n").expect("lane file should write");
+
+		run_git(&repo_root, &["add", "LANE.md"]);
+		run_git(&repo_root, &["commit", "-m", "lane branch"]);
+		run_git(&repo_root, &["push", "-u", "origin", lane_branch]);
+		run_git(&repo_root, &["checkout", "main"]);
+
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
+
+		assert_eq!(git_stdout(&spec.path, &["rev-parse", "--abbrev-ref", "HEAD"]), lane_branch);
+		assert_eq!(
+			fs::read_to_string(spec.path.join("LANE.md")).expect("lane file should exist"),
+			"lane branch\n"
+		);
 	}
 
 	#[test]
