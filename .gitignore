@@ -1,11 +1,20 @@
 # AI
 .codex
-.worktrees
-maestro.toml
 
 # Editor
 .vscode
 .zed
+
+# General Ignores
+*.bak
+*.log
+.env*
+.turbo
+model
+tmp
+
+# Kubernetes
+.kube
 
 # Language Specifics
 
@@ -45,16 +54,8 @@ target
 .build
 xcuserdata
 
-# General Ignores
-*.bak
-*.log
-.env*
-.turbo
-model
-tmp
-
-# Kubernetes
-.kube
-
 # System
 .DS_Store
+
+# Work Dirs
+.workspaces

@@ -8,8 +8,6 @@ use std::{
 
 use rusqlite::{self, Connection, OptionalExtension, Row};
 
-use crate::prelude::eyre;
-
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 
 /// Local state store for leases, attempts, workspaces, and protocol events.
@@ -429,12 +427,6 @@ impl StateStore {
 	}
 
 	fn initialize(&self) -> crate::prelude::Result<()> {
-		if legacy_workspace_table_exists(&self.connection)? {
-			eyre::bail!(
-				"Unsupported local state schema: found pre-workspace table `worktree_mappings`. Remove or reset the local state database before running this build."
-			);
-		}
-
 		self.connection.execute_batch(INIT_SQL)?;
 
 		Ok(())
@@ -609,23 +601,6 @@ impl WorkspaceMapping {
 	}
 }
 
-fn legacy_workspace_table_exists(connection: &Connection) -> crate::prelude::Result<bool> {
-	let exists = connection.query_row(
-		"
-		SELECT EXISTS(
-			SELECT 1
-			FROM sqlite_master
-			WHERE type = 'table'
-				AND name = 'worktree_mappings'
-		)
-		",
-		[],
-		|row| row.get::<_, i64>(0),
-	)?;
-
-	Ok(exists != 0)
-}
-
 fn project_run_status_select_sql() -> &'static str {
 	"
 	SELECT
@@ -690,8 +665,6 @@ fn map_project_run_status_row(row: &Row<'_>) -> rusqlite::Result<ProjectRunStatu
 #[cfg(test)]
 mod tests {
 	use std::path::Path;
-
-	use tempfile::NamedTempFile;
 
 	use crate::state::StateStore;
 
@@ -881,37 +854,5 @@ mod tests {
 		assert_eq!(recent_runs.len(), 1);
 		assert_eq!(active_runs.len(), 2);
 		assert!(active_runs.iter().all(|run| run.active_lease()));
-	}
-
-	#[test]
-	fn rejects_legacy_worktree_mappings_table_on_open() {
-		let db_file = NamedTempFile::new().expect("temp db file should exist");
-		let connection =
-			rusqlite::Connection::open(db_file.path()).expect("raw sqlite connection should open");
-
-		connection
-			.execute_batch(
-				"
-				CREATE TABLE worktree_mappings (
-					project_id TEXT NOT NULL,
-					issue_id TEXT PRIMARY KEY,
-					branch_name TEXT NOT NULL,
-					worktree_path TEXT NOT NULL,
-					updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-				);
-				",
-			)
-			.expect("legacy table should seed");
-
-		drop(connection);
-
-		let error = match StateStore::open(db_file.path()) {
-			Ok(_) => panic!("legacy local state should be rejected"),
-			Err(error) => error,
-		};
-
-		assert!(error.to_string().contains(
-			"Unsupported local state schema: found pre-workspace table `worktree_mappings`"
-		));
 	}
 }
