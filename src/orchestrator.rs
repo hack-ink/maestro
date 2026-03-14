@@ -133,6 +133,10 @@ struct ActiveRunReconciliation {
 	disposition: ActiveRunDisposition,
 }
 
+struct TerminalFailureOutcome {
+	error_class: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct OperatorStatusSnapshot {
 	project_id: String,
@@ -350,6 +354,12 @@ where
 
 	if actions.is_empty() {
 		if child_exited {
+			clear_orphaned_daemon_child_state(
+				state_store,
+				&daemon_child.issue_id,
+				&daemon_child.run_id,
+			)?;
+
 			active_child.take();
 		}
 
@@ -369,6 +379,23 @@ where
 	)?;
 
 	active_child.take();
+
+	Ok(())
+}
+
+fn clear_orphaned_daemon_child_state(
+	state_store: &StateStore,
+	issue_id: &str,
+	run_id: &str,
+) -> crate::prelude::Result<()> {
+	mark_run_attempt_if_active(state_store, run_id, "interrupted")?;
+
+	let lease_matches_run =
+		state_store.lease_for_issue(issue_id)?.is_some_and(|lease| lease.run_id() == run_id);
+
+	if lease_matches_run {
+		state_store.clear_lease(issue_id)?;
+	}
 
 	Ok(())
 }
@@ -668,8 +695,9 @@ fn stalled_idle_duration(
 	else {
 		return Ok(None);
 	};
-	let idle_seconds = now_unix_epoch.saturating_sub(last_activity);
-	let idle_for = Duration::from_secs(idle_seconds as u64);
+	let Some(idle_for) = observed_idle_duration(last_activity, now_unix_epoch) else {
+		return Ok(None);
+	};
 
 	if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT {
 		return Ok(Some(idle_for));
@@ -686,14 +714,22 @@ fn stalled_protocol_idle_duration(
 	let Some(last_activity) = state_store.last_protocol_activity_unix_epoch(run_id)? else {
 		return Ok(None);
 	};
-	let idle_seconds = now_unix_epoch.saturating_sub(last_activity);
-	let idle_for = Duration::from_secs(idle_seconds as u64);
+	let Some(idle_for) = observed_idle_duration(last_activity, now_unix_epoch) else {
+		return Ok(None);
+	};
 
 	if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT {
 		return Ok(Some(idle_for));
 	}
 
 	Ok(None)
+}
+
+fn observed_idle_duration(last_activity_unix_epoch: i64, now_unix_epoch: i64) -> Option<Duration> {
+	now_unix_epoch
+		.checked_sub(last_activity_unix_epoch)
+		.and_then(|idle_seconds| u64::try_from(idle_seconds).ok())
+		.map(Duration::from_secs)
 }
 
 fn run_configured_cycle(
@@ -1084,48 +1120,13 @@ where
 		return Ok(());
 	}
 
-	let failure_state_id = issue_run
-		.issue
-		.state_id_for_name(workflow.frontmatter().tracker().failure_state())
-		.ok_or_else(|| {
-			eyre::eyre!(
-				"State `{}` was not found for issue `{}`.",
-				workflow.frontmatter().tracker().failure_state(),
-				issue_run.issue.identifier
-			)
-		})?;
-
-	tracker.update_issue_state(&issue_run.issue.id, failure_state_id)?;
-
-	if let Some(label_id) =
-		issue_run.issue.label_id_for_name(workflow.frontmatter().tracker().needs_attention_label())
-	{
-		let mut label_ids =
-			issue_run.issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
-
-		if !label_ids.iter().any(|existing| existing == label_id) {
-			label_ids.push(label_id.to_owned());
-			tracker.update_issue_labels(&issue_run.issue.id, &label_ids)?;
-		}
-	} else {
-		tracing::warn!(
-			label = workflow.frontmatter().tracker().needs_attention_label(),
-			issue = issue_run.issue.identifier,
-			"Needs-attention label was not found in the issue team."
-		);
-	}
-
-	tracker.create_comment(
-		&issue_run.issue.id,
-		&format_terminal_failure_comment(
-			&issue_run.run_id,
-			issue_run.attempt_number,
-			worktree_path.clone(),
-			&issue_run.workspace.branch_name,
-			workflow.frontmatter().tracker().needs_attention_label(),
-			manual_attention_requested,
-			error,
-		),
+	let outcome = apply_terminal_failure_writeback(
+		tracker,
+		workflow,
+		issue_run,
+		&worktree_path,
+		manual_attention_requested,
+		error,
 	)?;
 
 	tracing::warn!(
@@ -1136,19 +1137,121 @@ where
 		attempt = issue_run.attempt_number,
 		branch = issue_run.workspace.branch_name,
 		worktree_path = %worktree_path,
-		error_class = if manual_attention_requested {
-			"human_attention_required"
-		} else if review_handoff_needs_attention {
-			"review_handoff_writeback_failed"
-		} else if stalled_run_needs_attention {
-			"stalled_run_detected"
-		} else {
-			"retry_budget_exhausted"
-		},
+		error_class = outcome.error_class,
 		"Run failed and now requires operator attention."
 	);
 
 	Ok(())
+}
+
+fn apply_terminal_failure_writeback<T>(
+	tracker: &T,
+	workflow: &WorkflowDocument,
+	issue_run: &IssueRunPlan,
+	worktree_path: &str,
+	manual_attention_requested: bool,
+	error: &Report,
+) -> crate::prelude::Result<TerminalFailureOutcome>
+where
+	T: IssueTracker,
+{
+	let tracker_policy = workflow.frontmatter().tracker();
+	let needs_attention_label = tracker_policy.needs_attention_label();
+	let needs_attention_label_id = issue_run.issue.label_id_for_name(needs_attention_label);
+	let failure_state_name = tracker_policy.failure_state();
+	let failure_state_is_startable =
+		tracker_policy.startable_states().iter().any(|state| state == failure_state_name);
+	let guard_with_nonstartable_state =
+		needs_attention_label_id.is_none() && failure_state_is_startable;
+	let terminal_failure_state_name = if guard_with_nonstartable_state {
+		tracker_policy.in_progress_state()
+	} else {
+		failure_state_name
+	};
+	let failure_state_id =
+		issue_run.issue.state_id_for_name(terminal_failure_state_name).ok_or_else(|| {
+			eyre::eyre!(
+				"State `{}` was not found for issue `{}`.",
+				terminal_failure_state_name,
+				issue_run.issue.identifier
+			)
+		})?;
+
+	tracker.update_issue_state(&issue_run.issue.id, failure_state_id)?;
+
+	let needs_attention_label_available = apply_needs_attention_label(
+		tracker,
+		issue_run,
+		needs_attention_label,
+		needs_attention_label_id,
+		terminal_failure_state_name,
+	)?;
+	let recovery_gate = terminal_failure_recovery_gate(
+		needs_attention_label,
+		needs_attention_label_available,
+		guard_with_nonstartable_state,
+		tracker_policy.in_progress_state(),
+	);
+	let error_class = terminal_failure_error_class(manual_attention_requested, error);
+
+	tracker.create_comment(
+		&issue_run.issue.id,
+		&format_terminal_failure_comment(
+			&issue_run.run_id,
+			issue_run.attempt_number,
+			worktree_path.to_owned(),
+			&issue_run.workspace.branch_name,
+			&recovery_gate,
+			manual_attention_requested,
+			error,
+		),
+	)?;
+
+	Ok(TerminalFailureOutcome { error_class })
+}
+
+fn apply_needs_attention_label<T>(
+	tracker: &T,
+	issue_run: &IssueRunPlan,
+	needs_attention_label: &str,
+	needs_attention_label_id: Option<&str>,
+	terminal_failure_state_name: &str,
+) -> crate::prelude::Result<bool>
+where
+	T: IssueTracker,
+{
+	if let Some(label_id) = needs_attention_label_id {
+		let mut label_ids =
+			issue_run.issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
+
+		if !label_ids.iter().any(|existing| existing == label_id) {
+			label_ids.push(label_id.to_owned());
+			tracker.update_issue_labels(&issue_run.issue.id, &label_ids)?;
+		}
+
+		return Ok(true);
+	}
+
+	tracing::warn!(
+		label = needs_attention_label,
+		issue = issue_run.issue.identifier,
+		guard_state = terminal_failure_state_name,
+		"Needs-attention label was not found in the issue team; using a non-startable state guard when needed."
+	);
+
+	Ok(false)
+}
+
+fn terminal_failure_error_class(manual_attention_requested: bool, error: &Report) -> &'static str {
+	if manual_attention_requested {
+		"human_attention_required"
+	} else if error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some() {
+		"review_handoff_writeback_failed"
+	} else if error.downcast_ref::<StalledRunNeedsAttention>().is_some() {
+		"stalled_run_detected"
+	} else {
+		"retry_budget_exhausted"
+	}
 }
 
 fn validate_project_contract(
@@ -1537,7 +1640,7 @@ fn format_terminal_failure_comment(
 	attempt_number: i64,
 	worktree_path: String,
 	branch_name: &str,
-	needs_attention_label: &str,
+	recovery_gate: &str,
 	manual_attention_requested: bool,
 	error: &Report,
 ) -> String {
@@ -1545,29 +1648,27 @@ fn format_terminal_failure_comment(
 		(
 			"human_attention_required",
 			format!(
-				"inspect the issue comment and worktree, resolve the blocker manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+				"inspect the issue comment and worktree, resolve the blocker manually, {recovery_gate}"
 			),
 		)
 	} else if error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some() {
 		(
 			"review_handoff_writeback_failed",
 			format!(
-				"inspect the tracker state, PR, and worktree, repair the incomplete review handoff manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+				"inspect the tracker state, PR, and worktree, repair the incomplete review handoff manually, {recovery_gate}"
 			),
 		)
 	} else if error.downcast_ref::<StalledRunNeedsAttention>().is_some() {
 		(
 			"stalled_run_detected",
 			format!(
-				"inspect the worktree and app-server activity for the stalled lane, resolve the blocker manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+				"inspect the worktree and app-server activity for the stalled lane, resolve the blocker manually, {recovery_gate}"
 			),
 		)
 	} else {
 		(
 			"retry_budget_exhausted",
-			format!(
-				"inspect the worktree, resolve the issue manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
-			),
+			format!("inspect the worktree, resolve the issue manually, {recovery_gate}"),
 		)
 	};
 
@@ -1576,6 +1677,28 @@ fn format_terminal_failure_comment(
 		failed_at = current_timestamp(),
 		branch = branch_name,
 		worktree = worktree_path
+	)
+}
+
+fn terminal_failure_recovery_gate(
+	needs_attention_label: &str,
+	needs_attention_label_available: bool,
+	guarded_by_nonstartable_state: bool,
+	nonstartable_guard_state: &str,
+) -> String {
+	if needs_attention_label_available {
+		return format!(
+			"clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+		);
+	}
+	if guarded_by_nonstartable_state {
+		return format!(
+			"`{needs_attention_label}` could not be applied because it does not exist on the team; the issue remains in `{nonstartable_guard_state}` to block automatic retries, so move it back to a startable state manually if another automated run is desired"
+		);
+	}
+
+	format!(
+		"`{needs_attention_label}` could not be applied because it does not exist on the team; move the issue back to a startable state manually if another automated run is desired"
 	)
 }
 
@@ -1653,6 +1776,8 @@ mod tests {
 		project_exists: bool,
 		refresh_snapshots: RefCell<Vec<Vec<TrackerIssue>>>,
 		comments: RefCell<Vec<String>>,
+		state_updates: RefCell<Vec<(String, String)>>,
+		label_updates: RefCell<Vec<(String, Vec<String>)>>,
 	}
 	impl FakeTracker {
 		fn new(issues: Vec<TrackerIssue>) -> Self {
@@ -1676,6 +1801,8 @@ mod tests {
 				project_exists,
 				refresh_snapshots: RefCell::new(refresh_snapshots),
 				comments: RefCell::new(Vec::new()),
+				state_updates: RefCell::new(Vec::new()),
+				label_updates: RefCell::new(Vec::new()),
 			}
 		}
 	}
@@ -1711,10 +1838,14 @@ mod tests {
 		}
 
 		fn update_issue_state(&self, _issue_id: &str, _state_id: &str) -> Result<()> {
+			self.state_updates.borrow_mut().push((_issue_id.to_owned(), _state_id.to_owned()));
+
 			Ok(())
 		}
 
 		fn update_issue_labels(&self, _issue_id: &str, _label_ids: &[String]) -> Result<()> {
+			self.label_updates.borrow_mut().push((_issue_id.to_owned(), _label_ids.to_vec()));
+
 			Ok(())
 		}
 
@@ -1788,6 +1919,17 @@ mod tests {
 				})
 				.collect(),
 		}
+	}
+
+	fn sample_issue_without_needs_attention_team_label(
+		state_name: &str,
+		labels: &[&str],
+	) -> TrackerIssue {
+		let mut issue = sample_issue(state_name, labels);
+
+		issue.team.labels.retain(|label| label.name != "maestro:needs-attention");
+
+		issue
 	}
 
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
@@ -2302,7 +2444,7 @@ read_first = [{read_first}]
 			1,
 			String::from(".worktrees/PUB-101"),
 			"x/pubfi-pub-101",
-			"maestro:needs-attention",
+			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 			true,
 			&error,
 		);
@@ -2323,7 +2465,7 @@ read_first = [{read_first}]
 			1,
 			String::from(".worktrees/PUB-101"),
 			"x/pubfi-pub-101",
-			"maestro:needs-attention",
+			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 			false,
 			&error,
 		);
@@ -2331,6 +2473,28 @@ read_first = [{read_first}]
 		assert!(comment.contains("- error_class: `review_handoff_writeback_failed`"));
 		assert!(comment.contains("repair the incomplete review handoff manually"));
 		assert!(comment.contains("clear label `maestro:needs-attention`"));
+	}
+
+	#[test]
+	fn terminal_failure_comments_explain_state_guard_when_needs_attention_label_is_unavailable() {
+		let error = Report::new(super::StalledRunNeedsAttention {
+			issue_identifier: String::from("PUB-101"),
+			run_id: String::from("pub-101-attempt-1-123"),
+			idle_for: ACTIVE_RUN_IDLE_TIMEOUT,
+		});
+		let comment = orchestrator::format_terminal_failure_comment(
+			"pub-101-attempt-1-123",
+			1,
+			String::from(".worktrees/PUB-101"),
+			"x/pubfi-pub-101",
+			"`maestro:needs-attention` could not be applied because it does not exist on the team; the issue remains in `In Progress` to block automatic retries, so move it back to a startable state manually if another automated run is desired",
+			false,
+			&error,
+		);
+
+		assert!(comment.contains("- error_class: `stalled_run_detected`"));
+		assert!(comment.contains("does not exist on the team"));
+		assert!(comment.contains("remains in `In Progress`"));
 	}
 
 	#[test]
@@ -2431,6 +2595,32 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn exited_child_cleanup_clears_orphaned_active_run_state() {
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Progress", &[]);
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+
+		orchestrator::clear_orphaned_daemon_child_state(&state_store, &issue.id, "run-1")
+			.expect("orphaned child cleanup should succeed");
+
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		);
+		assert_eq!(
+			state_store
+				.run_attempt("run-1")
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"interrupted"
+		);
+	}
+
+	#[test]
 	fn active_run_reconciliation_detects_terminal_nonactive_and_stalled_runs() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -2501,6 +2691,56 @@ read_first = [{read_first}]
 					if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
 				)
 		}));
+	}
+
+	#[test]
+	fn stalled_idle_duration_ignores_future_last_activity() {
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Progress", &[]);
+		let run_id = "run-future-activity";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+
+		let last_activity = state_store
+			.last_run_activity_unix_epoch(run_id)
+			.expect("last activity lookup should succeed")
+			.expect("run activity should exist");
+
+		assert_eq!(
+			orchestrator::stalled_idle_duration(
+				&state_store,
+				&state_store
+					.run_attempt(run_id)
+					.expect("run lookup should succeed")
+					.expect("run attempt should exist"),
+				last_activity - 1
+			)
+			.expect("idle duration should evaluate"),
+			None
+		);
+	}
+
+	#[test]
+	fn stalled_protocol_idle_duration_ignores_future_protocol_activity() {
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-protocol-future-activity";
+
+		state_store
+			.append_event(run_id, 1, "thread/status/changed", "{\"status\":\"active\"}")
+			.expect("protocol event should record");
+
+		let last_activity = state_store
+			.last_protocol_activity_unix_epoch(run_id)
+			.expect("protocol activity lookup should succeed")
+			.expect("protocol activity should exist");
+
+		assert_eq!(
+			orchestrator::stalled_protocol_idle_duration(&state_store, run_id, last_activity - 1)
+				.expect("protocol idle duration should evaluate"),
+			None
+		);
 	}
 
 	#[test]
@@ -2675,6 +2915,42 @@ read_first = [{read_first}]
 			comment.contains("stalled_run_detected")
 				&& comment.contains("needs attention")
 				&& comment.contains("clear label `maestro:needs-attention`")
+		}));
+	}
+
+	#[test]
+	fn terminal_failures_without_needs_attention_label_use_nonstartable_guard_state() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let issue = sample_issue_without_needs_attention_team_label("Todo", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: issue.identifier.clone(),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1-123"),
+		};
+		let error = Report::new(super::ManualAttentionRequested {
+			issue_identifier: issue.identifier.clone(),
+			label: String::from("maestro:needs-attention"),
+			run_id: issue_run.run_id.clone(),
+		});
+
+		orchestrator::handle_failure(&tracker, &config, &workflow, &issue_run, &error)
+			.expect("terminal failure handling should succeed");
+
+		assert_eq!(
+			tracker.state_updates.borrow().last(),
+			Some(&(issue.id.clone(), String::from("state-progress")))
+		);
+		assert!(tracker.label_updates.borrow().is_empty());
+		assert!(tracker.comments.borrow().iter().any(|comment| {
+			comment.contains("does not exist on the team")
+				&& comment.contains("remains in `In Progress`")
 		}));
 	}
 

@@ -105,7 +105,7 @@ The target Linear team should also expose:
 - optional label `maestro:manual-only` to opt out of automation
 - optional label `maestro:needs-attention` for retry-exhausted or human-required failures
 
-If `maestro:needs-attention` does not exist, the run will still fail correctly, but `maestro` will only post the failure comment and log a warning instead of adding the label.
+If `maestro:needs-attention` does not exist, the run will still fail correctly. `maestro` will log a warning, explain the missing label in the failure comment, and keep the issue in a non-startable guard state instead of allowing another automatic retry from `Todo`.
 
 ## Recommended first scope
 
@@ -200,6 +200,7 @@ Start with Linear:
 - if retries were exhausted, look for the `maestro:needs-attention` label
 - if the agent explicitly requested human attention, expect the issue to move back to `Todo` with `maestro:needs-attention` immediately instead of retrying
 - any issue that still carries `maestro:needs-attention` is intentionally ineligible for another automatic run until a human clears that label
+- if the failure comment says the label was unavailable on the team, expect the issue to remain in a non-startable guard state such as `In Progress` until a human moves it back to a startable state manually
 - if the issue is already terminal, expect the worktree to disappear on the next live pass or startup reconciliation
 - if the run failed as `stalled_run_detected`, expect the worktree to remain in place so you can inspect the partially completed lane before re-enabling automation
 

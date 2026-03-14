@@ -192,6 +192,8 @@ Retry-exhausted or human-required failures:
 
 If the coding agent explicitly requests human attention by adding `maestro:needs-attention`, `maestro` must stop automatic retries for that attempt, skip PR-backed success writeback, and treat the lane as a human-required failure immediately.
 
+If the configured `maestro:needs-attention` label is unavailable on the team and the configured failure state is startable, `maestro` must still block automatic reselection by leaving the issue in a non-startable guard state such as `In Progress`. In that case the failure comment must explain that the label could not be applied and that a human must move the issue back to a startable state manually after repair.
+
 Any issue carrying `maestro:needs-attention` is ineligible for another automatic run until a human clears the label and returns the issue to a startable state.
 
 Required failure comment fields:
