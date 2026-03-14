@@ -227,6 +227,10 @@ The local persistence layer must not become the operator-facing source of workfl
 ## Recovery rules
 
 - On service startup, `maestro` must reconcile local leases against current Linear state before starting new work.
+- While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
+- If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the worktree.
+- If the leased issue becomes non-terminal but no longer active for the lane, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the worktree for inspection.
+- If a running attempt exceeds the app-server idle timeout with no persisted protocol activity, `maestro` must treat it as stalled, stop the active run, mark the attempt `stalled`, and converge the issue through the human-required failure path instead of silently retrying in this phase.
 - Reconciliation must mark locally active run attempts as `interrupted` when their stale lease is cleared, or `terminated` when the tracker issue is already terminal.
 - Reconciliation must clear stale leases before the next issue-selection pass.
 - Before a prepared lane starts `app-server`, `maestro` must refresh the selected issue once more and skip execution if the issue became terminal or otherwise ineligible.

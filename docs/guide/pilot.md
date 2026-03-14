@@ -160,6 +160,17 @@ After `protocol probe`, `run --once --dry-run`, and `run --once` all behave as e
 cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml
 ```
 
+During daemon mode, each poll tick now does two distinct things:
+
+1. inspect any currently leased active lane
+2. reconcile stale or terminal local state before selecting new work
+
+The active-lane reconciliation rules are:
+
+- terminal issue: stop the lane, mark the run `terminated`, and remove the worktree
+- non-terminal but non-active issue: stop the lane, mark the run `interrupted`, and keep the worktree
+- stalled lane with no app-server activity through the idle budget: stop the lane, mark the run `stalled`, and move the issue back through the human-attention failure path for manual repair
+
 ## Worktree behavior
 
 Each issue gets a deterministic lane:
@@ -188,6 +199,7 @@ Start with Linear:
 - if the agent explicitly requested human attention, expect the issue to move back to `Todo` with `maestro:needs-attention` immediately instead of retrying
 - any issue that still carries `maestro:needs-attention` is intentionally ineligible for another automatic run until a human clears that label
 - if the issue is already terminal, expect the worktree to disappear on the next live pass or startup reconciliation
+- if the run failed as `stalled_run_detected`, expect the worktree to remain in place so you can inspect the partially completed lane before re-enabling automation
 
 Then inspect the worktree mentioned in the comment:
 

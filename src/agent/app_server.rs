@@ -17,6 +17,8 @@ use crate::{
 	state::StateStore,
 };
 
+pub(crate) const ACTIVE_RUN_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_RUN_ID: &str = "protocol-probe-run";

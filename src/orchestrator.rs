@@ -1,11 +1,12 @@
 use std::{
 	cmp::Ordering,
 	collections::{HashMap, HashSet},
+	env,
 	error::Error,
 	fmt::{self, Display, Formatter},
 	fs,
 	path::{Path, PathBuf},
-	process::Command,
+	process::{Child, Command, Stdio},
 	slice, thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,13 +17,13 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
 	agent::{
-		self, AppServerRunRequest, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
-		ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
-		ReviewHandoffWritebackFailed, RunCompletionDisposition,
+		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, ISSUE_COMMENT_TOOL_NAME,
+		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME,
+		ReviewHandoffContext, ReviewHandoffWritebackFailed, RunCompletionDisposition,
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
-	state::{StateStore, WorktreeMapping},
+	state::{RunAttempt, StateStore, WorktreeMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
 	workflow::WorkflowDocument,
 	workspace::{WorkspaceManager, WorkspaceSpec},
@@ -81,6 +82,50 @@ impl Display for ReviewHandoffNeedsAttention {
 
 impl Error for ReviewHandoffNeedsAttention {}
 
+#[derive(Debug)]
+struct StalledRunNeedsAttention {
+	issue_identifier: String,
+	run_id: String,
+	idle_for: Duration,
+}
+impl Display for StalledRunNeedsAttention {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"Run `{}` for issue `{}` stalled after {:?} without app-server activity; stop automatic execution and repair manually.",
+			self.run_id, self.issue_identifier, self.idle_for
+		)
+	}
+}
+
+impl Error for StalledRunNeedsAttention {}
+
+struct DaemonRunChild {
+	child: Child,
+}
+
+struct DaemonTickContext {
+	config: ServiceConfig,
+	workflow: WorkflowDocument,
+	tracker: LinearClient,
+	workspace_manager: WorkspaceManager,
+}
+
+#[derive(Clone, Debug)]
+enum ActiveRunDisposition {
+	Terminal,
+	NonActive,
+	Stalled { idle_for: Duration },
+}
+
+#[derive(Clone, Debug)]
+struct ActiveRunReconciliation {
+	issue: TrackerIssue,
+	run_attempt: RunAttempt,
+	worktree_mapping: Option<WorktreeMapping>,
+	disposition: ActiveRunDisposition,
+}
+
 pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prelude::Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
@@ -137,6 +182,7 @@ pub(crate) fn run_daemon(
 		eyre::bail!("No maestro config found. Pass --config or create maestro.toml.");
 	};
 	let state_store = StateStore::open(default_state_store_path()?)?;
+	let mut active_child: Option<DaemonRunChild> = None;
 
 	tracing::info!(
 		config_path = %config_path.display(),
@@ -147,19 +193,10 @@ pub(crate) fn run_daemon(
 	loop {
 		let tick_started_at = Instant::now();
 
-		match run_configured_cycle(&config_path, &state_store, false) {
-			Ok(Some(summary)) => {
-				println!(
-					"run complete: project={} issue={} run_id={} worktree={}",
-					summary.project_id,
-					summary.issue_identifier,
-					summary.run_id,
-					summary.worktree_path.display()
-				);
-			},
-			Ok(None) => {
-				tracing::debug!("Daemon tick found no eligible issue.");
-			},
+		match load_daemon_tick_context(&config_path).and_then(|context| {
+			run_daemon_tick(&config_path, &state_store, &mut active_child, context)
+		}) {
+			Ok(()) => {},
 			Err(error) => {
 				tracing::warn!(?error, "Daemon tick failed.");
 			},
@@ -167,6 +204,316 @@ pub(crate) fn run_daemon(
 
 		sleep_until_next_tick(poll_interval, tick_started_at);
 	}
+}
+
+fn load_daemon_tick_context(config_path: &Path) -> crate::prelude::Result<DaemonTickContext> {
+	let config = ServiceConfig::from_path(config_path)?;
+	let workflow_path = config.repo_root().join(config.workflow_path());
+	let workflow = WorkflowDocument::from_path(&workflow_path)?;
+	let api_key = config.tracker().resolve_api_key()?;
+	let tracker = LinearClient::new(api_key)?;
+	let workspace_manager =
+		WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+
+	Ok(DaemonTickContext { config, workflow, tracker, workspace_manager })
+}
+
+fn run_daemon_tick(
+	config_path: &Path,
+	state_store: &StateStore,
+	active_child: &mut Option<DaemonRunChild>,
+	context: DaemonTickContext,
+) -> crate::prelude::Result<()> {
+	inspect_or_clear_active_child(
+		active_child,
+		&context.tracker,
+		&context.config,
+		&context.workflow,
+		state_store,
+		&context.workspace_manager,
+	)?;
+
+	if active_child.is_none() {
+		reconcile_project_state(
+			&context.tracker,
+			&context.config,
+			&context.workflow,
+			state_store,
+			&context.workspace_manager,
+		)?;
+		validate_project_contract(&context.config, &context.workflow)?;
+		validate_tracker_project(&context.tracker, context.config.tracker().project_slug())?;
+		spawn_next_daemon_child(
+			config_path,
+			state_store,
+			active_child,
+			&context.tracker,
+			&context.config,
+			&context.workflow,
+		)?;
+	}
+
+	Ok(())
+}
+
+fn inspect_or_clear_active_child<T>(
+	active_child: &mut Option<DaemonRunChild>,
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	workspace_manager: &WorkspaceManager,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	let Some(daemon_child) = active_child.as_mut() else {
+		return Ok(());
+	};
+
+	if daemon_child.child.try_wait()?.is_some() {
+		active_child.take();
+
+		return Ok(());
+	}
+
+	let actions = inspect_active_run_reconciliation(tracker, project, workflow, state_store)?;
+
+	if actions.is_empty() {
+		return Ok(());
+	}
+
+	stop_daemon_child(&mut daemon_child.child)?;
+	apply_active_run_reconciliation(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		workspace_manager,
+		actions,
+	)?;
+
+	active_child.take();
+
+	Ok(())
+}
+
+fn spawn_next_daemon_child<T>(
+	config_path: &Path,
+	state_store: &StateStore,
+	active_child: &mut Option<DaemonRunChild>,
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	match run_project_once(tracker, project, workflow, state_store, true)? {
+		Some(summary) => {
+			validate_review_handoff_runtime(false)?;
+
+			let child = spawn_run_once_child(config_path)?;
+
+			tracing::info!(
+				issue = summary.issue_identifier,
+				worktree = %summary.worktree_path.display(),
+				"Spawned daemon child for active issue lane."
+			);
+
+			*active_child = Some(DaemonRunChild { child });
+		},
+		None => {
+			tracing::debug!("Daemon tick found no eligible issue.");
+		},
+	}
+
+	Ok(())
+}
+
+fn spawn_run_once_child(config_path: &Path) -> crate::prelude::Result<Child> {
+	let executable = env::current_exe()?;
+	let child = Command::new(executable)
+		.args(["run", "--once", "--config"])
+		.arg(config_path)
+		.stdin(Stdio::null())
+		.stdout(Stdio::inherit())
+		.stderr(Stdio::inherit())
+		.spawn()?;
+
+	Ok(child)
+}
+
+fn stop_daemon_child(child: &mut Child) -> crate::prelude::Result<()> {
+	if child.try_wait()?.is_some() {
+		return Ok(());
+	}
+
+	let _ = child.kill();
+	let _ = child.wait();
+
+	Ok(())
+}
+
+fn inspect_active_run_reconciliation<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
+where
+	T: IssueTracker,
+{
+	inspect_active_run_reconciliation_at(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		OffsetDateTime::now_utc().unix_timestamp(),
+	)
+}
+
+fn inspect_active_run_reconciliation_at<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	now_unix_epoch: i64,
+) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
+where
+	T: IssueTracker,
+{
+	let leases = state_store.list_leases(project.id())?;
+
+	if leases.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let issue_ids = leases.iter().map(|lease| lease.issue_id().to_owned()).collect::<Vec<_>>();
+	let issues = tracker.refresh_issues(&issue_ids)?;
+	let issues_by_id =
+		issues.into_iter().map(|issue| (issue.id.clone(), issue)).collect::<HashMap<_, _>>();
+	let mut actions = Vec::new();
+
+	for lease in leases {
+		let Some(issue) = issues_by_id.get(lease.issue_id()).cloned() else {
+			continue;
+		};
+		let Some(run_attempt) = state_store.run_attempt(lease.run_id())? else {
+			continue;
+		};
+		let disposition = if is_terminal_issue(&issue, workflow) {
+			Some(ActiveRunDisposition::Terminal)
+		} else if !is_issue_active_for_run(&issue, workflow) {
+			Some(ActiveRunDisposition::NonActive)
+		} else {
+			stalled_idle_duration(state_store, &run_attempt, now_unix_epoch)?
+				.map(|idle_for| ActiveRunDisposition::Stalled { idle_for })
+		};
+
+		if let Some(disposition) = disposition {
+			actions.push(ActiveRunReconciliation {
+				issue: issue.clone(),
+				run_attempt,
+				worktree_mapping: state_store.worktree_for_issue(&issue.id)?,
+				disposition,
+			});
+		}
+	}
+
+	Ok(actions)
+}
+
+fn apply_active_run_reconciliation<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	workspace_manager: &WorkspaceManager,
+	actions: Vec<ActiveRunReconciliation>,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	for action in actions {
+		match action.disposition {
+			ActiveRunDisposition::Terminal => {
+				mark_run_attempt_if_active(state_store, action.run_attempt.run_id(), "terminated")?;
+
+				state_store.clear_lease(&action.issue.id)?;
+
+				if let Some(mapping) = &action.worktree_mapping {
+					cleanup_worktree_mapping(state_store, workspace_manager, mapping)?;
+				}
+			},
+			ActiveRunDisposition::NonActive => {
+				mark_run_attempt_if_active(
+					state_store,
+					action.run_attempt.run_id(),
+					"interrupted",
+				)?;
+
+				state_store.clear_lease(&action.issue.id)?;
+			},
+			ActiveRunDisposition::Stalled { idle_for } => {
+				state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
+				state_store.clear_lease(&action.issue.id)?;
+
+				let workspace = action.worktree_mapping.as_ref().map_or_else(
+					|| workspace_manager.plan_for_issue(&action.issue.identifier),
+					|mapping| WorkspaceSpec {
+						branch_name: mapping.branch_name().to_owned(),
+						issue_identifier: action.issue.identifier.clone(),
+						path: mapping.worktree_path().to_path_buf(),
+						reused_existing: true,
+					},
+				);
+				let issue_run = IssueRunPlan {
+					issue: action.issue.clone(),
+					workspace,
+					attempt_number: action.run_attempt.attempt_number(),
+					run_id: action.run_attempt.run_id().to_owned(),
+				};
+
+				handle_failure(
+					tracker,
+					project,
+					workflow,
+					&issue_run,
+					&Report::new(StalledRunNeedsAttention {
+						issue_identifier: action.issue.identifier.clone(),
+						run_id: action.run_attempt.run_id().to_owned(),
+						idle_for,
+					}),
+				)?;
+			},
+		}
+	}
+
+	Ok(())
+}
+
+fn stalled_idle_duration(
+	state_store: &StateStore,
+	run_attempt: &RunAttempt,
+	now_unix_epoch: i64,
+) -> crate::prelude::Result<Option<Duration>> {
+	if !matches!(run_attempt.status(), "starting" | "running") {
+		return Ok(None);
+	}
+
+	let Some(last_activity) = state_store.last_run_activity_unix_epoch(run_attempt.run_id())?
+	else {
+		return Ok(None);
+	};
+	let idle_seconds = now_unix_epoch.saturating_sub(last_activity);
+	let idle_for = Duration::from_secs(idle_seconds as u64);
+
+	if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT {
+		return Ok(Some(idle_for));
+	}
+
+	Ok(None)
 }
 
 fn run_configured_cycle(
@@ -436,7 +783,7 @@ where
 			model: model.clone(),
 			personality: workflow.frontmatter().agent().personality().map(str::to_owned),
 			service_tier: workflow.frontmatter().agent().service_tier().map(str::to_owned),
-			timeout: Duration::from_secs(300),
+			timeout: ACTIVE_RUN_IDLE_TIMEOUT,
 			dynamic_tool_handler: Some(&tracker_tool_bridge),
 		},
 		state_store,
@@ -495,9 +842,11 @@ where
 	let manual_attention_requested = error.downcast_ref::<ManualAttentionRequested>().is_some();
 	let review_handoff_needs_attention =
 		error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some();
+	let stalled_run_needs_attention = error.downcast_ref::<StalledRunNeedsAttention>().is_some();
 
 	if !manual_attention_requested
 		&& !review_handoff_needs_attention
+		&& !stalled_run_needs_attention
 		&& issue_run.attempt_number < max_attempts
 	{
 		tracker.create_comment(
@@ -617,6 +966,13 @@ fn is_terminal_issue(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool 
 		.terminal_states()
 		.iter()
 		.any(|state| state == &issue.state.name)
+}
+
+fn is_issue_active_for_run(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+	let tracker_policy = workflow.frontmatter().tracker();
+
+	issue.state.name == tracker_policy.in_progress_state()
+		&& !issue.has_label(tracker_policy.needs_attention_label())
 }
 
 fn mark_run_attempt_if_active(
@@ -823,6 +1179,13 @@ fn format_terminal_failure_comment(
 				"inspect the tracker state, PR, and worktree, repair the incomplete review handoff manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
 			),
 		)
+	} else if error.downcast_ref::<StalledRunNeedsAttention>().is_some() {
+		(
+			"stalled_run_detected",
+			format!(
+				"inspect the worktree and app-server activity for the stalled lane, resolve the blocker manually, clear label `{needs_attention_label}`, then move the issue back to a startable state if another automated run is desired"
+			),
+		)
 	} else {
 		(
 			"retry_budget_exhausted",
@@ -887,12 +1250,14 @@ fn sleep_until_next_tick(poll_interval: Duration, tick_started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
-	use std::{cell::RefCell, fs, path::Path, process::Command};
+	use std::{cell::RefCell, fs, path::Path, process::Command, time::Duration};
 
 	use color_eyre::Report;
 	use tempfile::TempDir;
+	use time::OffsetDateTime;
 
 	use crate::{
+		agent::ACTIVE_RUN_IDLE_TIMEOUT,
 		config::ServiceConfig,
 		orchestrator::{
 			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
@@ -1565,6 +1930,222 @@ read_first = [{read_first}]
 				.status(),
 			"terminated"
 		);
+	}
+
+	#[test]
+	fn active_run_reconciliation_detects_terminal_nonactive_and_stalled_runs() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let terminal_issue = sample_issue_with_sort_fields(
+			"issue-terminal",
+			"PUB-201",
+			"Done",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let nonactive_issue = sample_issue_with_sort_fields(
+			"issue-nonactive",
+			"PUB-202",
+			"Todo",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let stalled_issue = sample_issue_with_sort_fields(
+			"issue-stalled",
+			"PUB-203",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![
+			terminal_issue.clone(),
+			nonactive_issue.clone(),
+			stalled_issue.clone(),
+		]);
+
+		for issue in [&terminal_issue, &nonactive_issue, &stalled_issue] {
+			state_store
+				.record_run_attempt(&format!("run-{}", issue.identifier), &issue.id, 1, "running")
+				.expect("run attempt should record");
+			state_store
+				.upsert_lease("pubfi", &issue.id, &format!("run-{}", issue.identifier))
+				.expect("lease should record");
+		}
+
+		let now = OffsetDateTime::now_utc().unix_timestamp()
+			+ ACTIVE_RUN_IDLE_TIMEOUT.as_secs() as i64
+			+ 1;
+		let actions = orchestrator::inspect_active_run_reconciliation_at(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			now,
+		)
+		.expect("active-run inspection should succeed");
+
+		assert!(actions.iter().any(|action| {
+			action.issue.id == terminal_issue.id
+				&& matches!(action.disposition, orchestrator::ActiveRunDisposition::Terminal)
+		}));
+		assert!(actions.iter().any(|action| {
+			action.issue.id == nonactive_issue.id
+				&& matches!(action.disposition, orchestrator::ActiveRunDisposition::NonActive)
+		}));
+		assert!(actions.iter().any(|action| {
+			action.issue.id == stalled_issue.id
+				&& matches!(
+					action.disposition,
+					orchestrator::ActiveRunDisposition::Stalled { idle_for }
+						if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
+				)
+		}));
+	}
+
+	#[test]
+	fn active_run_reconciliation_keeps_nonterminal_nonactive_worktrees() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager = crate::workspace::WorkspaceManager::new(
+			"pubfi",
+			config.repo_root(),
+			config.workspace_root(),
+		);
+		let issue = sample_issue("Todo", &[]);
+		let run_id = "run-nonactive";
+		let worktree_path = config.workspace_root().join("PUB-101");
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_worktree(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&worktree_path.display().to_string(),
+			)
+			.expect("worktree mapping should record");
+
+		let action = orchestrator::ActiveRunReconciliation {
+			issue: issue.clone(),
+			run_attempt: state_store
+				.run_attempt(run_id)
+				.expect("run attempt query should succeed")
+				.expect("run attempt should exist"),
+			worktree_mapping: state_store
+				.worktree_for_issue(&issue.id)
+				.expect("worktree query should succeed"),
+			disposition: orchestrator::ActiveRunDisposition::NonActive,
+		};
+
+		orchestrator::apply_active_run_reconciliation(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&workspace_manager,
+			vec![action],
+		)
+		.expect("reconciliation should succeed");
+
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		);
+		assert!(
+			state_store
+				.worktree_for_issue(&issue.id)
+				.expect("worktree lookup should succeed")
+				.is_some()
+		);
+		assert_eq!(
+			state_store
+				.run_attempt(run_id)
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"interrupted"
+		);
+	}
+
+	#[test]
+	fn stalled_run_reconciliation_routes_to_needs_attention_without_cleanup() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager = crate::workspace::WorkspaceManager::new(
+			"pubfi",
+			config.repo_root(),
+			config.workspace_root(),
+		);
+		let issue = sample_issue("In Progress", &[]);
+		let run_id = "run-stalled";
+		let worktree_path = config.workspace_root().join("PUB-101");
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_worktree(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&worktree_path.display().to_string(),
+			)
+			.expect("worktree mapping should record");
+
+		let action = orchestrator::ActiveRunReconciliation {
+			issue: issue.clone(),
+			run_attempt: state_store
+				.run_attempt(run_id)
+				.expect("run attempt query should succeed")
+				.expect("run attempt should exist"),
+			worktree_mapping: state_store
+				.worktree_for_issue(&issue.id)
+				.expect("worktree query should succeed"),
+			disposition: orchestrator::ActiveRunDisposition::Stalled {
+				idle_for: ACTIVE_RUN_IDLE_TIMEOUT + Duration::from_secs(1),
+			},
+		};
+
+		orchestrator::apply_active_run_reconciliation(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&workspace_manager,
+			vec![action],
+		)
+		.expect("reconciliation should succeed");
+
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		);
+		assert!(
+			state_store
+				.worktree_for_issue(&issue.id)
+				.expect("worktree lookup should succeed")
+				.is_some()
+		);
+		assert_eq!(
+			state_store
+				.run_attempt(run_id)
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"stalled"
+		);
+		assert!(tracker.comments.borrow().iter().any(|comment| {
+			comment.contains("stalled_run_detected")
+				&& comment.contains("needs attention")
+				&& comment.contains("clear label `maestro:needs-attention`")
+		}));
 	}
 
 	#[test]

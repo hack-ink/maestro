@@ -3,6 +3,7 @@
 use std::{
 	fs,
 	path::{Path, PathBuf},
+	time::Duration,
 };
 
 use rusqlite::{self, Connection, OptionalExtension};
@@ -23,6 +24,9 @@ impl StateStore {
 		}
 
 		let connection = Connection::open(path)?;
+
+		connection.busy_timeout(Duration::from_secs(5))?;
+
 		let store = Self { connection };
 
 		store.initialize()?;
@@ -33,6 +37,9 @@ impl StateStore {
 	/// Open an in-memory state store for tests and probes.
 	pub fn open_in_memory() -> crate::prelude::Result<Self> {
 		let connection = Connection::open_in_memory()?;
+
+		connection.busy_timeout(Duration::from_secs(5))?;
+
 		let store = Self { connection };
 
 		store.initialize()?;
@@ -231,6 +238,31 @@ impl StateStore {
 		)?;
 
 		Ok(count)
+	}
+
+	/// Read the latest persisted activity timestamp for one run as a Unix epoch.
+	pub fn last_run_activity_unix_epoch(
+		&self,
+		run_id: &str,
+	) -> crate::prelude::Result<Option<i64>> {
+		let latest_activity = self.connection.query_row(
+			"
+			SELECT MAX(ts)
+			FROM (
+				SELECT CAST(strftime('%s', updated_at) AS INTEGER) AS ts
+				FROM run_attempts
+				WHERE run_id = ?1
+				UNION ALL
+				SELECT CAST(strftime('%s', created_at) AS INTEGER) AS ts
+				FROM event_journal
+				WHERE run_id = ?1
+			)
+			",
+			rusqlite::params![run_id],
+			|row| row.get(0),
+		)?;
+
+		Ok(latest_activity)
 	}
 
 	/// Create or replace the worktree mapping for one issue.
@@ -473,6 +505,12 @@ mod tests {
 			.expect("run attempt should exist");
 
 		assert_eq!(updated.status(), "interrupted");
+		assert!(
+			store
+				.last_run_activity_unix_epoch("run-1")
+				.expect("last activity lookup should succeed")
+				.is_some()
+		);
 	}
 
 	#[test]
