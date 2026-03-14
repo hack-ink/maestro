@@ -229,8 +229,10 @@ The local persistence layer must not become the operator-facing source of workfl
 - On service startup, `maestro` must reconcile local leases against current Linear state before starting new work.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
 - If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the worktree.
-- If the leased issue becomes non-terminal but no longer active for the lane, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the worktree for inspection.
+- If the leased issue becomes non-terminal and leaves both the `In Progress` lane state and any configured startable pre-claim state, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the worktree for inspection.
+- A leased issue that is still in a configured startable state during early daemon ticks must be treated as a lane that has not finished claiming tracker ownership yet, not as an immediate non-active interruption.
 - If a running attempt exceeds the app-server idle timeout with no persisted protocol activity, `maestro` must treat it as stalled, stop the active run, mark the attempt `stalled`, and converge the issue through the human-required failure path instead of silently retrying in this phase.
+- If the supervised child already exited before the next daemon tick, stalled reconciliation must still inspect the just-finished lane using persisted protocol activity rather than skipping directly to generic failure handling.
 - Reconciliation must mark locally active run attempts as `interrupted` when their stale lease is cleared, or `terminated` when the tracker issue is already terminal.
 - Reconciliation must clear stale leases before the next issue-selection pass.
 - Before a prepared lane starts `app-server`, `maestro` must refresh the selected issue once more and skip execution if the issue became terminal or otherwise ineligible.

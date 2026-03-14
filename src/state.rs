@@ -265,6 +265,24 @@ impl StateStore {
 		Ok(latest_activity)
 	}
 
+	/// Read the latest persisted protocol-event timestamp for one run as a Unix epoch.
+	pub fn last_protocol_activity_unix_epoch(
+		&self,
+		run_id: &str,
+	) -> crate::prelude::Result<Option<i64>> {
+		let latest_activity = self.connection.query_row(
+			"
+			SELECT MAX(CAST(strftime('%s', created_at) AS INTEGER))
+			FROM event_journal
+			WHERE run_id = ?1
+			",
+			rusqlite::params![run_id],
+			|row| row.get(0),
+		)?;
+
+		Ok(latest_activity)
+	}
+
 	/// Create or replace the worktree mapping for one issue.
 	pub fn upsert_worktree(
 		&self,

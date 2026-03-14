@@ -32,6 +32,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RunSummary {
 	project_id: String,
+	issue_id: String,
 	issue_identifier: String,
 	branch_name: String,
 	worktree_path: PathBuf,
@@ -102,6 +103,8 @@ impl Error for StalledRunNeedsAttention {}
 
 struct DaemonRunChild {
 	child: Child,
+	issue_id: String,
+	run_id: String,
 }
 
 struct DaemonTickContext {
@@ -270,20 +273,31 @@ where
 	let Some(daemon_child) = active_child.as_mut() else {
 		return Ok(());
 	};
-
-	if daemon_child.child.try_wait()?.is_some() {
-		active_child.take();
-
-		return Ok(());
-	}
-
-	let actions = inspect_active_run_reconciliation(tracker, project, workflow, state_store)?;
+	let child_exited = daemon_child.child.try_wait()?.is_some();
+	let actions = if child_exited {
+		inspect_exited_daemon_child_reconciliation(
+			tracker,
+			project,
+			workflow,
+			state_store,
+			&daemon_child.issue_id,
+			&daemon_child.run_id,
+		)?
+	} else {
+		inspect_active_run_reconciliation(tracker, project, workflow, state_store)?
+	};
 
 	if actions.is_empty() {
+		if child_exited {
+			active_child.take();
+		}
+
 		return Ok(());
 	}
+	if !child_exited {
+		stop_daemon_child(&mut daemon_child.child)?;
+	}
 
-	stop_daemon_child(&mut daemon_child.child)?;
 	apply_active_run_reconciliation(
 		tracker,
 		project,
@@ -321,7 +335,8 @@ where
 				"Spawned daemon child for active issue lane."
 			);
 
-			*active_child = Some(DaemonRunChild { child });
+			*active_child =
+				Some(DaemonRunChild { child, issue_id: summary.issue_id, run_id: summary.run_id });
 		},
 		None => {
 			tracing::debug!("Daemon tick found no eligible issue.");
@@ -404,7 +419,7 @@ where
 		};
 		let disposition = if is_terminal_issue(&issue, workflow) {
 			Some(ActiveRunDisposition::Terminal)
-		} else if !is_issue_active_for_run(&issue, workflow) {
+		} else if is_issue_nonactive_for_run(&issue, workflow) {
 			Some(ActiveRunDisposition::NonActive)
 		} else {
 			stalled_idle_duration(state_store, &run_attempt, now_unix_epoch)?
@@ -422,6 +437,64 @@ where
 	}
 
 	Ok(actions)
+}
+
+fn inspect_exited_daemon_child_reconciliation<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_id: &str,
+	run_id: &str,
+) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
+where
+	T: IssueTracker,
+{
+	inspect_exited_daemon_child_reconciliation_at(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		issue_id,
+		run_id,
+		OffsetDateTime::now_utc().unix_timestamp(),
+	)
+}
+
+fn inspect_exited_daemon_child_reconciliation_at<T>(
+	tracker: &T,
+	_project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_id: &str,
+	run_id: &str,
+	now_unix_epoch: i64,
+) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
+where
+	T: IssueTracker,
+{
+	let Some(issue) = refresh_issue(tracker, issue_id)? else {
+		return Ok(Vec::new());
+	};
+	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
+		return Ok(Vec::new());
+	};
+
+	if run_attempt.status() != "failed" || !is_issue_active_for_run(&issue, workflow) {
+		return Ok(Vec::new());
+	}
+
+	let Some(idle_for) = stalled_protocol_idle_duration(state_store, run_id, now_unix_epoch)?
+	else {
+		return Ok(Vec::new());
+	};
+
+	Ok(vec![ActiveRunReconciliation {
+		issue,
+		run_attempt,
+		worktree_mapping: state_store.worktree_for_issue(issue_id)?,
+		disposition: ActiveRunDisposition::Stalled { idle_for },
+	}])
 }
 
 fn apply_active_run_reconciliation<T>(
@@ -516,6 +589,24 @@ fn stalled_idle_duration(
 	Ok(None)
 }
 
+fn stalled_protocol_idle_duration(
+	state_store: &StateStore,
+	run_id: &str,
+	now_unix_epoch: i64,
+) -> crate::prelude::Result<Option<Duration>> {
+	let Some(last_activity) = state_store.last_protocol_activity_unix_epoch(run_id)? else {
+		return Ok(None);
+	};
+	let idle_seconds = now_unix_epoch.saturating_sub(last_activity);
+	let idle_for = Duration::from_secs(idle_seconds as u64);
+
+	if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT {
+		return Ok(Some(idle_for));
+	}
+
+	Ok(None)
+}
+
 fn run_configured_cycle(
 	config_path: &Path,
 	state_store: &StateStore,
@@ -595,6 +686,7 @@ where
 	if dry_run {
 		return Ok(Some(RunSummary {
 			project_id: project.id().to_owned(),
+			issue_id: issue_run.issue.id.clone(),
 			issue_identifier: issue_run.issue.identifier.clone(),
 			branch_name: issue_run.workspace.branch_name.clone(),
 			worktree_path: issue_run.workspace.path.clone(),
@@ -820,6 +912,7 @@ where
 
 	Ok(RunSummary {
 		project_id: project.id().to_owned(),
+		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
 		branch_name: issue_run.workspace.branch_name.clone(),
 		worktree_path: issue_run.workspace.path.clone(),
@@ -973,6 +1066,15 @@ fn is_issue_active_for_run(issue: &TrackerIssue, workflow: &WorkflowDocument) ->
 
 	issue.state.name == tracker_policy.in_progress_state()
 		&& !issue.has_label(tracker_policy.needs_attention_label())
+}
+
+fn is_issue_nonactive_for_run(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+	let tracker_policy = workflow.frontmatter().tracker();
+
+	issue.has_label(tracker_policy.opt_out_label())
+		|| issue.has_label(tracker_policy.needs_attention_label())
+		|| (issue.state.name != tracker_policy.in_progress_state()
+			&& !tracker_policy.startable_states().iter().any(|state| state == &issue.state.name))
 }
 
 fn mark_run_attempt_if_active(
@@ -1630,6 +1732,7 @@ read_first = [{read_first}]
 			summary,
 			RunSummary {
 				project_id: String::from("pubfi"),
+				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
 				branch_name: String::from("x/pubfi-pub-101"),
 				worktree_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
@@ -1947,7 +2050,7 @@ read_first = [{read_first}]
 		let nonactive_issue = sample_issue_with_sort_fields(
 			"issue-nonactive",
 			"PUB-202",
-			"Todo",
+			"Blocked",
 			&[],
 			Some(3),
 			"2026-03-13T04:16:17.133Z",
@@ -1998,11 +2101,43 @@ read_first = [{read_first}]
 		assert!(actions.iter().any(|action| {
 			action.issue.id == stalled_issue.id
 				&& matches!(
-					action.disposition,
-					orchestrator::ActiveRunDisposition::Stalled { idle_for }
-						if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
+				action.disposition,
+				orchestrator::ActiveRunDisposition::Stalled { idle_for }
+					if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
 				)
 		}));
+	}
+
+	#[test]
+	fn active_run_reconciliation_ignores_startable_preclaim_states() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue_with_sort_fields(
+			"issue-startable",
+			"PUB-204",
+			"Todo",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![issue.clone()]);
+
+		state_store
+			.record_run_attempt("run-startable", &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, "run-startable").expect("lease should record");
+
+		let now = OffsetDateTime::now_utc().unix_timestamp() + 1;
+		let actions = orchestrator::inspect_active_run_reconciliation_at(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			now,
+		)
+		.expect("active-run inspection should succeed");
+
+		assert!(actions.is_empty(), "startable pre-claim states should not be interrupted");
 	}
 
 	#[test]
@@ -2145,6 +2280,56 @@ read_first = [{read_first}]
 			comment.contains("stalled_run_detected")
 				&& comment.contains("needs attention")
 				&& comment.contains("clear label `maestro:needs-attention`")
+		}));
+	}
+
+	#[test]
+	fn exited_child_reconciliation_detects_stalled_failed_runs_from_protocol_idle() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue_with_sort_fields(
+			"issue-stalled-after-exit",
+			"PUB-205",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![issue.clone()]);
+		let run_id = "run-stalled-after-exit";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store
+			.append_event(run_id, 1, "thread/status/changed", "{\"status\":\"active\"}")
+			.expect("protocol event should record");
+		state_store
+			.update_run_status(run_id, "failed")
+			.expect("run should exit as failed before daemon inspects it");
+
+		let last_protocol_activity = state_store
+			.last_protocol_activity_unix_epoch(run_id)
+			.expect("protocol activity query should succeed")
+			.expect("protocol activity should exist");
+		let actions = orchestrator::inspect_exited_daemon_child_reconciliation_at(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&issue.id,
+			run_id,
+			last_protocol_activity + ACTIVE_RUN_IDLE_TIMEOUT.as_secs() as i64 + 1,
+		)
+		.expect("exited child inspection should succeed");
+
+		assert!(actions.iter().any(|action| {
+			action.issue.id == issue.id
+				&& matches!(
+					action.disposition,
+					orchestrator::ActiveRunDisposition::Stalled { idle_for }
+						if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
+				)
 		}));
 	}
 
