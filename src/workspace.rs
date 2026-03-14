@@ -98,7 +98,8 @@ impl WorkspaceManager {
 			&self.repo_root,
 			["remote", "get-url", "origin"],
 			"read the source repository origin URL",
-		)?;
+		)?
+		.map(|url| normalize_remote_url(&self.repo_root, &url));
 		let source_head =
 			git_stdout(&self.repo_root, ["rev-parse", "HEAD"], "read the source repository HEAD")?;
 
@@ -269,10 +270,48 @@ fn copy_repo_local_git_config(source_repo_root: &Path, workspace_path: &Path) ->
 	Ok(())
 }
 
+fn normalize_remote_url(source_repo_root: &Path, remote_url: &str) -> String {
+	if !is_relative_path_remote(remote_url) {
+		return remote_url.to_owned();
+	}
+
+	let resolved = source_repo_root.join(remote_url);
+
+	fs::canonicalize(&resolved).unwrap_or(resolved).display().to_string()
+}
+
 fn should_copy_local_git_config(key: &str) -> bool {
 	key.starts_with("user.")
 		|| key.starts_with("gpg.")
 		|| matches!(key, "commit.gpgsign" | "tag.gpgsign")
+}
+
+fn is_relative_path_remote(remote_url: &str) -> bool {
+	let path = Path::new(remote_url);
+
+	!path.is_absolute()
+		&& !remote_url.contains("://")
+		&& !looks_like_windows_absolute_path(remote_url)
+		&& !looks_like_scp_remote(remote_url)
+}
+
+fn looks_like_windows_absolute_path(remote_url: &str) -> bool {
+	let bytes = remote_url.as_bytes();
+
+	bytes.len() >= 3
+		&& bytes[0].is_ascii_alphabetic()
+		&& bytes[1] == b':'
+		&& matches!(bytes[2], b'/' | b'\\')
+}
+
+fn looks_like_scp_remote(remote_url: &str) -> bool {
+	let Some(colon_index) = remote_url.find(':') else {
+		return false;
+	};
+	let slash_index = remote_url.find('/').unwrap_or(usize::MAX);
+	let backslash_index = remote_url.find('\\').unwrap_or(usize::MAX);
+
+	colon_index < slash_index.min(backslash_index)
 }
 
 fn sanitize_branch_component(value: &str) -> String {
@@ -429,6 +468,29 @@ mod tests {
 			git_stdout(&spec.path, &["config", "--local", "--get", "user.signingkey"]),
 			"workspace-tests"
 		);
+	}
+
+	#[test]
+	fn clone_backed_workspace_normalizes_relative_origin_remote() {
+		let (_temp_dir, repo_root) = init_repo();
+		let bare_remote = repo_root.parent().unwrap().join("remote.git");
+		let workspace_root = repo_root.join(".workspaces");
+		let manager = WorkspaceManager::new("pubfi", &repo_root, &workspace_root);
+
+		run_git(bare_remote.parent().unwrap(), &["init", "--bare", bare_remote.to_str().unwrap()]);
+		run_git(&repo_root, &["remote", "set-url", "origin", "../remote.git"]);
+
+		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
+
+		assert_eq!(
+			git_stdout(&spec.path, &["remote", "get-url", "origin"]),
+			fs::canonicalize(&bare_remote)
+				.expect("bare remote should canonicalize")
+				.display()
+				.to_string()
+		);
+
+		run_git(&spec.path, &["ls-remote", "origin"]);
 	}
 
 	#[test]
