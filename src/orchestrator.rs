@@ -177,7 +177,7 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prel
 			return Ok(());
 		}
 
-		eyre::bail!("No maestro config found. Pass --config or create maestro.toml.");
+		eyre::bail!("No maestro config found. Pass --config or create tmp/maestro.toml.");
 	};
 	let state_store = if dry_run {
 		StateStore::open_in_memory()?
@@ -222,7 +222,7 @@ pub(crate) fn run_daemon(
 	}
 
 	let Some(config_path) = resolve_config_path(config_path)? else {
-		eyre::bail!("No maestro config found. Pass --config or create maestro.toml.");
+		eyre::bail!("No maestro config found. Pass --config or create tmp/maestro.toml.");
 	};
 	let state_store = StateStore::open(default_state_store_path()?)?;
 	let mut active_child: Option<DaemonRunChild> = None;
@@ -259,7 +259,7 @@ pub(crate) fn print_status(
 	}
 
 	let Some(config_path) = resolve_config_path(config_path)? else {
-		eyre::bail!("No maestro config found. Pass --config or create maestro.toml.");
+		eyre::bail!("No maestro config found. Pass --config or create tmp/maestro.toml.");
 	};
 	let config = ServiceConfig::from_path(&config_path)?;
 	let state_store = StateStore::open(default_state_store_path()?)?;
@@ -1722,7 +1722,7 @@ fn resolve_config_path(explicit_path: Option<&Path>) -> crate::prelude::Result<O
 		return Ok(Some(path.to_path_buf()));
 	}
 
-	let repo_local = PathBuf::from("maestro.toml");
+	let repo_local = repo_local_config_path();
 
 	if repo_local.exists() {
 		return Ok(Some(repo_local));
@@ -1735,6 +1735,10 @@ fn resolve_config_path(explicit_path: Option<&Path>) -> crate::prelude::Result<O
 	}
 
 	Ok(None)
+}
+
+fn repo_local_config_path() -> PathBuf {
+	PathBuf::from("tmp/maestro.toml")
 }
 
 fn default_state_store_path() -> crate::prelude::Result<PathBuf> {
@@ -1754,7 +1758,13 @@ fn sleep_until_next_tick(poll_interval: Duration, tick_started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
-	use std::{cell::RefCell, fs, path::Path, process::Command, time::Duration};
+	use std::{
+		cell::RefCell,
+		fs,
+		path::{Path, PathBuf},
+		process::Command,
+		time::Duration,
+	};
 
 	use color_eyre::Report;
 	use tempfile::TempDir;
@@ -2317,6 +2327,11 @@ read_first = [{read_first}]
 			orchestrator::relative_workspace_path(&config, &workspace),
 			".workspaces/PUB-101"
 		);
+	}
+
+	#[test]
+	fn repo_local_config_path_points_to_tmp_maestro_toml() {
+		assert_eq!(orchestrator::repo_local_config_path(), PathBuf::from("tmp/maestro.toml"));
 	}
 
 	#[test]

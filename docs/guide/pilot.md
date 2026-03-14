@@ -2,9 +2,9 @@
 
 Goal: Run the `maestro` MVP against one configured Linear project and one target repository, with `maestro` itself as the default first pilot target.
 Read this when: You are preparing a dry run or live self-dogfood pilot and need the bounded operator procedure for config, target-repo requirements, and expected run behavior.
-Preconditions: `codex app-server` is available locally; `gh` is available locally for live PR-backed handoff validation; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is configured through `tracker.api_key` in `maestro.toml`.
+Preconditions: `codex app-server` is available locally; `gh` is available locally for live PR-backed handoff validation; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is configured through `tracker.api_key` in `tmp/maestro.toml`.
 Depends on: `docs/spec/system_maestro_runtime.md`, `docs/spec/system_workflow_contract.md`, `docs/spec/system_app_server_contract.md`, the target repository root `WORKFLOW.md`, and `Makefile.toml` for repo-native verification tasks.
-Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run --config ./maestro.toml`; and, when the environment is ready, `cargo run -- run --once --config ./maestro.toml`.
+Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run --config ./tmp/maestro.toml`; and, when the environment is ready, `cargo run -- run --once --config ./tmp/maestro.toml`.
 
 ## Alignment note
 
@@ -20,7 +20,7 @@ Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run 
 - The target repository has a root `WORKFLOW.md`.
 - The target repository files referenced by `WORKFLOW.md [context.read_first]` exist.
 - The Linear team already has the workflow states used by the target `WORKFLOW.md`.
-- The Linear API token is configured through `tracker.api_key` in `maestro.toml`.
+- The Linear API token is configured through `tracker.api_key` in `tmp/maestro.toml`.
 
 Recommended first-run check:
 
@@ -32,11 +32,12 @@ If `protocol probe` does not return `PROBE_OK`, stop there. The orchestrator loo
 
 ## Recommended layout
 
-For the recommended first deployment, keep `maestro.toml` alongside the checked-out `maestro` repo and point it back at this repository. Keep issue workspaces under the repo-local `.workspaces/` directory.
+For the recommended first deployment, keep the live local config at `tmp/maestro.toml` and point it back at this repository. If you need a checked-in template, copy `maestro.example.toml` first.
 
 ```text
 /path/to/maestro/
-  maestro.toml
+  maestro.example.toml
+  tmp/maestro.toml
 
 /path/to/maestro/
   AGENTS.md
@@ -50,12 +51,12 @@ For the recommended first deployment, keep `maestro.toml` alongside the checked-
 `maestro` resolves config in this order:
 
 1. `--config <PATH>`
-2. `./maestro.toml`
+2. `./tmp/maestro.toml`
 3. The platform default config path returned by `directories::ProjectDirs`
 
 The SQLite operational state is stored separately from the target repo and uses the filename `maestro.sqlite3` under the platform data directory.
 
-The local state is scoped by configured `id`, so reconciliation and cleanup operate within the single configured project lane for this `maestro.toml`.
+The local state is scoped by configured `id`, so reconciliation and cleanup operate within the single configured project lane for this `tmp/maestro.toml`.
 
 ## Sample service config
 
@@ -118,7 +119,7 @@ Use `maestro` itself as the first target repo and keep the tracker scope bounded
 Use dry run first to validate config loading, issue discovery, and workspace planning without mutating Linear or creating workspace directories.
 
 ```sh
-cargo run -- run --once --dry-run --config ./maestro.toml
+cargo run -- run --once --dry-run --config ./tmp/maestro.toml
 ```
 
 Expected behavior:
@@ -138,7 +139,7 @@ dry run: no maestro config found; nothing to execute.
 ### Live run
 
 ```sh
-cargo run -- run --once --config ./maestro.toml
+cargo run -- run --once --config ./tmp/maestro.toml
 ```
 
 On a normal successful run, `maestro` will:
@@ -157,7 +158,7 @@ On a normal successful run, `maestro` will:
 After `protocol probe`, `run --once --dry-run`, and `run --once` all behave as expected, use daemon mode for the long-running pilot loop:
 
 ```sh
-cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml
+cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml
 ```
 
 During daemon mode, each poll tick now does two distinct things:
@@ -216,8 +217,8 @@ git -C /absolute/path/to/helixbox/maestro/.workspaces/PUB-600 log --oneline --de
 Before dropping to local storage internals, inspect the supported runtime surface:
 
 ```sh
-cargo run -- status --config ./maestro.toml
-cargo run -- status --json --config ./maestro.toml
+cargo run -- status --config ./tmp/maestro.toml
+cargo run -- status --json --config ./tmp/maestro.toml
 ```
 
 Use the human-readable view when you need the current leased run, retained workspace, and recent attempt summary at a glance. Use `--json` when you want a machine-readable snapshot with stable identifiers such as `run_id`, `issue_id`, `thread_id`, `branch`, and repository-relative `workspace_path`.
@@ -246,7 +247,7 @@ When changing `maestro` itself, keep the pilot path healthy with:
 
 ```sh
 cargo run -- protocol probe
-cargo run -- run --once --dry-run --config ./maestro.toml
+cargo run -- run --once --dry-run --config ./tmp/maestro.toml
 cargo make fmt-check
 cargo make lint
 cargo make test

@@ -20,28 +20,28 @@ The CLI surface exists now as a scaffold. The orchestration baseline is in place
 
 ```sh
 cargo run -- protocol probe
-cargo run -- status --config ./maestro.toml
-cargo run -- run --once --dry-run --config ./maestro.toml
-cargo run -- run --once --config ./maestro.toml
-cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml
+cargo run -- status --config ./tmp/maestro.toml
+cargo run -- run --once --dry-run --config ./tmp/maestro.toml
+cargo run -- run --once --config ./tmp/maestro.toml
+cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml
 ```
 
 These commands are intentionally early-stage entrypoints. The `protocol probe` command is the first contract check for `app-server` compatibility before the full orchestrator loop depends on it.
 
 ## Pilot Guide
 
-For the first real pilot, target `maestro` itself before onboarding another repository. Keep the service config in the repository root as `./maestro.toml` and keep issue workspaces under the repo-local `.workspaces/` directory. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage.
+For the first real pilot, target `maestro` itself before onboarding another repository. Keep the live service config at `./tmp/maestro.toml`, and keep issue workspaces under the repo-local `.workspaces/` directory. If you need a tracked template, start from `./maestro.example.toml`. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage.
 
 Recommended order:
 
 ```sh
 cargo run -- protocol probe
-cargo run -- status --config ./maestro.toml
-cargo run -- run --once --dry-run --config ./maestro.toml
-cargo run -- run --once --config ./maestro.toml
+cargo run -- status --config ./tmp/maestro.toml
+cargo run -- run --once --dry-run --config ./tmp/maestro.toml
+cargo run -- run --once --config ./tmp/maestro.toml
 ```
 
-After those bounded checks pass, switch to `cargo run -- daemon --poll-interval-s 60 --config ./maestro.toml` when you want the long-running poll loop for the pilot.
+After those bounded checks pass, switch to `cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml` when you want the long-running poll loop for the pilot.
 
 The detailed operator runbook, including sample config, filesystem layout, and failure inspection, lives in [`docs/guide/pilot.md`](docs/guide/pilot.md).
 

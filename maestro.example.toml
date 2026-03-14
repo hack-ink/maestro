@@ -1,0 +1,12 @@
+id             = "maestro"
+repo_root      = "/absolute/path/to/helixbox/maestro"
+workflow_path  = "WORKFLOW.md"
+workspace_root = "/absolute/path/to/helixbox/maestro/.workspaces"
+
+[tracker]
+api_key      = "$HELIXBOX_LINEAR_API_KEY"
+project_slug = "maestro-pilot-ops-hardening-8c4cd895b10d"
+
+[agent]
+model     = "gpt-5-codex"
+transport = "stdio://"

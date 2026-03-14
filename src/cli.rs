@@ -205,7 +205,7 @@ mod tests {
 			"--poll-interval-s",
 			"5",
 			"--config",
-			"./maestro.toml",
+			"./tmp/maestro.toml",
 		]);
 
 		assert!(matches!(
@@ -223,7 +223,7 @@ mod tests {
 			"--limit",
 			"5",
 			"--config",
-			"./maestro.toml",
+			"./tmp/maestro.toml",
 		]);
 
 		assert!(matches!(
