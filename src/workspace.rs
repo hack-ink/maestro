@@ -453,8 +453,13 @@ fn is_relative_path_remote(remote_url: &str) -> bool {
 
 	!path.is_absolute()
 		&& !remote_url.contains("://")
+		&& !looks_like_tilde_path(remote_url)
 		&& !looks_like_windows_absolute_path(remote_url)
 		&& !looks_like_scp_remote(remote_url)
+}
+
+fn looks_like_tilde_path(remote_url: &str) -> bool {
+	remote_url.starts_with('~')
 }
 
 fn looks_like_windows_absolute_path(remote_url: &str) -> bool {
@@ -552,6 +557,8 @@ mod tests {
 		run_git(&repo_root, &["init", "--initial-branch", "main"]);
 		run_git(&repo_root, &["config", "user.name", "Maestro Tests"]);
 		run_git(&repo_root, &["config", "user.email", "maestro-tests@example.com"]);
+		run_git(&repo_root, &["config", "commit.gpgsign", "false"]);
+		run_git(&repo_root, &["config", "tag.gpgsign", "false"]);
 		run_git(&repo_root, &["remote", "add", "origin", default_origin.to_str().unwrap()]);
 
 		fs::write(repo_root.join("README.md"), "hello\n").expect("seed file should write");
@@ -691,6 +698,17 @@ mod tests {
 		);
 
 		run_git(&spec.path, &["ls-remote", "origin"]);
+	}
+
+	#[test]
+	fn normalize_remote_url_preserves_tilde_based_local_remotes() {
+		let (_temp_dir, repo_root) = init_repo();
+
+		assert_eq!(super::normalize_remote_url(&repo_root, "~/remote.git"), "~/remote.git");
+		assert_eq!(
+			super::normalize_remote_url(&repo_root, "~alice/remote.git"),
+			"~alice/remote.git"
+		);
 	}
 
 	#[test]
