@@ -6,7 +6,7 @@ use std::{
 	time::Duration,
 };
 
-use rusqlite::{self, Connection, OptionalExtension};
+use rusqlite::{self, Connection, OptionalExtension, Row};
 
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 
@@ -216,47 +216,9 @@ impl StateStore {
 		project_id: &str,
 		limit: usize,
 	) -> crate::prelude::Result<Vec<ProjectRunStatus>> {
-		let mut statement = self.connection.prepare(
+		let mut statement = self.connection.prepare(&format!(
 			"
-			SELECT
-				r.run_id,
-				r.issue_id,
-				r.attempt_number,
-				r.status,
-				r.thread_id,
-				r.updated_at,
-				m.branch_name,
-				m.worktree_path,
-				EXISTS(
-					SELECT 1
-					FROM issue_leases l
-					WHERE l.project_id = ?1
-						AND l.issue_id = r.issue_id
-						AND l.run_id = r.run_id
-				) AS active_lease,
-				(
-					SELECT COUNT(*)
-					FROM event_journal e
-					WHERE e.run_id = r.run_id
-				) AS event_count,
-				(
-					SELECT e.event_type
-					FROM event_journal e
-					WHERE e.run_id = r.run_id
-					ORDER BY e.sequence_number DESC
-					LIMIT 1
-				) AS last_event_type,
-				(
-					SELECT e.created_at
-					FROM event_journal e
-					WHERE e.run_id = r.run_id
-					ORDER BY e.sequence_number DESC
-					LIMIT 1
-				) AS last_event_at
-			FROM run_attempts r
-			LEFT JOIN worktree_mappings m
-				ON m.issue_id = r.issue_id
-				AND m.project_id = ?1
+			{}
 			WHERE m.project_id = ?1
 				OR EXISTS(
 					SELECT 1
@@ -268,23 +230,36 @@ impl StateStore {
 			ORDER BY active_lease DESC, r.updated_at DESC, r.attempt_number DESC, r.run_id DESC
 			LIMIT ?2
 			",
-		)?;
-		let rows = statement.query_map(rusqlite::params![project_id, limit as i64], |row| {
-			Ok(ProjectRunStatus {
-				run_id: row.get(0)?,
-				issue_id: row.get(1)?,
-				attempt_number: row.get(2)?,
-				status: row.get(3)?,
-				thread_id: row.get(4)?,
-				updated_at: row.get(5)?,
-				branch_name: row.get(6)?,
-				worktree_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
-				active_lease: row.get::<_, i64>(8)? != 0,
-				event_count: row.get(9)?,
-				last_event_type: row.get(10)?,
-				last_event_at: row.get(11)?,
-			})
-		})?;
+			project_run_status_select_sql()
+		))?;
+		let rows = statement
+			.query_map(rusqlite::params![project_id, limit as i64], map_project_run_status_row)?;
+		let runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+		Ok(runs)
+	}
+
+	/// List all active leased runs for one project without applying the recent-run limit.
+	pub fn list_active_runs(
+		&self,
+		project_id: &str,
+	) -> crate::prelude::Result<Vec<ProjectRunStatus>> {
+		let mut statement = self.connection.prepare(&format!(
+			"
+			{}
+			WHERE EXISTS(
+				SELECT 1
+				FROM issue_leases l
+				WHERE l.project_id = ?1
+					AND l.issue_id = r.issue_id
+					AND l.run_id = r.run_id
+			)
+			ORDER BY r.updated_at DESC, r.attempt_number DESC, r.run_id DESC
+			",
+			project_run_status_select_sql()
+		))?;
+		let rows =
+			statement.query_map(rusqlite::params![project_id], map_project_run_status_row)?;
 		let runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
 		Ok(runs)
@@ -623,6 +598,67 @@ impl WorktreeMapping {
 	}
 }
 
+fn project_run_status_select_sql() -> &'static str {
+	"
+	SELECT
+		r.run_id,
+		r.issue_id,
+		r.attempt_number,
+		r.status,
+		r.thread_id,
+		r.updated_at,
+		m.branch_name,
+		m.worktree_path,
+		EXISTS(
+			SELECT 1
+			FROM issue_leases l
+			WHERE l.project_id = ?1
+				AND l.issue_id = r.issue_id
+				AND l.run_id = r.run_id
+		) AS active_lease,
+		(
+			SELECT COUNT(*)
+			FROM event_journal e
+			WHERE e.run_id = r.run_id
+		) AS event_count,
+		(
+			SELECT e.event_type
+			FROM event_journal e
+			WHERE e.run_id = r.run_id
+			ORDER BY e.sequence_number DESC
+			LIMIT 1
+		) AS last_event_type,
+		(
+			SELECT e.created_at
+			FROM event_journal e
+			WHERE e.run_id = r.run_id
+			ORDER BY e.sequence_number DESC
+			LIMIT 1
+		) AS last_event_at
+	FROM run_attempts r
+	LEFT JOIN worktree_mappings m
+		ON m.issue_id = r.issue_id
+		AND m.project_id = ?1
+	"
+}
+
+fn map_project_run_status_row(row: &Row<'_>) -> rusqlite::Result<ProjectRunStatus> {
+	Ok(ProjectRunStatus {
+		run_id: row.get(0)?,
+		issue_id: row.get(1)?,
+		attempt_number: row.get(2)?,
+		status: row.get(3)?,
+		thread_id: row.get(4)?,
+		updated_at: row.get(5)?,
+		branch_name: row.get(6)?,
+		worktree_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+		active_lease: row.get::<_, i64>(8)? != 0,
+		event_count: row.get(9)?,
+		last_event_type: row.get(10)?,
+		last_event_at: row.get(11)?,
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use std::path::Path;
@@ -788,5 +824,32 @@ mod tests {
 		let runs = store.list_recent_runs("pubfi", 1).expect("status query should succeed");
 
 		assert_eq!(runs.len(), 1);
+	}
+
+	#[test]
+	fn active_project_runs_are_not_capped_by_recent_limit() {
+		let store = StateStore::open_in_memory().expect("in-memory state store should open");
+
+		store
+			.record_run_attempt("run-1", "PUB-101", 1, "running")
+			.expect("first active run should record");
+		store
+			.record_run_attempt("run-2", "PUB-102", 1, "running")
+			.expect("second active run should record");
+		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("first lease should record");
+		store.upsert_lease("pubfi", "PUB-102", "run-2").expect("second lease should record");
+		store
+			.upsert_worktree("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/worktrees/pub-101")
+			.expect("first worktree should record");
+		store
+			.upsert_worktree("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/worktrees/pub-102")
+			.expect("second worktree should record");
+
+		let recent_runs = store.list_recent_runs("pubfi", 1).expect("recent runs should query");
+		let active_runs = store.list_active_runs("pubfi").expect("active runs should query");
+
+		assert_eq!(recent_runs.len(), 1);
+		assert_eq!(active_runs.len(), 2);
+		assert!(active_runs.iter().all(|run| run.active_lease()));
 	}
 }
