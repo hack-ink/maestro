@@ -145,6 +145,7 @@ Before applying success or failure writeback, `maestro` must classify the finish
 
 If neither signal exists, or both signals exist, `maestro` must fail the attempt instead of inferring operator intent.
 If the label is recorded without the required explanatory comment, `maestro` must also fail the attempt instead of treating it as a valid `manual_attention` exit.
+The explanatory comment for `manual_attention` must describe the exact observed blocker and should include the failed command plus raw error text when available instead of speculating about unverified capability limits.
 
 ### Success writeback
 

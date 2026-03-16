@@ -153,13 +153,14 @@
     "evidence": [
       "2026-03-13: PUB-610 and PUB-608 were originally staged after PR-backed handoff and daemon supervision so structural work would not enter the critical path too early.",
       "2026-03-16: The current hackink backlog has expanded the post-pilot runtime set to XY-125, XY-126, XY-128, and XY-124.",
-      "2026-03-16: XY-125 is the first post-pilot execution candidate because current code still lacks explicit claimed-set awareness, concurrency ceilings, and blocker gating in candidate selection.",
+      "2026-03-16: Fresh daemon follow-up XY-143 now sits inside the daemon-supervision phase, so this structural plan remains staged until that reliability fix closes.",
+      "2026-03-16: XY-125 is still the first structural execution candidate after daemon closeout because current code lacks explicit claimed-set awareness, concurrency ceilings, and blocker gating in candidate selection.",
       "2026-03-16: XY-126 remains downstream of XY-125, XY-128 must be placed explicitly before durability removal, and XY-124 stays last."
     ],
-    "last_updated": "2026-03-16T08:21:28Z",
+    "last_updated": "2026-03-16T11:24:36Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "The daemon pilot is not closed yet, so post-pilot runtime hardening remains staged rather than executable.",
+      "current_gap": "Daemon supervision now has an explicit follow-up on XY-143, so post-pilot runtime hardening remains staged until that reliability fix closes.",
       "ordering_rule": "XY-125 stays ahead of XY-126, XY-128 is placed explicitly before XY-124, and XY-124 stays last.",
       "next_candidate_after_daemon_closeout": "XY-125"
     }

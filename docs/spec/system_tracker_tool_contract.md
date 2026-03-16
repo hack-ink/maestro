@@ -71,6 +71,7 @@ In either invalid case, `maestro` must fail the attempt rather than infer which 
 - `issue_review_handoff` must validate that the supplied PR belongs to the current repository and lane branch, points at the validated lane HEAD, is open, and is ready for review before `maestro` accepts the handoff.
 - `issue_review_handoff` records the success metadata during the turn, but `maestro` owns the final completion comment and `In Review` transition after service-side validation succeeds.
 - Adding the configured `needs_attention_label` is an explicit human-required failure exit for the active lane. In that case the agent must leave a comment explaining the blocker, must not also record `issue_review_handoff`, and `maestro` must stop automatic retries for that attempt.
+- Human-attention comments must describe the exact observed blocker and should include the failed command plus raw error text when available. The agent must not speculate about capabilities or environment restrictions that it did not directly verify.
 - The human-attention exit is not complete until the explanatory comment is successfully written after the label request. A label-only signal must be rejected as an invalid completion disposition.
 - Issues that carry the configured `needs_attention_label` must remain ineligible for future automatic selection until a human clears the label.
 - `issue_review_handoff` and the human-attention exit are mutually exclusive terminal signals for the same turn.
