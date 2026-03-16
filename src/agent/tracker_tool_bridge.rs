@@ -1171,6 +1171,7 @@ mod tests {
 		TrackerIssue {
 			id: String::from("issue-1"),
 			identifier: String::from("MAE-1"),
+			project_slug: Some(String::from("maestro")),
 			title: String::from("Sample"),
 			description: String::from("Body"),
 			priority: Some(3),

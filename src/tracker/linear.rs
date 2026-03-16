@@ -27,6 +27,9 @@ query IssuesForProject($projectSlug: String!, $after: String) {
     nodes {
       id
       identifier
+      project {
+        slugId
+      }
       title
       description
       priority
@@ -88,6 +91,9 @@ query IssuesByIds($issueIds: [ID!], $after: String) {
     nodes {
       id
       identifier
+      project {
+        slugId
+      }
       title
       description
       priority
@@ -477,6 +483,7 @@ struct PageInfo {
 struct LinearIssue {
 	id: String,
 	identifier: String,
+	project: Option<LinearIssueProject>,
 	title: String,
 	description: Option<String>,
 	priority: Option<i64>,
@@ -487,6 +494,12 @@ struct LinearIssue {
 	labels: LabelConnection,
 	#[serde(rename = "inverseRelations")]
 	inverse_relations: IssueRelationConnection,
+}
+
+#[derive(Deserialize)]
+struct LinearIssueProject {
+	#[serde(rename = "slugId")]
+	slug: String,
 }
 
 #[derive(Deserialize)]
@@ -606,6 +619,7 @@ fn map_issue(issue: LinearIssue, blockers: Vec<TrackerIssueBlocker>) -> TrackerI
 	TrackerIssue {
 		id: issue.id,
 		identifier: issue.identifier,
+		project_slug: issue.project.map(|project| project.slug),
 		title: issue.title,
 		description: issue.description.unwrap_or_default(),
 		priority: issue.priority,
@@ -642,8 +656,9 @@ fn map_issue(issue: LinearIssue, blockers: Vec<TrackerIssueBlocker>) -> TrackerI
 #[cfg(test)]
 mod tests {
 	use crate::tracker::linear::{
-		IssueRelationConnection, LabelConnection, LinearIssue, LinearIssueRelation, LinearLabel,
-		LinearRelatedIssue, LinearState, LinearTeam, PageInfo, StateConnection,
+		IssueRelationConnection, LabelConnection, LinearIssue, LinearIssueProject,
+		LinearIssueRelation, LinearLabel, LinearRelatedIssue, LinearState, LinearTeam, PageInfo,
+		StateConnection,
 	};
 
 	#[test]
@@ -651,6 +666,7 @@ mod tests {
 		let issue = LinearIssue {
 			id: String::from("issue-1"),
 			identifier: String::from("PUB-101"),
+			project: Some(LinearIssueProject { slug: String::from("pubfi") }),
 			title: String::from("Implement ordering"),
 			description: Some(String::from("Body")),
 			priority: Some(2),
@@ -698,6 +714,7 @@ mod tests {
 
 		assert_eq!(mapped.priority, Some(2));
 		assert_eq!(mapped.created_at, "2026-03-13T04:16:17.133Z");
+		assert_eq!(mapped.project_slug.as_deref(), Some("pubfi"));
 		assert_eq!(mapped.blockers.len(), 1);
 		assert_eq!(mapped.blockers[0].identifier, "PUB-102");
 		assert_eq!(mapped.blockers[0].state.name, "In Progress");

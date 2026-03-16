@@ -15,6 +15,7 @@ pub(crate) trait IssueTracker {
 pub(crate) struct TrackerIssue {
 	pub(crate) id: String,
 	pub(crate) identifier: String,
+	pub(crate) project_slug: Option<String>,
 	pub(crate) title: String,
 	pub(crate) description: String,
 	pub(crate) priority: Option<i64>,

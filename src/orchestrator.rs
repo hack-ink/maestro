@@ -175,10 +175,15 @@ enum IssueDispatchMode {
 	Retry,
 }
 impl IssueDispatchMode {
-	fn allows_issue(self, issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+	fn allows_issue(
+		self,
+		issue: &TrackerIssue,
+		project_slug: &str,
+		workflow: &WorkflowDocument,
+	) -> bool {
 		match self {
 			Self::Normal => issue_passes_dispatch_policy(issue, workflow),
-			Self::Retry => issue_passes_retry_dispatch_policy(issue, workflow),
+			Self::Retry => issue_passes_retry_dispatch_policy(issue, project_slug, workflow),
 		}
 	}
 }
@@ -454,9 +459,9 @@ where
 				schedule_retry_after_child_exit(
 					retry_queue,
 					tracker,
+					project.tracker().project_slug(),
 					workflow,
 					state_store,
-					&daemon_child.issue_id,
 					&daemon_child.run_id,
 					exit_status,
 				)?;
@@ -601,7 +606,7 @@ where
 			return Ok(RetryDispatchDecision::Continue);
 		};
 
-		if !issue_passes_retry_dispatch_policy(&issue, workflow) {
+		if !issue_passes_retry_dispatch_policy(&issue, project.tracker().project_slug(), workflow) {
 			retry_queue.release(&entry.issue_id);
 
 			return Ok(RetryDispatchDecision::Continue);
@@ -656,15 +661,15 @@ where
 		return Ok(false);
 	};
 
-	Ok(issue_passes_retry_dispatch_policy(&issue, workflow))
+	Ok(issue_passes_retry_dispatch_policy(&issue, project.tracker().project_slug(), workflow))
 }
 
 fn schedule_retry_after_child_exit<T>(
 	retry_queue: &mut RetryQueue,
 	tracker: &T,
+	project_slug: &str,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
-	issue_id: &str,
 	run_id: &str,
 	exit_status: ExitStatus,
 ) -> crate::prelude::Result<()>
@@ -672,17 +677,16 @@ where
 	T: IssueTracker,
 {
 	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
-		retry_queue.release(issue_id);
-
 		return Ok(());
 	};
+	let issue_id = run_attempt.issue_id();
 	let Some(issue) = refresh_issue(tracker, issue_id)? else {
 		retry_queue.release(issue_id);
 
 		return Ok(());
 	};
 
-	if !issue_passes_retry_dispatch_policy(&issue, workflow) {
+	if !issue_passes_retry_dispatch_policy(&issue, project_slug, workflow) {
 		retry_queue.release(issue_id);
 
 		return Ok(());
@@ -1134,7 +1138,7 @@ where
 		return Ok(None);
 	};
 
-	if !issue_passes_retry_dispatch_policy(&issue, workflow) {
+	if !issue_passes_retry_dispatch_policy(&issue, project.tracker().project_slug(), workflow) {
 		return Ok(None);
 	}
 
@@ -1190,8 +1194,11 @@ where
 		let Some(refreshed_issue) = refresh_issue(context.tracker, &lease_issue_id)? else {
 			return Ok(None);
 		};
-		let dispatch_allowed =
-			context.dispatch_mode.allows_issue(&refreshed_issue, context.workflow);
+		let dispatch_allowed = context.dispatch_mode.allows_issue(
+			&refreshed_issue,
+			context.project.tracker().project_slug(),
+			context.workflow,
+		);
 
 		if !dispatch_allowed {
 			if !context.dry_run && is_terminal_issue(&refreshed_issue, context.workflow) {
@@ -1739,14 +1746,15 @@ fn issue_passes_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocumen
 	true
 }
 
-fn issue_passes_retry_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
-	if issue_passes_dispatch_policy(issue, workflow) {
-		return true;
-	}
-
+fn issue_passes_retry_dispatch_policy(
+	issue: &TrackerIssue,
+	project_slug: &str,
+	workflow: &WorkflowDocument,
+) -> bool {
 	let tracker_policy = workflow.frontmatter().tracker();
 
-	issue.state.name == tracker_policy.in_progress_state()
+	issue.project_slug.as_deref() == Some(project_slug)
+		&& issue.state.name == tracker_policy.in_progress_state()
 		&& !issue.has_label(tracker_policy.opt_out_label())
 		&& !issue.has_label(tracker_policy.needs_attention_label())
 }
@@ -2417,6 +2425,7 @@ mod tests {
 		TrackerIssue {
 			id: id.to_owned(),
 			identifier: identifier.to_owned(),
+			project_slug: Some(String::from("pubfi")),
 			title: String::from("Implement orchestration"),
 			description: String::from("Body"),
 			priority,
@@ -2741,6 +2750,31 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn retry_run_dry_run_rejects_issue_from_another_project() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let mut issue = sample_issue("In Progress", &[]);
+
+		issue.project_slug = Some(String::from("other-project"));
+
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary = orchestrator::run_retry_issue_once(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&issue.id,
+			true,
+		)
+		.expect("retry run should succeed");
+
+		assert!(summary.is_none(), "retry should reject issues outside the configured project");
+	}
+
+	#[test]
 	fn schedule_retry_after_child_exit_records_failure_retry_for_active_issue() {
 		let (_temp_dir, _config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
@@ -2760,9 +2794,9 @@ read_first = [{read_first}]
 		orchestrator::schedule_retry_after_child_exit(
 			&mut retry_queue,
 			&tracker,
+			"pubfi",
 			&workflow,
 			&state_store,
-			&issue.id,
 			run_id,
 			exit_status,
 		)
@@ -2804,9 +2838,9 @@ read_first = [{read_first}]
 		orchestrator::schedule_retry_after_child_exit(
 			&mut retry_queue,
 			&tracker,
+			"pubfi",
 			&workflow,
 			&state_store,
-			&issue.id,
 			run_id,
 			exit_status,
 		)
@@ -2849,9 +2883,9 @@ read_first = [{read_first}]
 		orchestrator::schedule_retry_after_child_exit(
 			&mut retry_queue,
 			&tracker,
+			"pubfi",
 			&workflow,
 			&state_store,
-			&issue.id,
 			run_id,
 			exit_status,
 		)
@@ -2883,9 +2917,9 @@ read_first = [{read_first}]
 		orchestrator::schedule_retry_after_child_exit(
 			&mut retry_queue,
 			&tracker,
+			"pubfi",
 			&workflow,
 			&state_store,
-			&issue.id,
 			run_id,
 			exit_status,
 		)
@@ -2954,6 +2988,35 @@ read_first = [{read_first}]
 
 		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
 		assert!(retry_queue.is_empty(), "non-active issue should release the queued claim early");
+	}
+
+	#[test]
+	fn future_retry_claim_releases_when_issue_returns_to_todo_before_due_time() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
+		assert!(retry_queue.is_empty(), "todo issues should not retain queued retry claims");
 	}
 
 	#[test]
