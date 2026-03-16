@@ -595,6 +595,18 @@ where
 	};
 
 	if Instant::now() < entry.ready_at {
+		let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
+			retry_queue.release(&entry.issue_id);
+
+			return Ok(RetryDispatchDecision::Continue);
+		};
+
+		if !issue_passes_retry_dispatch_policy(&issue, workflow) {
+			retry_queue.release(&entry.issue_id);
+
+			return Ok(RetryDispatchDecision::Continue);
+		}
+
 		tracing::debug!(
 			issue_id = entry.issue_id,
 			retry_kind = ?entry.kind,
@@ -2889,12 +2901,14 @@ read_first = [{read_first}]
 	#[test]
 	fn queued_retry_blocks_normal_candidate_selection_until_due() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
-		let tracker = FakeTracker::with_refresh_snapshots(Vec::new(), Vec::new());
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		retry_queue.upsert(orchestrator::RetryEntry {
-			issue_id: String::from("issue-1"),
+			issue_id: issue.id.clone(),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -2911,6 +2925,35 @@ read_first = [{read_first}]
 
 		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
 		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
+	}
+
+	#[test]
+	fn future_retry_claim_releases_when_issue_becomes_non_active_before_due_time() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
+		assert!(retry_queue.is_empty(), "non-active issue should release the queued claim early");
 	}
 
 	#[test]
