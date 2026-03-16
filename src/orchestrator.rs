@@ -918,6 +918,7 @@ where
 					tracker,
 					project,
 					workflow,
+					state_store,
 					&issue_run,
 					&Report::new(StalledRunNeedsAttention {
 						issue_identifier: action.issue.identifier.clone(),
@@ -1363,7 +1364,7 @@ where
 		},
 		Err(error) => {
 			persist_issue_run_outcome(state_store, &issue_run.run_id, false)?;
-			handle_failure(tracker, project, workflow, &issue_run, &error)?;
+			handle_failure(tracker, project, workflow, state_store, &issue_run, &error)?;
 
 			Err(error)
 		},
@@ -1472,6 +1473,7 @@ fn handle_failure<T>(
 	tracker: &T,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
+	state_store: &StateStore,
 	issue_run: &IssueRunPlan,
 	error: &Report,
 ) -> crate::prelude::Result<()>
@@ -1484,11 +1486,12 @@ where
 		error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some();
 	let stalled_run_needs_attention = error.downcast_ref::<StalledRunNeedsAttention>().is_some();
 	let workspace_path = relative_workspace_path(project, &issue_run.workspace);
+	let failed_attempts = state_store.failed_attempt_count(&issue_run.issue.id)?;
 
 	if !manual_attention_requested
 		&& !review_handoff_needs_attention
 		&& !stalled_run_needs_attention
-		&& issue_run.attempt_number < max_attempts
+		&& failed_attempts < max_attempts
 	{
 		tracing::warn!(
 			project_id = project.id(),
@@ -1496,6 +1499,7 @@ where
 			issue = issue_run.issue.identifier,
 			run_id = issue_run.run_id,
 			attempt = issue_run.attempt_number,
+			failure_attempt = failed_attempts,
 			max_attempts,
 			branch = issue_run.workspace.branch_name,
 			workspace_path = %workspace_path,
@@ -1508,6 +1512,7 @@ where
 			&format_retry_comment(
 				&issue_run.run_id,
 				issue_run.attempt_number,
+				failed_attempts,
 				max_attempts,
 				workspace_path,
 				&issue_run.workspace.branch_name,
@@ -2062,13 +2067,14 @@ fn compare_issue_candidates(left: &TrackerIssue, right: &TrackerIssue) -> Orderi
 fn format_retry_comment(
 	run_id: &str,
 	attempt_number: i64,
+	failed_attempt_number: i64,
 	max_attempts: i64,
 	workspace_path: String,
 	branch_name: &str,
 	error: &Report,
 ) -> String {
 	format!(
-		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
+		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failure_attempt: `{failed_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
 		workspace = workspace_path
@@ -3718,6 +3724,7 @@ read_first = [{read_first}]
 	fn terminal_failures_without_needs_attention_label_use_nonstartable_guard_state() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue_without_needs_attention_team_label("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
@@ -3736,8 +3743,15 @@ read_first = [{read_first}]
 			run_id: issue_run.run_id.clone(),
 		});
 
-		orchestrator::handle_failure(&tracker, &config, &workflow, &issue_run, &error)
-			.expect("terminal failure handling should succeed");
+		orchestrator::handle_failure(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&issue_run,
+			&error,
+		)
+		.expect("terminal failure handling should succeed");
 
 		assert_eq!(
 			tracker.state_updates.borrow().last(),
@@ -3747,6 +3761,59 @@ read_first = [{read_first}]
 		assert!(tracker.comments.borrow().iter().any(|comment| {
 			comment.contains("does not exist on the team")
 				&& comment.contains("remains in `In Progress`")
+		}));
+	}
+
+	#[test]
+	fn retryable_failures_ignore_prior_continuation_attempts_in_writeback() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Progress", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: issue.identifier.clone(),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			attempt_number: 4,
+			run_id: String::from("pub-101-attempt-4-123"),
+		};
+
+		state_store
+			.record_run_attempt("pub-101-attempt-1-123", &issue.id, 1, "succeeded")
+			.expect("first continuation attempt should record");
+		state_store
+			.record_run_attempt("pub-101-attempt-2-123", &issue.id, 2, "succeeded")
+			.expect("second continuation attempt should record");
+		state_store
+			.record_run_attempt("pub-101-attempt-3-123", &issue.id, 3, "succeeded")
+			.expect("third continuation attempt should record");
+		state_store
+			.record_run_attempt(&issue_run.run_id, &issue.id, issue_run.attempt_number, "failed")
+			.expect("current failed attempt should record");
+
+		orchestrator::handle_failure(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&issue_run,
+			&Report::msg("command failed"),
+		)
+		.expect("retryable failure handling should succeed");
+
+		assert!(tracker.state_updates.borrow().is_empty());
+		assert!(tracker.label_updates.borrow().is_empty());
+		assert!(tracker.comments.borrow().iter().any(|comment| {
+			comment.contains("retryable_execution_failure")
+				&& comment.contains("- attempt: `4`")
+				&& comment.contains("- failure_attempt: `1` / `3`")
+		}));
+		assert!(!tracker.comments.borrow().iter().any(|comment| {
+			comment.contains("needs attention") || comment.contains("retry_budget_exhausted")
 		}));
 	}
 
