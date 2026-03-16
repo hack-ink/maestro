@@ -254,6 +254,39 @@ impl StateStore {
 		Ok(attempt)
 	}
 
+	/// Read one run attempt by issue and attempt number.
+	pub fn run_attempt_for_issue_attempt(
+		&self,
+		issue_id: &str,
+		attempt_number: i64,
+	) -> crate::prelude::Result<Option<RunAttempt>> {
+		let attempt = self
+			.connection
+			.query_row(
+				"
+				SELECT run_id, issue_id, attempt_number, status, thread_id
+				FROM run_attempts
+				WHERE issue_id = ?1
+					AND attempt_number = ?2
+				ORDER BY updated_at DESC, run_id DESC
+				LIMIT 1
+				",
+				rusqlite::params![issue_id, attempt_number],
+				|row| {
+					Ok(RunAttempt {
+						run_id: row.get(0)?,
+						issue_id: row.get(1)?,
+						attempt_number: row.get(2)?,
+						status: row.get(3)?,
+						thread_id: row.get(4)?,
+					})
+				},
+			)
+			.optional()?;
+
+		Ok(attempt)
+	}
+
 	/// List recent run attempts for one project, including lease and protocol summary fields.
 	pub fn list_recent_runs(
 		&self,

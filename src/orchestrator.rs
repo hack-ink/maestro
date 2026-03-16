@@ -123,12 +123,14 @@ struct DaemonRunChild {
 	child: Child,
 	issue_id: String,
 	run_id: String,
+	attempt_number: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetryKind {
-	Continuation,
-	Failure,
+#[derive(Clone, Copy)]
+struct ChildRunRef<'a> {
+	issue_id: &'a str,
+	run_id: &'a str,
+	attempt_number: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -163,43 +165,11 @@ impl RetryQueue {
 	}
 }
 
-enum RetryDispatchDecision {
-	Blocked,
-	Dispatch(RunSummary),
-	Continue,
-}
-
-#[derive(Clone, Copy)]
-enum IssueDispatchMode {
-	Normal,
-	Retry,
-}
-impl IssueDispatchMode {
-	fn allows_issue(
-		self,
-		issue: &TrackerIssue,
-		project_slug: &str,
-		workflow: &WorkflowDocument,
-	) -> bool {
-		match self {
-			Self::Normal => issue_passes_dispatch_policy(issue, workflow),
-			Self::Retry => issue_passes_retry_dispatch_policy(issue, project_slug, workflow),
-		}
-	}
-}
-
 struct DaemonTickContext {
 	config: ServiceConfig,
 	workflow: WorkflowDocument,
 	tracker: LinearClient,
 	workspace_manager: WorkspaceManager,
-}
-
-#[derive(Clone, Debug)]
-enum ActiveRunDisposition {
-	Terminal,
-	NonActive,
-	Stalled { idle_for: Duration },
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +214,52 @@ struct OperatorWorkspaceStatus {
 	issue_id: String,
 	branch_name: String,
 	workspace_path: String,
+}
+
+struct ChildExitRetryContext<'a, T> {
+	retry_queue: &'a mut RetryQueue,
+	tracker: &'a T,
+	project_slug: &'a str,
+	workflow: &'a WorkflowDocument,
+	state_store: &'a StateStore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryKind {
+	Continuation,
+	Failure,
+}
+
+enum RetryDispatchDecision {
+	Blocked,
+	Dispatch(RunSummary),
+	Continue,
+}
+
+#[derive(Clone, Copy)]
+enum IssueDispatchMode {
+	Normal,
+	Retry,
+}
+impl IssueDispatchMode {
+	fn allows_issue(
+		self,
+		issue: &TrackerIssue,
+		project_slug: &str,
+		workflow: &WorkflowDocument,
+	) -> bool {
+		match self {
+			Self::Normal => issue_passes_dispatch_policy(issue, workflow),
+			Self::Retry => issue_passes_retry_dispatch_policy(issue, project_slug, workflow),
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+enum ActiveRunDisposition {
+	Terminal,
+	NonActive,
+	Stalled { idle_for: Duration },
 }
 
 pub(crate) fn run_once(
@@ -451,18 +467,27 @@ where
 		if child_exited {
 			clear_orphaned_daemon_child_state(
 				state_store,
-				&daemon_child.issue_id,
-				&daemon_child.run_id,
+				ChildRunRef {
+					issue_id: &daemon_child.issue_id,
+					run_id: &daemon_child.run_id,
+					attempt_number: daemon_child.attempt_number,
+				},
 			)?;
 
 			if let Some(exit_status) = child_exit_status {
 				schedule_retry_after_child_exit(
-					retry_queue,
-					tracker,
-					project.tracker().project_slug(),
-					workflow,
-					state_store,
-					&daemon_child.run_id,
+					ChildExitRetryContext {
+						retry_queue,
+						tracker,
+						project_slug: project.tracker().project_slug(),
+						workflow,
+						state_store,
+					},
+					ChildRunRef {
+						issue_id: &daemon_child.issue_id,
+						run_id: &daemon_child.run_id,
+						attempt_number: daemon_child.attempt_number,
+					},
 					exit_status,
 				)?;
 			}
@@ -492,19 +517,37 @@ where
 
 fn clear_orphaned_daemon_child_state(
 	state_store: &StateStore,
-	issue_id: &str,
-	run_id: &str,
+	child: ChildRunRef<'_>,
 ) -> crate::prelude::Result<()> {
-	mark_run_attempt_if_active(state_store, run_id, "interrupted")?;
+	let resolved_run_attempt = resolve_child_exit_run_attempt(state_store, child)?;
 
-	let lease_matches_run =
-		state_store.lease_for_issue(issue_id)?.is_some_and(|lease| lease.run_id() == run_id);
+	if let Some(run_attempt) = resolved_run_attempt.as_ref() {
+		mark_run_attempt_if_active(state_store, run_attempt.run_id(), "interrupted")?;
+	}
+
+	let lease_matches_run = state_store.lease_for_issue(child.issue_id)?.is_some_and(|lease| {
+		resolved_run_attempt
+			.as_ref()
+			.is_some_and(|run_attempt| lease.run_id() == run_attempt.run_id())
+			|| lease.run_id() == child.run_id
+	});
 
 	if lease_matches_run {
-		state_store.clear_lease(issue_id)?;
+		state_store.clear_lease(child.issue_id)?;
 	}
 
 	Ok(())
+}
+
+fn resolve_child_exit_run_attempt(
+	state_store: &StateStore,
+	child: ChildRunRef<'_>,
+) -> crate::prelude::Result<Option<RunAttempt>> {
+	if let Some(run_attempt) = state_store.run_attempt(child.run_id)? {
+		return Ok(Some(run_attempt));
+	}
+
+	state_store.run_attempt_for_issue_attempt(child.issue_id, child.attempt_number)
 }
 
 fn spawn_next_daemon_child<T>(
@@ -548,8 +591,12 @@ where
 				"Spawned daemon child for active issue lane."
 			);
 
-			*active_child =
-				Some(DaemonRunChild { child, issue_id: summary.issue_id, run_id: summary.run_id });
+			*active_child = Some(DaemonRunChild {
+				child,
+				issue_id: summary.issue_id,
+				run_id: summary.run_id,
+				attempt_number: summary.attempt_number,
+			});
 		},
 		None =>
 			if retry_queue.is_empty() {
@@ -665,29 +712,25 @@ where
 }
 
 fn schedule_retry_after_child_exit<T>(
-	retry_queue: &mut RetryQueue,
-	tracker: &T,
-	project_slug: &str,
-	workflow: &WorkflowDocument,
-	state_store: &StateStore,
-	run_id: &str,
+	context: ChildExitRetryContext<'_, T>,
+	child: ChildRunRef<'_>,
 	exit_status: ExitStatus,
 ) -> crate::prelude::Result<()>
 where
 	T: IssueTracker,
 {
-	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
+	let Some(run_attempt) = resolve_child_exit_run_attempt(context.state_store, child)? else {
 		return Ok(());
 	};
 	let issue_id = run_attempt.issue_id();
-	let Some(issue) = refresh_issue(tracker, issue_id)? else {
-		retry_queue.release(issue_id);
+	let Some(issue) = refresh_issue(context.tracker, issue_id)? else {
+		context.retry_queue.release(issue_id);
 
 		return Ok(());
 	};
 
-	if !issue_passes_retry_dispatch_policy(&issue, project_slug, workflow) {
-		retry_queue.release(issue_id);
+	if !issue_passes_retry_dispatch_policy(&issue, context.project_slug, context.workflow) {
+		context.retry_queue.release(issue_id);
 
 		return Ok(());
 	}
@@ -699,19 +742,19 @@ where
 		)
 	} else {
 		let retry_budget_attempts =
-			u32::try_from(state_store.retry_budget_attempt_count(issue_id)?)
+			u32::try_from(context.state_store.retry_budget_attempt_count(issue_id)?)
 				.unwrap_or(u32::MAX)
 				.max(1);
 
-		if retry_budget_attempts >= workflow.frontmatter().execution().max_attempts() {
-			retry_queue.release(issue_id);
+		if retry_budget_attempts >= context.workflow.frontmatter().execution().max_attempts() {
+			context.retry_queue.release(issue_id);
 
 			return Ok(());
 		}
 
 		(RetryKind::Failure, retry_budget_attempts)
 	};
-	let delay = retry_delay(kind, attempt.max(1), workflow);
+	let delay = retry_delay(kind, attempt.max(1), context.workflow);
 
 	tracing::info!(
 		issue_id,
@@ -721,7 +764,7 @@ where
 		"Queued retry after daemon child exit."
 	);
 
-	retry_queue.upsert(RetryEntry {
+	context.retry_queue.upsert(RetryEntry {
 		issue_id: issue_id.to_owned(),
 		kind,
 		attempt: attempt.max(1),
@@ -2792,12 +2835,14 @@ read_first = [{read_first}]
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		orchestrator::schedule_retry_after_child_exit(
-			&mut retry_queue,
-			&tracker,
-			"pubfi",
-			&workflow,
-			&state_store,
-			run_id,
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project_slug: "pubfi",
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			exit_status,
 		)
 		.expect("failure retry should schedule");
@@ -2836,12 +2881,14 @@ read_first = [{read_first}]
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		orchestrator::schedule_retry_after_child_exit(
-			&mut retry_queue,
-			&tracker,
-			"pubfi",
-			&workflow,
-			&state_store,
-			run_id,
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project_slug: "pubfi",
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 4 },
 			exit_status,
 		)
 		.expect("first failure after continuations should still schedule");
@@ -2881,12 +2928,14 @@ read_first = [{read_first}]
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		orchestrator::schedule_retry_after_child_exit(
-			&mut retry_queue,
-			&tracker,
-			"pubfi",
-			&workflow,
-			&state_store,
-			run_id,
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project_slug: "pubfi",
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 3 },
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -2915,12 +2964,14 @@ read_first = [{read_first}]
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		orchestrator::schedule_retry_after_child_exit(
-			&mut retry_queue,
-			&tracker,
-			"pubfi",
-			&workflow,
-			&state_store,
-			run_id,
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project_slug: "pubfi",
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			exit_status,
 		)
 		.expect("continuation retry should schedule");
@@ -2929,6 +2980,46 @@ read_first = [{read_first}]
 			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
 
 		assert_eq!(entry.kind, orchestrator::RetryKind::Continuation);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_uses_persisted_attempt_when_run_id_differs() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+
+		state_store
+			.record_run_attempt("persisted-run", &issue.id, 1, "failed")
+			.expect("persisted run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project_slug: "pubfi",
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef {
+				issue_id: &issue.id,
+				run_id: "planned-run",
+				attempt_number: 1,
+			},
+			exit_status,
+		)
+		.expect("retry scheduling should use the persisted run attempt");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
 		assert_eq!(entry.attempt, 1);
 	}
 
@@ -3620,8 +3711,11 @@ read_first = [{read_first}]
 			.expect("run attempt should record");
 		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
 
-		orchestrator::clear_orphaned_daemon_child_state(&state_store, &issue.id, "run-1")
-			.expect("orphaned child cleanup should succeed");
+		orchestrator::clear_orphaned_daemon_child_state(
+			&state_store,
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id: "run-1", attempt_number: 1 },
+		)
+		.expect("orphaned child cleanup should succeed");
 
 		assert!(
 			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
@@ -3629,6 +3723,39 @@ read_first = [{read_first}]
 		assert_eq!(
 			state_store
 				.run_attempt("run-1")
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"interrupted"
+		);
+	}
+
+	#[test]
+	fn exited_child_cleanup_uses_persisted_attempt_when_run_id_differs() {
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Progress", &[]);
+
+		state_store
+			.record_run_attempt("persisted-run", &issue.id, 1, "running")
+			.expect("persisted run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, "persisted-run").expect("lease should record");
+
+		orchestrator::clear_orphaned_daemon_child_state(
+			&state_store,
+			orchestrator::ChildRunRef {
+				issue_id: &issue.id,
+				run_id: "planned-run",
+				attempt_number: 1,
+			},
+		)
+		.expect("orphaned child cleanup should succeed");
+
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		);
+		assert_eq!(
+			state_store
+				.run_attempt("persisted-run")
 				.expect("run attempt lookup should succeed")
 				.expect("run attempt should exist")
 				.status(),
