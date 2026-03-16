@@ -608,12 +608,43 @@ where
 	let Some(summary) =
 		run_retry_issue_once(tracker, project, workflow, state_store, &entry.issue_id, true)?
 	else {
+		if retry_entry_is_temporarily_blocked(
+			tracker,
+			project,
+			workflow,
+			state_store,
+			&entry.issue_id,
+		)? {
+			return Ok(RetryDispatchDecision::Blocked);
+		}
+
 		retry_queue.release(&entry.issue_id);
 
 		return Ok(RetryDispatchDecision::Continue);
 	};
 
 	Ok(RetryDispatchDecision::Dispatch(summary))
+}
+
+fn retry_entry_is_temporarily_blocked<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_id: &str,
+) -> crate::prelude::Result<bool>
+where
+	T: IssueTracker,
+{
+	if has_available_dispatch_slot(project.id(), state_store)? {
+		return Ok(false);
+	}
+
+	let Some(issue) = refresh_issue(tracker, issue_id)? else {
+		return Ok(false);
+	};
+
+	Ok(issue_passes_retry_dispatch_policy(&issue, workflow))
 }
 
 fn schedule_retry_after_child_exit<T>(
@@ -651,16 +682,18 @@ where
 			u32::try_from(run_attempt.attempt_number()).unwrap_or(u32::MAX).max(1),
 		)
 	} else {
-		let failed_attempts =
-			u32::try_from(state_store.failed_attempt_count(issue_id)?).unwrap_or(u32::MAX).max(1);
+		let retry_budget_attempts =
+			u32::try_from(state_store.retry_budget_attempt_count(issue_id)?)
+				.unwrap_or(u32::MAX)
+				.max(1);
 
-		if failed_attempts >= workflow.frontmatter().execution().max_attempts() {
+		if retry_budget_attempts >= workflow.frontmatter().execution().max_attempts() {
 			retry_queue.release(issue_id);
 
 			return Ok(());
 		}
 
-		(RetryKind::Failure, failed_attempts)
+		(RetryKind::Failure, retry_budget_attempts)
 	};
 	let delay = retry_delay(kind, attempt.max(1), workflow);
 
@@ -1486,12 +1519,12 @@ where
 		error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some();
 	let stalled_run_needs_attention = error.downcast_ref::<StalledRunNeedsAttention>().is_some();
 	let workspace_path = relative_workspace_path(project, &issue_run.workspace);
-	let failed_attempts = state_store.failed_attempt_count(&issue_run.issue.id)?;
+	let retry_budget_attempts = state_store.retry_budget_attempt_count(&issue_run.issue.id)?;
 
 	if !manual_attention_requested
 		&& !review_handoff_needs_attention
 		&& !stalled_run_needs_attention
-		&& failed_attempts < max_attempts
+		&& retry_budget_attempts < max_attempts
 	{
 		tracing::warn!(
 			project_id = project.id(),
@@ -1499,7 +1532,7 @@ where
 			issue = issue_run.issue.identifier,
 			run_id = issue_run.run_id,
 			attempt = issue_run.attempt_number,
-			failure_attempt = failed_attempts,
+			retry_budget_attempt = retry_budget_attempts,
 			max_attempts,
 			branch = issue_run.workspace.branch_name,
 			workspace_path = %workspace_path,
@@ -1512,7 +1545,7 @@ where
 			&format_retry_comment(
 				&issue_run.run_id,
 				issue_run.attempt_number,
-				failed_attempts,
+				retry_budget_attempts,
 				max_attempts,
 				workspace_path,
 				&issue_run.workspace.branch_name,
@@ -2067,14 +2100,14 @@ fn compare_issue_candidates(left: &TrackerIssue, right: &TrackerIssue) -> Orderi
 fn format_retry_comment(
 	run_id: &str,
 	attempt_number: i64,
-	failed_attempt_number: i64,
+	retry_budget_attempt_number: i64,
 	max_attempts: i64,
 	workspace_path: String,
 	branch_name: &str,
 	error: &Report,
 ) -> String {
 	format!(
-		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failure_attempt: `{failed_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
+		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- retry_budget_attempt: `{retry_budget_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
 		workspace = workspace_path
@@ -2779,6 +2812,46 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn interrupted_exits_consume_retry_budget() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-3";
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "interrupted")
+			.expect("first interrupted attempt should record");
+		state_store
+			.record_run_attempt("run-2", &issue.id, 2, "interrupted")
+			.expect("second interrupted attempt should record");
+		state_store
+			.record_run_attempt(run_id, &issue.id, 3, "interrupted")
+			.expect("third interrupted attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			&mut retry_queue,
+			&tracker,
+			&workflow,
+			&state_store,
+			&issue.id,
+			run_id,
+			exit_status,
+		)
+		.expect("retry scheduling should succeed");
+
+		assert!(
+			!retry_queue.entries.contains_key(&issue.id),
+			"interrupted exits should exhaust the retry budget"
+		);
+	}
+
+	#[test]
 	fn schedule_retry_after_child_exit_records_continuation_retry_for_clean_exit() {
 		let (_temp_dir, _config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
@@ -2867,6 +2940,41 @@ read_first = [{read_first}]
 
 		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
 		assert!(retry_queue.is_empty(), "non-active issue should release the queued claim");
+	}
+
+	#[test]
+	fn due_retry_claim_stays_queued_when_dispatch_slot_is_temporarily_unavailable() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		state_store
+			.upsert_lease("pubfi", "issue-other", "run-other")
+			.expect("temporary competing lease should record");
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now(),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
+		assert!(
+			retry_queue.entries.contains_key(&issue.id),
+			"active retry entry should remain queued while another lease temporarily holds the slot"
+		);
 	}
 
 	#[test]
@@ -3810,7 +3918,7 @@ read_first = [{read_first}]
 		assert!(tracker.comments.borrow().iter().any(|comment| {
 			comment.contains("retryable_execution_failure")
 				&& comment.contains("- attempt: `4`")
-				&& comment.contains("- failure_attempt: `1` / `3`")
+				&& comment.contains("- retry_budget_attempt: `1` / `3`")
 		}));
 		assert!(!tracker.comments.borrow().iter().any(|comment| {
 			comment.contains("needs attention") || comment.contains("retry_budget_exhausted")
