@@ -28,6 +28,8 @@ cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml
 
 These commands are intentionally early-stage entrypoints. The `protocol probe` command is the first contract check for `app-server` compatibility before the full orchestrator loop depends on it.
 
+When you need a shorter operator snapshot, pass `--limit` to `cargo run -- status --config ./tmp/maestro.toml`. That limit only truncates the `Recent Runs` section; `Active Runs` remain fully visible so the currently leased lanes never disappear from the status view.
+
 ## Pilot Guide
 
 For the first real pilot, target `maestro` itself before onboarding another repository. Keep the live service config at `./tmp/maestro.toml`, and keep issue workspaces under the repo-local `.workspaces/` directory. If you need a tracked template, start from `./maestro.example.toml`. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage.

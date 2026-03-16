@@ -223,6 +223,8 @@ cargo run -- status --json --config ./tmp/maestro.toml
 
 Use the human-readable view when you need the current leased run, retained workspace, and recent attempt summary at a glance. Use `--json` when you want a machine-readable snapshot with stable identifiers such as `run_id`, `issue_id`, `thread_id`, `branch`, and repository-relative `workspace_path`.
 
+If you pass `--limit`, it only caps the recent-run section. Active runs remain uncapped in both the human-readable and JSON status views so the currently leased lanes stay visible.
+
 If you still need the thin storage internals for deep forensics, inspect the SQLite file directly as a fallback:
 
 ```sh
