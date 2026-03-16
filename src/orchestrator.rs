@@ -964,6 +964,8 @@ where
 
 	match result {
 		Ok(summary) => {
+			persist_issue_run_outcome(state_store, &issue_run.run_id, true)?;
+
 			tracing::info!(
 				project_id = project.id(),
 				issue_id = issue_run.issue.id,
@@ -978,11 +980,20 @@ where
 			Ok(summary)
 		},
 		Err(error) => {
+			persist_issue_run_outcome(state_store, &issue_run.run_id, false)?;
 			handle_failure(tracker, project, workflow, &issue_run, &error)?;
 
 			Err(error)
 		},
 	}
+}
+
+fn persist_issue_run_outcome(
+	state_store: &StateStore,
+	run_id: &str,
+	succeeded: bool,
+) -> crate::prelude::Result<()> {
+	state_store.update_run_status(run_id, if succeeded { "succeeded" } else { "failed" })
 }
 
 fn execute_issue_run_inner<T>(
@@ -1390,7 +1401,7 @@ fn build_developer_instructions(
 	));
 
 	sections.push(format!(
-		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
+		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain the exact observed blocker in a comment, including the failed command and raw error when available. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
 		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
@@ -2098,7 +2109,7 @@ read_first = [{read_first}]
 		));
 
 		sections.push(format!(
-			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain the exact observed blocker in a comment, including the failed command and raw error when available. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
 			issue = issue_run.issue.identifier,
 			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 			comment_tool = ISSUE_COMMENT_TOOL_NAME,
@@ -2198,6 +2209,10 @@ read_first = [{read_first}]
 		assert!(instructions.contains("Do not browse upstream references"));
 		assert!(instructions.contains("Tracker tool contract"));
 		assert!(instructions.contains("You own issue-scoped tracker writes for `PUB-101`."));
+		assert!(
+			instructions
+				.contains("Do not speculate about capabilities you did not directly verify.")
+		);
 		assert!(instructions.contains(ISSUE_REVIEW_HANDOFF_TOOL_NAME));
 		assert!(!instructions.contains("WORKFLOW.md\n"));
 		assert!(!instructions.contains("Follow the repository policy."));
@@ -2975,6 +2990,27 @@ read_first = [{read_first}]
 			comment.contains("does not exist on the team")
 				&& comment.contains("remains in `In Progress`")
 		}));
+	}
+
+	#[test]
+	fn manual_attention_failure_overrides_succeeded_run_status() {
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+
+		state_store
+			.record_run_attempt("run-1", "issue-1", 1, "succeeded")
+			.expect("run attempt should record");
+
+		orchestrator::persist_issue_run_outcome(&state_store, "run-1", false)
+			.expect("failed outcome should persist");
+
+		assert_eq!(
+			state_store
+				.run_attempt("run-1")
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"failed"
+		);
 	}
 
 	#[test]
