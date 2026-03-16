@@ -20,6 +20,7 @@ personality = "pragmatic"
 
 [execution]
 max_attempts = 3
+max_retry_backoff_ms = 300000
 validation_commands = [
   "cargo make fmt-check",
   "cargo make lint",

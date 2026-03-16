@@ -96,6 +96,7 @@ At minimum, the target repo should define:
 - `[tracker] startable_states = ["Todo"]` or another explicit start set
 - `[agent]` policy such as sandbox and approval mode
 - `[execution] max_attempts`
+- `[execution] max_retry_backoff_ms`
 - `[context] read_first = ["AGENTS.md"]` if repo policy should be loaded into issue-scoped instructions without relying on raw workflow-body inlining
 
 The target Linear team should also expose:
@@ -240,6 +241,7 @@ Use the event journal when the failure happened inside `app-server` transport or
 ## Re-running after failure
 
 - If the run is still retryable, leave the issue in `In Progress` and let `maestro` retry.
+- Retryable daemon retries now split into a short continuation retry after a clean worker exit and a capped exponential failure backoff after an abnormal worker exit.
 - If the run moved back to `Todo` with `maestro:needs-attention`, inspect the workspace, fix the blocking problem, clear `maestro:needs-attention`, and then move the issue back into a startable state for another automated attempt.
 - If the issue should never be automated again, add `maestro:manual-only`.
 

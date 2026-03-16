@@ -64,6 +64,9 @@ struct RunCommand {
 	/// Skip external side effects where the later implementation allows it.
 	#[arg(long)]
 	dry_run: bool,
+	/// Run a specific leased or queued issue instead of normal candidate selection.
+	#[arg(long, value_name = "ISSUE_ID")]
+	issue_id: Option<String>,
 	/// Override the service config path.
 	#[arg(long, value_name = "PATH")]
 	config: Option<PathBuf>,
@@ -74,7 +77,7 @@ impl RunCommand {
 			eyre::bail!("`run` currently requires `--once` for the MVP.");
 		}
 
-		orchestrator::run_once(self.config.as_deref(), self.dry_run)
+		orchestrator::run_once(self.config.as_deref(), self.dry_run, self.issue_id.as_deref())
 	}
 }
 
@@ -180,7 +183,22 @@ mod tests {
 
 		assert!(matches!(
 			cli.command,
-			Command::Run(RunCommand { once: true, dry_run: true, config: None })
+			Command::Run(RunCommand { once: true, dry_run: true, issue_id: None, config: None })
+		));
+	}
+
+	#[test]
+	fn parses_run_once_with_issue_override() {
+		let cli = Cli::parse_from(["maestro", "run", "--once", "--issue-id", "issue-1"]);
+
+		assert!(matches!(
+			cli.command,
+			Command::Run(RunCommand {
+				once: true,
+				dry_run: false,
+				issue_id: Some(_),
+				config: None
+			})
 		));
 	}
 

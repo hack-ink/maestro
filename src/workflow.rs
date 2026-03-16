@@ -94,6 +94,9 @@ impl WorkflowFrontmatter {
 		if self.execution.max_attempts == 0 {
 			eyre::bail!("`execution.max_attempts` must be greater than zero.");
 		}
+		if self.execution.max_retry_backoff_ms == 0 {
+			eyre::bail!("`execution.max_retry_backoff_ms` must be greater than zero.");
+		}
 
 		Ok(())
 	}
@@ -238,6 +241,8 @@ impl Default for WorkflowAgent {
 pub struct WorkflowExecution {
 	#[serde(default = "default_max_attempts")]
 	max_attempts: u32,
+	#[serde(default = "default_max_retry_backoff_ms")]
+	max_retry_backoff_ms: u64,
 	#[serde(default)]
 	validation_commands: Vec<String>,
 }
@@ -245,6 +250,11 @@ impl WorkflowExecution {
 	/// Maximum automatic attempts before human attention is required.
 	pub fn max_attempts(&self) -> u32 {
 		self.max_attempts
+	}
+
+	/// Maximum failure-retry backoff in milliseconds.
+	pub fn max_retry_backoff_ms(&self) -> u64 {
+		self.max_retry_backoff_ms
 	}
 
 	/// Validation commands to run before the success writeback is committed.
@@ -255,7 +265,11 @@ impl WorkflowExecution {
 
 impl Default for WorkflowExecution {
 	fn default() -> Self {
-		Self { max_attempts: default_max_attempts(), validation_commands: Vec::new() }
+		Self {
+			max_attempts: default_max_attempts(),
+			max_retry_backoff_ms: default_max_retry_backoff_ms(),
+			validation_commands: Vec::new(),
+		}
 	}
 }
 
@@ -356,6 +370,10 @@ fn default_max_attempts() -> u32 {
 	3
 }
 
+fn default_max_retry_backoff_ms() -> u64 {
+	300_000
+}
+
 fn default_read_first() -> Vec<String> {
 	vec![String::from("AGENTS.md")]
 }
@@ -381,6 +399,7 @@ project_slug = "pubfi"
 
 [execution]
 max_attempts = 3
+max_retry_backoff_ms = 300000
 validation_commands = ["cargo make test"]
 +++
 
@@ -394,6 +413,7 @@ Use `cargo make`.
 		assert_eq!(document.frontmatter().tracker().provider(), TrackerProvider::Linear);
 		assert_eq!(document.frontmatter().tracker().project_slug(), "pubfi");
 		assert_eq!(document.frontmatter().execution().max_attempts(), 3);
+		assert_eq!(document.frontmatter().execution().max_retry_backoff_ms(), 300_000);
 		assert_eq!(document.body(), "Read `AGENTS.md` first.\nUse `cargo make`.");
 	}
 

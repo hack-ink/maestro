@@ -6,7 +6,7 @@ use std::{
 	fmt::{self, Display, Formatter},
 	fs,
 	path::{Path, PathBuf},
-	process::{Child, Command, Stdio},
+	process::{Child, Command, ExitStatus, Stdio},
 	slice, thread,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +33,9 @@ use crate::{
 
 pub(crate) const DEFAULT_STATUS_RUN_LIMIT: usize = 10;
 
+const CONTINUATION_RETRY_DELAY_MS: u64 = 1_000;
+const FAILURE_RETRY_BASE_DELAY_MS: u64 = 10_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RunSummary {
 	project_id: String,
@@ -50,6 +53,17 @@ struct IssueRunPlan {
 	workspace: WorkspaceSpec,
 	attempt_number: i64,
 	run_id: String,
+}
+
+#[derive(Clone, Copy)]
+struct PrepareIssueRunContext<'a, T> {
+	tracker: &'a T,
+	project: &'a ServiceConfig,
+	workflow: &'a WorkflowDocument,
+	state_store: &'a StateStore,
+	workspace_manager: &'a WorkspaceManager,
+	dry_run: bool,
+	dispatch_mode: IssueDispatchMode,
 }
 
 #[derive(Debug)]
@@ -111,6 +125,64 @@ struct DaemonRunChild {
 	run_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryKind {
+	Continuation,
+	Failure,
+}
+
+#[derive(Clone, Debug)]
+struct RetryEntry {
+	issue_id: String,
+	kind: RetryKind,
+	attempt: u32,
+	ready_at: Instant,
+}
+
+#[derive(Default)]
+struct RetryQueue {
+	entries: HashMap<String, RetryEntry>,
+}
+impl RetryQueue {
+	fn is_empty(&self) -> bool {
+		self.entries.is_empty()
+	}
+
+	fn upsert(&mut self, entry: RetryEntry) {
+		self.entries.insert(entry.issue_id.clone(), entry);
+	}
+
+	fn release(&mut self, issue_id: &str) {
+		self.entries.remove(issue_id);
+	}
+
+	fn next_entry(&self) -> Option<&RetryEntry> {
+		self.entries.values().min_by(|left, right| {
+			left.ready_at.cmp(&right.ready_at).then_with(|| left.issue_id.cmp(&right.issue_id))
+		})
+	}
+}
+
+enum RetryDispatchDecision {
+	Blocked,
+	Dispatch(RunSummary),
+	Continue,
+}
+
+#[derive(Clone, Copy)]
+enum IssueDispatchMode {
+	Normal,
+	Retry,
+}
+impl IssueDispatchMode {
+	fn allows_issue(self, issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+		match self {
+			Self::Normal => issue_passes_dispatch_policy(issue, workflow),
+			Self::Retry => issue_passes_retry_dispatch_policy(issue, workflow),
+		}
+	}
+}
+
 struct DaemonTickContext {
 	config: ServiceConfig,
 	workflow: WorkflowDocument,
@@ -169,7 +241,11 @@ struct OperatorWorkspaceStatus {
 	workspace_path: String,
 }
 
-pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prelude::Result<()> {
+pub(crate) fn run_once(
+	config_path: Option<&Path>,
+	dry_run: bool,
+	preferred_issue_id: Option<&str>,
+) -> crate::prelude::Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
 			println!("dry run: no maestro config found; nothing to execute.");
@@ -185,7 +261,9 @@ pub(crate) fn run_once(config_path: Option<&Path>, dry_run: bool) -> crate::prel
 		StateStore::open(default_state_store_path()?)?
 	};
 
-	if let Some(summary) = run_configured_cycle(&config_path, &state_store, dry_run)? {
+	if let Some(summary) =
+		run_configured_cycle(&config_path, &state_store, dry_run, preferred_issue_id)?
+	{
 		if dry_run {
 			println!(
 				"dry run: project={} issue={} branch={} workspace={} attempt={}",
@@ -226,6 +304,7 @@ pub(crate) fn run_daemon(
 	};
 	let state_store = StateStore::open(default_state_store_path()?)?;
 	let mut active_child: Option<DaemonRunChild> = None;
+	let mut retry_queue = RetryQueue::default();
 
 	tracing::info!(
 		config_path = %config_path.display(),
@@ -237,7 +316,13 @@ pub(crate) fn run_daemon(
 		let tick_started_at = Instant::now();
 
 		match load_daemon_tick_context(&config_path).and_then(|context| {
-			run_daemon_tick(&config_path, &state_store, &mut active_child, context)
+			run_daemon_tick(
+				&config_path,
+				&state_store,
+				&mut active_child,
+				&mut retry_queue,
+				context,
+			)
 		}) {
 			Ok(()) => {},
 			Err(error) => {
@@ -290,10 +375,12 @@ fn run_daemon_tick(
 	config_path: &Path,
 	state_store: &StateStore,
 	active_child: &mut Option<DaemonRunChild>,
+	retry_queue: &mut RetryQueue,
 	context: DaemonTickContext,
 ) -> crate::prelude::Result<()> {
 	inspect_or_clear_active_child(
 		active_child,
+		retry_queue,
 		&context.tracker,
 		&context.config,
 		&context.workflow,
@@ -315,6 +402,7 @@ fn run_daemon_tick(
 			config_path,
 			state_store,
 			active_child,
+			retry_queue,
 			&context.tracker,
 			&context.config,
 			&context.workflow,
@@ -326,6 +414,7 @@ fn run_daemon_tick(
 
 fn inspect_or_clear_active_child<T>(
 	active_child: &mut Option<DaemonRunChild>,
+	retry_queue: &mut RetryQueue,
 	tracker: &T,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
@@ -338,7 +427,8 @@ where
 	let Some(daemon_child) = active_child.as_mut() else {
 		return Ok(());
 	};
-	let child_exited = daemon_child.child.try_wait()?.is_some();
+	let child_exit_status = daemon_child.child.try_wait()?;
+	let child_exited = child_exit_status.is_some();
 	let actions = if child_exited {
 		inspect_exited_daemon_child_reconciliation(
 			tracker,
@@ -359,6 +449,18 @@ where
 				&daemon_child.issue_id,
 				&daemon_child.run_id,
 			)?;
+
+			if let Some(exit_status) = child_exit_status {
+				schedule_retry_after_child_exit(
+					retry_queue,
+					tracker,
+					workflow,
+					state_store,
+					&daemon_child.issue_id,
+					&daemon_child.run_id,
+					exit_status,
+				)?;
+			}
 
 			active_child.take();
 		}
@@ -404,6 +506,7 @@ fn spawn_next_daemon_child<T>(
 	config_path: &Path,
 	state_store: &StateStore,
 	active_child: &mut Option<DaemonRunChild>,
+	retry_queue: &mut RetryQueue,
 	tracker: &T,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
@@ -411,40 +514,182 @@ fn spawn_next_daemon_child<T>(
 where
 	T: IssueTracker,
 {
-	match run_project_once(tracker, project, workflow, state_store, true)? {
-		Some(summary) => {
+	let next_run = match plan_due_retry_run(retry_queue, tracker, project, workflow, state_store) {
+		Ok(RetryDispatchDecision::Dispatch(summary)) => Some((summary, true)),
+		Ok(RetryDispatchDecision::Blocked) => None,
+		Ok(RetryDispatchDecision::Continue) =>
+			run_project_once(tracker, project, workflow, state_store, true)?
+				.map(|summary| (summary, false)),
+		Err(error) => return Err(error),
+	};
+
+	match next_run {
+		Some((summary, from_retry_queue)) => {
 			validate_review_handoff_runtime(false)?;
 
-			let child = spawn_run_once_child(config_path)?;
+			let child = spawn_run_once_child(
+				config_path,
+				from_retry_queue.then_some(summary.issue_id.as_str()),
+			)?;
+
+			if from_retry_queue {
+				retry_queue.release(&summary.issue_id);
+			}
 
 			tracing::info!(
 				issue = summary.issue_identifier,
 				workspace = %summary.workspace_path.display(),
+				retry = from_retry_queue,
 				"Spawned daemon child for active issue lane."
 			);
 
 			*active_child =
 				Some(DaemonRunChild { child, issue_id: summary.issue_id, run_id: summary.run_id });
 		},
-		None => {
-			tracing::debug!("Daemon tick found no eligible issue.");
-		},
+		None =>
+			if retry_queue.is_empty() {
+				tracing::debug!("Daemon tick found no eligible issue.");
+			} else {
+				tracing::debug!("Daemon tick is holding a queued retry claim.");
+			},
 	}
 
 	Ok(())
 }
 
-fn spawn_run_once_child(config_path: &Path) -> crate::prelude::Result<Child> {
+fn spawn_run_once_child(
+	config_path: &Path,
+	preferred_issue_id: Option<&str>,
+) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
-	let child = Command::new(executable)
+	let mut command = Command::new(executable);
+
+	command
 		.args(["run", "--once", "--config"])
 		.arg(config_path)
 		.stdin(Stdio::null())
 		.stdout(Stdio::inherit())
-		.stderr(Stdio::inherit())
-		.spawn()?;
+		.stderr(Stdio::inherit());
+
+	if let Some(issue_id) = preferred_issue_id {
+		command.args(["--issue-id", issue_id]);
+	}
+
+	let child = command.spawn()?;
 
 	Ok(child)
+}
+
+fn plan_due_retry_run<T>(
+	retry_queue: &mut RetryQueue,
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+) -> crate::prelude::Result<RetryDispatchDecision>
+where
+	T: IssueTracker,
+{
+	let Some(entry) = retry_queue.next_entry().cloned() else {
+		return Ok(RetryDispatchDecision::Continue);
+	};
+
+	if Instant::now() < entry.ready_at {
+		tracing::debug!(
+			issue_id = entry.issue_id,
+			retry_kind = ?entry.kind,
+			retry_attempt = entry.attempt,
+			"Retry queue is holding the project claim until the next retry is due."
+		);
+
+		return Ok(RetryDispatchDecision::Blocked);
+	}
+
+	let Some(summary) =
+		run_retry_issue_once(tracker, project, workflow, state_store, &entry.issue_id, true)?
+	else {
+		retry_queue.release(&entry.issue_id);
+
+		return Ok(RetryDispatchDecision::Continue);
+	};
+
+	Ok(RetryDispatchDecision::Dispatch(summary))
+}
+
+fn schedule_retry_after_child_exit<T>(
+	retry_queue: &mut RetryQueue,
+	tracker: &T,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_id: &str,
+	run_id: &str,
+	exit_status: ExitStatus,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
+		retry_queue.release(issue_id);
+
+		return Ok(());
+	};
+	let Some(issue) = refresh_issue(tracker, issue_id)? else {
+		retry_queue.release(issue_id);
+
+		return Ok(());
+	};
+
+	if !issue_passes_retry_dispatch_policy(&issue, workflow) {
+		retry_queue.release(issue_id);
+
+		return Ok(());
+	}
+
+	let kind = if exit_status.success() {
+		RetryKind::Continuation
+	} else if run_attempt.attempt_number()
+		>= i64::from(workflow.frontmatter().execution().max_attempts())
+	{
+		retry_queue.release(issue_id);
+
+		return Ok(());
+	} else {
+		RetryKind::Failure
+	};
+	let attempt = u32::try_from(run_attempt.attempt_number()).unwrap_or(u32::MAX);
+	let delay = retry_delay(kind, attempt.max(1), workflow);
+
+	tracing::info!(
+		issue_id,
+		retry_kind = ?kind,
+		retry_attempt = attempt.max(1),
+		retry_delay_ms = delay.as_millis(),
+		"Queued retry after daemon child exit."
+	);
+
+	retry_queue.upsert(RetryEntry {
+		issue_id: issue_id.to_owned(),
+		kind,
+		attempt: attempt.max(1),
+		ready_at: Instant::now() + delay,
+	});
+
+	Ok(())
+}
+
+fn retry_delay(kind: RetryKind, attempt: u32, workflow: &WorkflowDocument) -> Duration {
+	match kind {
+		RetryKind::Continuation => Duration::from_millis(CONTINUATION_RETRY_DELAY_MS),
+		RetryKind::Failure => {
+			let exponent = attempt.saturating_sub(1).min(31);
+			let multiplier = 1_u128 << exponent;
+			let requested = u128::from(FAILURE_RETRY_BASE_DELAY_MS).saturating_mul(multiplier);
+			let capped = requested
+				.min(u128::from(workflow.frontmatter().execution().max_retry_backoff_ms()));
+
+			Duration::from_millis(capped as u64)
+		},
+	}
 }
 
 fn stop_daemon_child(child: &mut Child) -> crate::prelude::Result<()> {
@@ -736,12 +981,17 @@ fn run_configured_cycle(
 	config_path: &Path,
 	state_store: &StateStore,
 	dry_run: bool,
+	preferred_issue_id: Option<&str>,
 ) -> crate::prelude::Result<Option<RunSummary>> {
 	let config = ServiceConfig::from_path(config_path)?;
 	let workflow_path = config.repo_root().join(config.workflow_path());
 	let workflow = WorkflowDocument::from_path(&workflow_path)?;
 	let api_key = config.tracker().resolve_api_key()?;
 	let tracker = LinearClient::new(api_key)?;
+
+	if let Some(issue_id) = preferred_issue_id {
+		return run_retry_issue_once(&tracker, &config, &workflow, state_store, issue_id, dry_run);
+	}
 
 	run_project_once(&tracker, &config, &workflow, state_store, dry_run)
 }
@@ -784,35 +1034,119 @@ where
 		return Ok(None);
 	}
 
-	let attempt_number = state_store.next_attempt_number(&issue.id)?;
-	let run_id = build_run_id(&issue.identifier, attempt_number)?;
-	let lease_issue_id = issue.id.clone();
+	let Some(issue_run) = prepare_issue_run(
+		PrepareIssueRunContext {
+			tracker,
+			project,
+			workflow,
+			state_store,
+			workspace_manager: &workspace_manager,
+			dry_run,
+			dispatch_mode: IssueDispatchMode::Normal,
+		},
+		issue,
+	)?
+	else {
+		return Ok(None);
+	};
 
-	if !dry_run && !state_store.try_acquire_lease(project.id(), &issue.id, &run_id)? {
+	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+}
+
+fn run_retry_issue_once<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_id: &str,
+	dry_run: bool,
+) -> crate::prelude::Result<Option<RunSummary>>
+where
+	T: IssueTracker,
+{
+	let workspace_manager =
+		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
+
+	if !dry_run {
+		reconcile_project_state(tracker, project, workflow, state_store, &workspace_manager)?;
+	}
+
+	validate_project_contract(project, workflow)?;
+	validate_tracker_project(tracker, project.tracker().project_slug())?;
+	validate_review_handoff_runtime(dry_run)?;
+
+	if !has_available_dispatch_slot(project.id(), state_store)? {
 		return Ok(None);
 	}
 
-	let issue_run = match (|| -> crate::prelude::Result<Option<IssueRunPlan>> {
-		let workspace = workspace_manager.ensure_workspace(&issue.identifier, dry_run)?;
+	let Some(issue) = refresh_issue(tracker, issue_id)? else {
+		return Ok(None);
+	};
 
-		if !dry_run {
-			state_store.upsert_workspace(
-				project.id(),
+	if !issue_passes_retry_dispatch_policy(&issue, workflow) {
+		return Ok(None);
+	}
+
+	let Some(issue_run) = prepare_issue_run(
+		PrepareIssueRunContext {
+			tracker,
+			project,
+			workflow,
+			state_store,
+			workspace_manager: &workspace_manager,
+			dry_run,
+			dispatch_mode: IssueDispatchMode::Retry,
+		},
+		issue,
+	)?
+	else {
+		return Ok(None);
+	};
+
+	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+}
+
+fn prepare_issue_run<T>(
+	context: PrepareIssueRunContext<'_, T>,
+	issue: TrackerIssue,
+) -> crate::prelude::Result<Option<IssueRunPlan>>
+where
+	T: IssueTracker,
+{
+	let attempt_number = context.state_store.next_attempt_number(&issue.id)?;
+	let run_id = build_run_id(&issue.identifier, attempt_number)?;
+	let lease_issue_id = issue.id.clone();
+
+	if !context.dry_run
+		&& !context.state_store.try_acquire_lease(context.project.id(), &issue.id, &run_id)?
+	{
+		return Ok(None);
+	}
+
+	match (|| -> crate::prelude::Result<Option<IssueRunPlan>> {
+		let workspace =
+			context.workspace_manager.ensure_workspace(&issue.identifier, context.dry_run)?;
+
+		if !context.dry_run {
+			context.state_store.upsert_workspace(
+				context.project.id(),
 				&lease_issue_id,
 				&workspace.branch_name,
 				&workspace.path.display().to_string(),
 			)?;
 		}
 
-		let Some(refreshed_issue) = refresh_issue(tracker, &lease_issue_id)? else {
+		let Some(refreshed_issue) = refresh_issue(context.tracker, &lease_issue_id)? else {
 			return Ok(None);
 		};
+		let dispatch_allowed =
+			context.dispatch_mode.allows_issue(&refreshed_issue, context.workflow);
 
-		if !issue_passes_dispatch_policy(&refreshed_issue, workflow) {
-			if !dry_run && is_terminal_issue(&refreshed_issue, workflow) {
+		if !dispatch_allowed {
+			if !context.dry_run && is_terminal_issue(&refreshed_issue, context.workflow) {
 				cleanup_terminal_workspace(
-					state_store,
-					&workspace_manager,
+					context.state_store,
+					context.workspace_manager,
 					&lease_issue_id,
 					&workspace.path,
 				)?;
@@ -828,23 +1162,35 @@ where
 			run_id: run_id.clone(),
 		}))
 	})() {
-		Ok(Some(issue_run)) => issue_run,
+		Ok(Some(issue_run)) => Ok(Some(issue_run)),
 		Ok(None) => {
-			if !dry_run {
-				state_store.clear_lease(&lease_issue_id)?;
+			if !context.dry_run {
+				context.state_store.clear_lease(&lease_issue_id)?;
 			}
 
-			return Ok(None);
+			Ok(None)
 		},
 		Err(error) => {
-			if !dry_run {
-				state_store.clear_lease(&lease_issue_id)?;
+			if !context.dry_run {
+				context.state_store.clear_lease(&lease_issue_id)?;
 			}
 
-			return Err(error);
+			Err(error)
 		},
-	};
+	}
+}
 
+fn complete_issue_run<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_run: IssueRunPlan,
+	dry_run: bool,
+) -> crate::prelude::Result<Option<RunSummary>>
+where
+	T: IssueTracker,
+{
 	if dry_run {
 		return Ok(Some(RunSummary {
 			project_id: project.id().to_owned(),
@@ -1336,6 +1682,18 @@ fn issue_passes_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocumen
 	}
 
 	true
+}
+
+fn issue_passes_retry_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+	if issue_passes_dispatch_policy(issue, workflow) {
+		return true;
+	}
+
+	let tracker_policy = workflow.frontmatter().tracker();
+
+	issue.state.name == tracker_policy.in_progress_state()
+		&& !issue.has_label(tracker_policy.opt_out_label())
+		&& !issue.has_label(tracker_policy.needs_attention_label())
 }
 
 fn is_issue_eligible(
@@ -1835,7 +2193,7 @@ mod tests {
 		fs,
 		path::{Path, PathBuf},
 		process::Command,
-		time::Duration,
+		time::{Duration, Instant},
 	};
 
 	use color_eyre::Report;
@@ -2174,6 +2532,7 @@ approval_policy = "never"
 
 [execution]
 max_attempts = 3
+max_retry_backoff_ms = 300000
 
 [context]
 read_first = [{read_first}]
@@ -2283,6 +2642,172 @@ read_first = [{read_first}]
 			!orchestrator::is_issue_eligible(&issue, &workflow, &state_store)
 				.expect("pre-claim eligibility should still reject leased issues")
 		);
+	}
+
+	#[test]
+	fn retry_delay_distinguishes_continuation_and_capped_failure_backoff() {
+		let (_, _, workflow) = temp_project_layout();
+
+		assert_eq!(
+			orchestrator::retry_delay(orchestrator::RetryKind::Continuation, 1, &workflow,),
+			Duration::from_millis(1_000)
+		);
+		assert_eq!(
+			orchestrator::retry_delay(orchestrator::RetryKind::Failure, 1, &workflow),
+			Duration::from_millis(10_000)
+		);
+		assert_eq!(
+			orchestrator::retry_delay(orchestrator::RetryKind::Failure, 10, &workflow),
+			Duration::from_millis(300_000)
+		);
+	}
+
+	#[test]
+	fn retry_run_dry_run_accepts_active_issue() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary = orchestrator::run_retry_issue_once(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&issue.id,
+			true,
+		)
+		.expect("retry run should succeed");
+
+		assert!(summary.is_some(), "active issue should remain dispatchable for retry");
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_records_failure_retry_for_active_issue() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-1";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "failed")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			&mut retry_queue,
+			&tracker,
+			&workflow,
+			&state_store,
+			&issue.id,
+			run_id,
+			exit_status,
+		)
+		.expect("failure retry should schedule");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_records_continuation_retry_for_clean_exit() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-1";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 0"]).status().expect("success exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			&mut retry_queue,
+			&tracker,
+			&workflow,
+			&state_store,
+			&issue.id,
+			run_id,
+			exit_status,
+		)
+		.expect("continuation retry should schedule");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.kind, orchestrator::RetryKind::Continuation);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn queued_retry_blocks_normal_candidate_selection_until_due() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::with_refresh_snapshots(Vec::new(), Vec::new());
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: String::from("issue-1"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
+		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
+	}
+
+	#[test]
+	fn due_retry_claim_releases_when_issue_becomes_non_active() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now(),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
+		assert!(retry_queue.is_empty(), "non-active issue should release the queued claim");
 	}
 
 	#[test]

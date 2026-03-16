@@ -25,7 +25,7 @@ Defines: The runtime scope, source-of-truth boundaries, eligibility rules, lane 
 ## Source of truth boundaries
 
 - Linear is the source of truth for issue lifecycle and coarse run outcomes.
-- `maestro` local state is the source of truth only for active leases, in-flight protocol sessions, retry bookkeeping, and short-lived diagnostic history.
+- `maestro` local state is the source of truth only for active leases, in-flight protocol sessions, in-memory retry bookkeeping, and short-lived diagnostic history.
 - `maestro` must not create a second long-lived business workflow model outside Linear.
 
 ## Runtime tuning inputs
@@ -95,7 +95,7 @@ The runtime state machine is local to `maestro`. It is not a replacement for Lin
 | `workspace_ready` | The issue lane exists locally and is ready for execution. | `app-server` session starts. |
 | `running` | `maestro` has an active `app-server` thread and turn for the issue. | Turn completes, transport fails, or policy violation occurs. |
 | `validating` | Agent execution finished and post-run validation commands are running. | Validation passes or fails. |
-| `retry_wait` | The attempt failed but retry budget remains. | Retry delay expires and a new attempt starts, or operator intervention cancels retries. |
+| `retry_wait` | The daemon is holding a queued retry entry for the leased lane after a clean continuation exit or a failure with remaining retry budget. | The queued retry revalidates and starts, the queued issue becomes non-active and the claim is released, or operator intervention cancels retries. |
 | `needs_attention` | Retry budget is exhausted or human intervention is required. | Human updates the issue and it becomes eligible again. |
 | `succeeded` | The attempt finished, validations passed, and the success writeback was committed to Linear. | Local cleanup begins. |
 | `closed` | Local cleanup finished and the lease is gone. | None. |
@@ -192,6 +192,10 @@ This path applies to retryable failures, retry exhaustion, and explicit `manual_
 Retryable failures with remaining budget:
 
 - Keep the issue in `In Progress`, typically through an agent-authored retry comment.
+- Queue the retry in daemon memory rather than immediately redispatching inside the same poll tick.
+- Clean worker exits schedule a short continuation retry.
+- Abnormal worker exits schedule exponential backoff capped by `execution.max_retry_backoff_ms`.
+- When the queued issue disappears, reaches a terminal state, or otherwise becomes non-active before the retry fires, release the queued claim instead of redispatching it.
 
 Retry-exhausted or human-required failures:
 
@@ -256,6 +260,7 @@ It is acceptable for deeper historical forensics to continue using the retained 
 
 - On service startup, `maestro` must reconcile local leases against current Linear state before starting new work.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
+- While daemon mode owns a queued retry entry, that queued claim must take priority over normal candidate selection in the current single-slot runtime.
 - If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the workspace.
 - If the leased issue becomes non-terminal and leaves both the `In Progress` lane state and any configured startable pre-claim state, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the workspace for inspection.
 - A leased issue that is still in a configured startable state during early daemon ticks must be treated as a lane that has not finished claiming tracker ownership yet, not as an immediate non-active interruption.
@@ -263,6 +268,7 @@ It is acceptable for deeper historical forensics to continue using the retained 
 - If the supervised child already exited before the next daemon tick, stalled reconciliation must still inspect the just-finished lane using persisted protocol activity rather than skipping directly to generic failure handling.
 - Reconciliation must mark locally active run attempts as `interrupted` when their stale lease is cleared, or `terminated` when the tracker issue is already terminal.
 - Reconciliation must clear stale leases before the next issue-selection pass.
+- When a queued retry becomes due, `maestro` must refresh that exact issue, redispatch it only if it is still active under retry policy, and otherwise release the queued claim.
 - Before a prepared lane starts `app-server`, `maestro` must refresh the selected issue once more and skip execution if the issue became terminal or otherwise ineligible.
 - If the local process crashed during a run, `maestro` may resume, retry, or mark the issue failed based on the retained lease, session, and attempt records.
 - If Linear shows a non-terminal state but no local lease exists, the issue may become eligible again after reconciliation.

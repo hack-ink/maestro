@@ -121,6 +121,11 @@ Supported keys:
   - type: integer
   - optional
   - default: `3`
+- `max_retry_backoff_ms`
+  - type: integer
+  - optional
+  - default: `300000`
+  - note: caps daemon-owned failure retry backoff in milliseconds; clean continuation retries use a separate short fixed delay in runtime policy
 - `validation_commands`
   - type: array of string
   - optional
@@ -177,6 +182,7 @@ personality = "pragmatic"
 
 [execution]
 max_attempts = 3
+max_retry_backoff_ms = 300000
 validation_commands = [
   "cargo make fmt-check",
   "cargo make lint",
