@@ -189,7 +189,7 @@ impl StateStore {
 			SELECT COUNT(*)
 			FROM run_attempts
 			WHERE issue_id = ?1
-				AND status IN ('failed', 'interrupted')
+				AND status IN ('failed', 'interrupted', 'terminal_guarded')
 			",
 			rusqlite::params![issue_id],
 			|row| row.get(0),
@@ -272,6 +272,37 @@ impl StateStore {
 				LIMIT 1
 				",
 				rusqlite::params![issue_id, attempt_number],
+				|row| {
+					Ok(RunAttempt {
+						run_id: row.get(0)?,
+						issue_id: row.get(1)?,
+						attempt_number: row.get(2)?,
+						status: row.get(3)?,
+						thread_id: row.get(4)?,
+					})
+				},
+			)
+			.optional()?;
+
+		Ok(attempt)
+	}
+
+	/// Read the latest run attempt for one issue.
+	pub fn latest_run_attempt_for_issue(
+		&self,
+		issue_id: &str,
+	) -> crate::prelude::Result<Option<RunAttempt>> {
+		let attempt = self
+			.connection
+			.query_row(
+				"
+				SELECT run_id, issue_id, attempt_number, status, thread_id
+				FROM run_attempts
+				WHERE issue_id = ?1
+				ORDER BY attempt_number DESC
+				LIMIT 1
+				",
+				rusqlite::params![issue_id],
 				|row| {
 					Ok(RunAttempt {
 						run_id: row.get(0)?,
@@ -849,17 +880,39 @@ mod tests {
 			.record_run_attempt("run-3", "PUB-101", 3, "interrupted")
 			.expect("third run should record");
 		store
+			.record_run_attempt("run-5", "PUB-101", 4, "terminal_guarded")
+			.expect("guarded run should record");
+		store
 			.record_run_attempt("run-4", "PUB-102", 1, "failed")
 			.expect("other issue run should record");
 
 		assert_eq!(
 			store.retry_budget_attempt_count("PUB-101").expect("retry budget count should load"),
-			2
+			3
 		);
 		assert_eq!(
 			store.retry_budget_attempt_count("PUB-102").expect("retry budget count should load"),
 			1
 		);
+	}
+
+	#[test]
+	fn loads_latest_run_attempt_for_issue() {
+		let store = StateStore::open_in_memory().expect("in-memory state store should open");
+
+		store.record_run_attempt("run-1", "PUB-101", 1, "failed").expect("first run should record");
+		store
+			.record_run_attempt("run-2", "PUB-101", 2, "terminal_guarded")
+			.expect("latest run should record");
+
+		let attempt = store
+			.latest_run_attempt_for_issue("PUB-101")
+			.expect("latest run lookup should succeed")
+			.expect("latest run should exist");
+
+		assert_eq!(attempt.run_id(), "run-2");
+		assert_eq!(attempt.attempt_number(), 2);
+		assert_eq!(attempt.status(), "terminal_guarded");
 	}
 
 	#[test]

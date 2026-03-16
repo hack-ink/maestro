@@ -35,6 +35,7 @@ pub(crate) const DEFAULT_STATUS_RUN_LIMIT: usize = 10;
 
 const CONTINUATION_RETRY_DELAY_MS: u64 = 1_000;
 const FAILURE_RETRY_BASE_DELAY_MS: u64 = 10_000;
+const TERMINAL_GUARDED_RUN_STATUS: &str = "terminal_guarded";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RunSummary {
@@ -183,6 +184,7 @@ struct ActiveRunReconciliation {
 
 struct TerminalFailureOutcome {
 	error_class: &'static str,
+	retry_guarded_by_state: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -248,10 +250,12 @@ impl IssueDispatchMode {
 		issue: &TrackerIssue,
 		project_slug: &str,
 		workflow: &WorkflowDocument,
-	) -> bool {
+		state_store: &StateStore,
+	) -> crate::prelude::Result<bool> {
 		match self {
-			Self::Normal => issue_passes_dispatch_policy(issue, workflow),
-			Self::Retry => issue_passes_retry_dispatch_policy(issue, project_slug, workflow),
+			Self::Normal => Ok(issue_passes_dispatch_policy(issue, workflow)),
+			Self::Retry =>
+				issue_passes_retry_dispatch_policy(issue, project_slug, workflow, state_store),
 		}
 	}
 }
@@ -654,7 +658,12 @@ where
 			return Ok(RetryDispatchDecision::Continue);
 		};
 
-		if !issue_passes_retry_dispatch_policy(&issue, project.tracker().project_slug(), workflow) {
+		if !issue_passes_retry_dispatch_policy(
+			&issue,
+			project.tracker().project_slug(),
+			workflow,
+			state_store,
+		)? {
 			retry_queue.release(&entry.issue_id);
 
 			return Ok(RetryDispatchDecision::Continue);
@@ -709,7 +718,12 @@ where
 		return Ok(false);
 	};
 
-	Ok(issue_passes_retry_dispatch_policy(&issue, project.tracker().project_slug(), workflow))
+	issue_passes_retry_dispatch_policy(
+		&issue,
+		project.tracker().project_slug(),
+		workflow,
+		state_store,
+	)
 }
 
 fn schedule_retry_after_child_exit<T>(
@@ -730,7 +744,12 @@ where
 		return Ok(());
 	};
 
-	if !issue_passes_retry_dispatch_policy(&issue, context.project_slug, context.workflow) {
+	if !issue_passes_retry_dispatch_policy(
+		&issue,
+		context.project_slug,
+		context.workflow,
+		context.state_store,
+	)? {
 		context.retry_queue.release(issue_id);
 
 		return Ok(());
@@ -1182,7 +1201,12 @@ where
 		return Ok(None);
 	};
 
-	if !issue_passes_retry_dispatch_policy(&issue, project.tracker().project_slug(), workflow) {
+	if !issue_passes_retry_dispatch_policy(
+		&issue,
+		project.tracker().project_slug(),
+		workflow,
+		state_store,
+	)? {
 		return Ok(None);
 	}
 
@@ -1245,7 +1269,8 @@ where
 			&refreshed_issue,
 			context.project.tracker().project_slug(),
 			context.workflow,
-		);
+			context.state_store,
+		)?;
 
 		if !dispatch_allowed {
 			if !context.dry_run && is_terminal_issue(&refreshed_issue, context.workflow) {
@@ -1631,6 +1656,10 @@ where
 		error,
 	)?;
 
+	if outcome.retry_guarded_by_state {
+		state_store.update_run_status(&issue_run.run_id, TERMINAL_GUARDED_RUN_STATUS)?;
+	}
+
 	tracing::warn!(
 		project_id = project.id(),
 		issue_id = issue_run.issue.id,
@@ -1709,7 +1738,10 @@ where
 		),
 	)?;
 
-	Ok(TerminalFailureOutcome { error_class })
+	Ok(TerminalFailureOutcome {
+		error_class,
+		retry_guarded_by_state: guard_with_nonstartable_state,
+	})
 }
 
 fn apply_needs_attention_label<T>(
@@ -1797,13 +1829,24 @@ fn issue_passes_retry_dispatch_policy(
 	issue: &TrackerIssue,
 	project_slug: &str,
 	workflow: &WorkflowDocument,
-) -> bool {
+	state_store: &StateStore,
+) -> crate::prelude::Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
 
-	issue.project_slug.as_deref() == Some(project_slug)
+	Ok(issue.project_slug.as_deref() == Some(project_slug)
 		&& issue.state.name == tracker_policy.in_progress_state()
 		&& !issue.has_label(tracker_policy.opt_out_label())
 		&& !issue.has_label(tracker_policy.needs_attention_label())
+		&& !issue_is_terminal_retry_guarded(issue, state_store)?)
+}
+
+fn issue_is_terminal_retry_guarded(
+	issue: &TrackerIssue,
+	state_store: &StateStore,
+) -> crate::prelude::Result<bool> {
+	Ok(state_store
+		.latest_run_attempt_for_issue(&issue.id)?
+		.is_some_and(|attempt| attempt.status() == TERMINAL_GUARDED_RUN_STATUS))
 }
 
 fn is_issue_eligible(
@@ -2820,6 +2863,36 @@ read_first = [{read_first}]
 		.expect("retry run should succeed");
 
 		assert!(summary.is_none(), "retry should reject issues outside the configured project");
+	}
+
+	#[test]
+	fn retry_run_dry_run_rejects_terminal_guarded_issue_without_attention_label() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue_without_needs_attention_team_label("In Progress", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, orchestrator::TERMINAL_GUARDED_RUN_STATUS)
+			.expect("terminal guard attempt should record");
+
+		let summary = orchestrator::run_retry_issue_once(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&issue.id,
+			true,
+		)
+		.expect("retry run should succeed");
+
+		assert!(
+			summary.is_none(),
+			"retry should reject issues that remain in progress only as a terminal guard"
+		);
 	}
 
 	#[test]
@@ -4185,6 +4258,10 @@ read_first = [{read_first}]
 			run_id: issue_run.run_id.clone(),
 		});
 
+		state_store
+			.record_run_attempt(&issue_run.run_id, &issue.id, issue_run.attempt_number, "failed")
+			.expect("run attempt should record");
+
 		orchestrator::handle_failure(
 			&tracker,
 			&config,
@@ -4204,6 +4281,14 @@ read_first = [{read_first}]
 			comment.contains("does not exist on the team")
 				&& comment.contains("remains in `In Progress`")
 		}));
+		assert_eq!(
+			state_store
+				.run_attempt(&issue_run.run_id)
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			orchestrator::TERMINAL_GUARDED_RUN_STATUS
+		);
 	}
 
 	#[test]
