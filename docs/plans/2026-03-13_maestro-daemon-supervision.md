@@ -166,30 +166,29 @@
       "2026-03-14: Started the rerun daemon pilot from `tmp/maestro-runner` with `cargo run -- daemon --poll-interval-s 5 --config ./tmp/maestro.toml`; `maestro status --json` shows active run `pub-626-attempt-1-1773496583`, Linear issue PUB-626 moved to In Progress with a start comment, and the runner workspace now contains README.md plus docs/guide/pilot.md edits while the lane remains active.",
       "2026-03-16: Verified the current repo routing is `y/hackink`; the PUB-era helixbox evidence above is retained as historical provenance only and no longer describes the active tracker authority.",
       "2026-03-16: The imported prerequisite set is satisfied in hackink with XY-134 Done (historical PUB-618), XY-127 Done (historical PUB-611), XY-129 Done (historical PUB-613), and XY-139 Done (historical PUB-625).",
-      "2026-03-16: The carried-forward daemon pilot itself remains open on XY-136, while XY-137 is still Todo with `maestro:needs-attention` and XY-140 is still In Progress with `maestro:needs-attention`.",
-      "2026-03-16: Current `main` already uses clone-backed `.workspaces` lanes, so XY-141's linked-worktree issue description is stale backlog context rather than a missing prerequisite for this subplan."
+      "2026-03-16: Finished the imported docs/config cleanup on `main` with 8d299d0, 2e85cb7, and 553cfac; XY-137 is now a duplicate of XY-140, XY-140 is Done, and current checked-in pilot authority no longer points at old helixbox slugs.",
+      "2026-03-16: Fresh seed XY-142 was selected by Maestro through run-once dry-run and live execution, produced the expected README diff in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff.",
+      "2026-03-16: XY-136 is now Done. The remaining daemon-supervision gap is XY-143 because the XY-142 journal showed that manual-attention exits can still leave operator status recorded as `succeeded` and that the child blocker comment overstated the observed network/git limits.",
+      "2026-03-16: Current `main` already uses clone-backed `.workspaces` lanes, so XY-141's linked-worktree issue description remains stale backlog context rather than a missing prerequisite for this subplan."
     ],
-    "last_updated": "2026-03-16T08:21:28Z",
+    "last_updated": "2026-03-16T11:24:36Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "The daemon pilot authority now lives in hackink on XY-136. This subplan cannot close until that imported pilot is reconciled, the overlapping docs-seed issues XY-137 and XY-140 are consolidated, and checked-in pilot config/docs stop pointing at old helixbox slugs.",
+      "current_gap": "The imported daemon pilot itself is now proven via XY-142 and XY-136 is Done, but this subplan cannot close until XY-143 resolves the remaining manual-attention status/comment mismatch exposed by that pilot.",
       "required_prerequisite": "Merged XY-134 (historical PUB-618)",
-      "active_lane": null,
+      "active_lane": "x/maestro-xy-143",
       "active_workspace": null,
       "confirmed_main_head": "70f8b283933ea673f275ec62db3ea3e83f59ccb3",
       "pilot_tracker_issue": "XY-136",
       "pilot_tracker_issue_url": null,
-      "pilot_seed_issue": null,
+      "pilot_seed_issue": "XY-142",
       "pilot_seed_issue_url": null,
       "pilot_runner_root": null,
-      "active_pr": null,
-      "active_commit": "70f8b283933ea673f275ec62db3ea3e83f59ccb3",
-      "followup_issue": "XY-139",
+      "active_pr": "https://github.com/hack-ink/maestro/pull/5",
+      "active_commit": "d816dc72a1166f895f2ad0e6798e59726ceecff5",
+      "followup_issue": "XY-143",
       "followup_issue_url": null,
-      "open_docs_seed_issues": [
-        "XY-137",
-        "XY-140"
-      ],
+      "open_docs_seed_issues": [],
       "stale_backlog_issue": "XY-141"
     }
   }

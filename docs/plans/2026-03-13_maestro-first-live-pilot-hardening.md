@@ -158,17 +158,18 @@
         "2026-03-14: Started the rerun daemon pilot on PUB-626; the issue is now In Progress with a start comment, `maestro status --json` reports active run `pub-626-attempt-1-1773496583`, and the runner workspace contains the expected README plus pilot-guide edits while the live lane is still running.",
         "2026-03-16: Verified the current repo routing is `y/hackink`; the PUB-era helixbox evidence above remains historical provenance from the pre-fork lane, not the current source of execution authority.",
         "2026-03-16: The carried-forward hardening backlog in hackink now maps the completed early phases to XY-134 Done (historical PUB-618), XY-127 Done (historical PUB-611), XY-129 Done (historical PUB-613), and XY-139 Done (historical PUB-625).",
-        "2026-03-16: The only still-active phase remains daemon supervision because XY-136 is still In Progress, XY-137 and XY-140 still carry `maestro:needs-attention` follow-up state, and structural follow-ups stay intentionally pending behind that cleanup."
+        "2026-03-16: Finished the imported authority cleanup on `main`: 8d299d0 realigned the split plans, 2e85cb7 fixed checked-in hackink pilot config/docs drift, 553cfac finished the carried-forward status docs seed, XY-137 was closed as a duplicate of XY-140, and XY-140 moved to Done.",
+        "2026-03-16: Fresh seed XY-142 was selected by Maestro, executed in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff; XY-136 is now Done, and the remaining daemon-supervision follow-up is XY-143."
       ],
-      "last_updated": "2026-03-16T08:21:28Z",
+      "last_updated": "2026-03-16T11:24:36Z",
     "replan_reason": null,
     "context_snapshot": {
       "first_subplan": "docs/plans/2026-03-13_maestro-pr-backed-handoff.md",
       "program_shape": "Three subplans in strict order",
       "active_subplan": "docs/plans/2026-03-13_maestro-daemon-supervision.md",
       "blocking_review_pr": null,
-      "blocking_followup_issue": "XY-136",
-      "next_validation_issue": "XY-136",
+      "blocking_followup_issue": "XY-143",
+      "next_validation_issue": "XY-143",
       "active_lane": null,
       "active_workspace": null,
       "tracker_project": "hackink/Maestro Pilot Ops Hardening",
@@ -180,9 +181,8 @@
         "stalled_run_followup": "XY-139"
       },
       "open_followups": [
-        "XY-137",
-        "XY-140",
-        "XY-141"
+        "XY-141",
+        "XY-143"
       ],
       "next_structural_issue_after_daemon_closeout": "XY-125"
     }
