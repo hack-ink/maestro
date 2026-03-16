@@ -33,7 +33,7 @@
       {
         "id": "confirm-loop-readiness",
         "title": "Confirm the self-supervision loop is already reviewable and observable",
-        "status": "pending",
+        "status": "done",
         "objective": "Prevent post-pilot runtime hardening from entering the critical path before the base loop is stable enough to support it.",
         "inputs": [
           "Outcomes of the PR-backed handoff plan",
@@ -51,7 +51,7 @@
       {
         "id": "shape-xy-125",
         "title": "Shape claim, concurrency, and blocker-aware candidate policy",
-        "status": "pending",
+        "status": "in_progress",
         "objective": "Decide whether XY-125 can be executed as one bounded issue or must be split before live execution.",
         "inputs": [
           "XY-125",
@@ -146,21 +146,23 @@
     }
   },
   "state": {
-    "phase": "ready",
-    "current_task_id": null,
-    "next_task_id": "confirm-loop-readiness",
+    "phase": "executing",
+    "current_task_id": "shape-xy-125",
+    "next_task_id": "shape-xy-125",
     "blockers": [],
     "evidence": [
       "2026-03-13: PUB-610 and PUB-608 were originally staged after PR-backed handoff and daemon supervision so structural work would not enter the critical path too early.",
       "2026-03-16: The current hackink backlog has expanded the post-pilot runtime set to XY-125, XY-126, XY-128, and XY-124.",
-      "2026-03-16: Fresh daemon follow-up XY-143 now sits inside the daemon-supervision phase, so this structural plan remains staged until that reliability fix closes.",
-      "2026-03-16: XY-125 is still the first structural execution candidate after daemon closeout because current code lacks explicit claimed-set awareness, concurrency ceilings, and blocker gating in candidate selection.",
-      "2026-03-16: XY-126 remains downstream of XY-125, XY-128 must be placed explicitly before durability removal, and XY-124 stays last."
+      "2026-03-16: Fresh daemon follow-up XY-143 originally kept this structural plan staged behind daemon supervision.",
+      "2026-03-16: PR #7 merged XY-143, so loop readiness is now confirmed: the current self-supervision path is PR-backed, reconciled, operator-visible, and no longer depends on manual PR creation or ad hoc SQL.",
+      "2026-03-16: XY-125 is now the active structural execution lane because current code still lacks explicit claimed-set awareness, concurrency ceilings, and blocker gating in candidate selection.",
+      "2026-03-16: XY-126 remains downstream of XY-125, XY-128 must be placed explicitly before durability removal, and XY-124 stays last.",
+      "2026-03-16: XY-141 should not block this plan because current `main` already uses clone-backed `.workspaces` lanes and the imported issue description is stale."
     ],
-    "last_updated": "2026-03-16T11:24:36Z",
+    "last_updated": "2026-03-16T15:21:10Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "Daemon supervision now has an explicit follow-up on XY-143, so post-pilot runtime hardening remains staged until that reliability fix closes.",
+      "current_gap": "The next remaining runtime gap is XY-125 claim/concurrency/blocker policy; daemon supervision is complete.",
       "ordering_rule": "XY-125 stays ahead of XY-126, XY-128 is placed explicitly before XY-124, and XY-124 stays last.",
       "next_candidate_after_daemon_closeout": "XY-125"
     }

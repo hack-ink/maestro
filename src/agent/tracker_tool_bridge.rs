@@ -1202,6 +1202,7 @@ mod tests {
 				],
 			},
 			labels: Vec::new(),
+			blockers: Vec::new(),
 		}
 	}
 

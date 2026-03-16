@@ -22,6 +22,7 @@ pub(crate) struct TrackerIssue {
 	pub(crate) state: TrackerState,
 	pub(crate) team: TrackerTeam,
 	pub(crate) labels: Vec<TrackerLabel>,
+	pub(crate) blockers: Vec<TrackerIssueBlocker>,
 }
 impl TrackerIssue {
 	pub(crate) fn has_label(&self, label_name: &str) -> bool {
@@ -43,6 +44,13 @@ impl TrackerIssue {
 			.find(|label| label.name == label_name)
 			.map(|label| label.id.as_str())
 	}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrackerIssueBlocker {
+	pub(crate) id: String,
+	pub(crate) identifier: String,
+	pub(crate) state: TrackerState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

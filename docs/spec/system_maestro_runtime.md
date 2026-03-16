@@ -56,7 +56,9 @@ An issue is eligible only when all of the following are true:
 3. The issue state is not in the configured terminal states.
 4. The issue does not have the opt-out label `maestro:manual-only`.
 5. The issue does not have the human-attention label `maestro:needs-attention`.
-6. The issue does not already have an active `maestro` lease.
+6. If the issue state is `Todo`, every blocker is already in a configured terminal state.
+7. The issue does not already have an active `maestro` lease.
+8. The project still has an available dispatch slot.
 
 Default `startable_states`:
 
@@ -67,6 +69,11 @@ Optional future expansion:
 - `Backlog`
 
 `In Progress` is not eligible by default. `maestro` should not race human-owned work that is already in progress.
+
+Current runtime note:
+
+- The current hack-ink `maestro` runtime is a single-worker model, so project-level concurrency is one dispatch slot.
+- Active leases are the project-local claim set for that slot until a broader concurrency model lands.
 
 ## Lane model
 

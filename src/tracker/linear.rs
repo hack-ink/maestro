@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	prelude::{Result, eyre},
 	tracker::{
-		IssueTracker, TrackerIssue, TrackerLabel, TrackerProject, TrackerState, TrackerTeam,
+		IssueTracker, TrackerIssue, TrackerIssueBlocker, TrackerLabel, TrackerProject,
+		TrackerState, TrackerTeam,
 	},
 };
 
@@ -56,6 +57,19 @@ query IssuesForProject($projectSlug: String!, $after: String) {
           name
         }
       }
+      inverseRelations(first: 50) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              id
+              name
+            }
+          }
+        }
+      }
     }
     pageInfo {
       hasNextPage
@@ -98,6 +112,19 @@ query IssuesByIds($issueIds: [ID!], $after: String) {
         nodes {
           id
           name
+        }
+      }
+      inverseRelations(first: 50) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              id
+              name
+            }
+          }
         }
       }
     }
@@ -360,6 +387,8 @@ struct LinearIssue {
 	state: LinearState,
 	team: LinearTeam,
 	labels: LabelConnection,
+	#[serde(rename = "inverseRelations")]
+	inverse_relations: IssueRelationConnection,
 }
 
 #[derive(Deserialize)]
@@ -378,6 +407,25 @@ struct StateConnection {
 #[derive(Deserialize)]
 struct LabelConnection {
 	nodes: Vec<LinearLabel>,
+}
+
+#[derive(Deserialize)]
+struct IssueRelationConnection {
+	nodes: Vec<LinearIssueRelation>,
+}
+
+#[derive(Deserialize)]
+struct LinearIssueRelation {
+	#[serde(rename = "type")]
+	relation_type: String,
+	issue: LinearRelatedIssue,
+}
+
+#[derive(Deserialize)]
+struct LinearRelatedIssue {
+	id: String,
+	identifier: String,
+	state: LinearState,
 }
 
 #[derive(Deserialize)]
@@ -468,13 +516,28 @@ fn map_issue(issue: LinearIssue) -> TrackerIssue {
 			.into_iter()
 			.map(|label| TrackerLabel { id: label.id, name: label.name })
 			.collect(),
+		blockers: issue
+			.inverse_relations
+			.nodes
+			.into_iter()
+			.filter(|relation| relation.relation_type == "blocks")
+			.map(|relation| TrackerIssueBlocker {
+				id: relation.issue.id,
+				identifier: relation.issue.identifier,
+				state: TrackerState {
+					id: relation.issue.state.id,
+					name: relation.issue.state.name,
+				},
+			})
+			.collect(),
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use crate::tracker::linear::{
-		LabelConnection, LinearIssue, LinearLabel, LinearState, LinearTeam, StateConnection,
+		IssueRelationConnection, LabelConnection, LinearIssue, LinearIssueRelation, LinearLabel,
+		LinearRelatedIssue, LinearState, LinearTeam, StateConnection,
 	};
 
 	#[test]
@@ -509,10 +572,26 @@ mod tests {
 					name: String::from("maestro:manual-only"),
 				}],
 			},
+			inverse_relations: IssueRelationConnection {
+				nodes: vec![LinearIssueRelation {
+					relation_type: String::from("blocks"),
+					issue: LinearRelatedIssue {
+						id: String::from("issue-2"),
+						identifier: String::from("PUB-102"),
+						state: LinearState {
+							id: String::from("state-progress"),
+							name: String::from("In Progress"),
+						},
+					},
+				}],
+			},
 		};
 		let mapped = super::map_issue(issue);
 
 		assert_eq!(mapped.priority, Some(2));
 		assert_eq!(mapped.created_at, "2026-03-13T04:16:17.133Z");
+		assert_eq!(mapped.blockers.len(), 1);
+		assert_eq!(mapped.blockers[0].identifier, "PUB-102");
+		assert_eq!(mapped.blockers[0].state.name, "In Progress");
 	}
 }

@@ -769,7 +769,7 @@ where
 
 	let project_slug = project.tracker().project_slug();
 	let issues = tracker.list_project_issues(project_slug)?;
-	let Some(issue) = select_issue_candidate(issues, workflow, state_store)? else {
+	let Some(issue) = select_issue_candidate(issues, workflow, state_store, project.id())? else {
 		return Ok(None);
 	};
 	let mut refreshed_issues = tracker.refresh_issues(slice::from_ref(&issue.id))?;
@@ -777,6 +777,9 @@ where
 		return Ok(None);
 	};
 
+	if !has_available_dispatch_slot(project.id(), state_store)? {
+		return Ok(None);
+	}
 	if !is_issue_eligible(&issue, workflow, state_store)? {
 		return Ok(None);
 	}
@@ -1304,8 +1307,26 @@ fn is_issue_eligible(
 	if issue.has_label(tracker_policy.needs_attention_label()) {
 		return Ok(false);
 	}
+	if !todo_blocker_rule_passes(issue, workflow) {
+		return Ok(false);
+	}
 
 	Ok(state_store.lease_for_issue(&issue.id)?.is_none())
+}
+
+fn has_available_dispatch_slot(
+	project_id: &str,
+	state_store: &StateStore,
+) -> crate::prelude::Result<bool> {
+	Ok(state_store.list_leases(project_id)?.is_empty())
+}
+
+fn todo_blocker_rule_passes(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+	if issue.state.name != "Todo" {
+		return true;
+	}
+
+	issue.blockers.iter().all(|blocker| state_name_is_terminal(&blocker.state.name, workflow))
 }
 
 fn refresh_issue<T>(tracker: &T, issue_id: &str) -> crate::prelude::Result<Option<TrackerIssue>>
@@ -1319,12 +1340,11 @@ where
 }
 
 fn is_terminal_issue(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
-	workflow
-		.frontmatter()
-		.tracker()
-		.terminal_states()
-		.iter()
-		.any(|state| state == &issue.state.name)
+	state_name_is_terminal(&issue.state.name, workflow)
+}
+
+fn state_name_is_terminal(state_name: &str, workflow: &WorkflowDocument) -> bool {
+	workflow.frontmatter().tracker().terminal_states().iter().any(|state| state == state_name)
 }
 
 fn is_issue_active_for_run(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
@@ -1611,7 +1631,12 @@ fn select_issue_candidate(
 	issues: Vec<TrackerIssue>,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
+	project_id: &str,
 ) -> crate::prelude::Result<Option<TrackerIssue>> {
+	if !has_available_dispatch_slot(project_id, state_store)? {
+		return Ok(None);
+	}
+
 	let mut eligible_issues = Vec::new();
 
 	for issue in issues {
@@ -1791,7 +1816,8 @@ mod tests {
 		prelude::Result,
 		state::StateStore,
 		tracker::{
-			IssueTracker, TrackerIssue, TrackerLabel, TrackerProject, TrackerState, TrackerTeam,
+			IssueTracker, TrackerIssue, TrackerIssueBlocker, TrackerLabel, TrackerProject,
+			TrackerState, TrackerTeam,
 		},
 		workflow::WorkflowDocument,
 		workspace::WorkspaceSpec,
@@ -1893,6 +1919,14 @@ mod tests {
 		)
 	}
 
+	fn sample_blocker(id: &str, identifier: &str, state_name: &str) -> TrackerIssueBlocker {
+		TrackerIssueBlocker {
+			id: id.to_owned(),
+			identifier: identifier.to_owned(),
+			state: TrackerState { id: format!("state-{id}"), name: state_name.to_owned() },
+		}
+	}
+
 	fn sample_issue_with_sort_fields(
 		id: &str,
 		identifier: &str,
@@ -1944,6 +1978,7 @@ mod tests {
 					name: (*label).to_owned(),
 				})
 				.collect(),
+			blockers: Vec::new(),
 		}
 	}
 
@@ -2127,12 +2162,20 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn eligibility_uses_state_label_and_lease_rules() {
+	fn eligibility_uses_state_label_blocker_and_lease_rules() {
 		let (_, _, workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let eligible_issue = sample_issue("Todo", &[]);
 		let opted_out_issue = sample_issue("Todo", &["maestro:manual-only"]);
 		let needs_attention_issue = sample_issue("Todo", &["maestro:needs-attention"]);
+		let mut blocked_issue = sample_issue("Todo", &[]);
+
+		blocked_issue.blockers = vec![sample_blocker("issue-2", "PUB-102", "In Progress")];
+
+		let mut unblocked_issue = sample_issue("Todo", &[]);
+
+		unblocked_issue.blockers = vec![sample_blocker("issue-3", "PUB-103", "Done")];
+
 		let wrong_state_issue = sample_issue("In Progress", &[]);
 
 		assert!(
@@ -2145,6 +2188,14 @@ read_first = [{read_first}]
 		);
 		assert!(
 			!orchestrator::is_issue_eligible(&needs_attention_issue, &workflow, &state_store)
+				.expect("eligibility should succeed")
+		);
+		assert!(
+			!orchestrator::is_issue_eligible(&blocked_issue, &workflow, &state_store)
+				.expect("eligibility should succeed")
+		);
+		assert!(
+			orchestrator::is_issue_eligible(&unblocked_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
 		);
 		assert!(
@@ -2290,6 +2341,7 @@ read_first = [{read_first}]
 			vec![no_priority, newest_same_priority, oldest_same_priority, high_priority],
 			&workflow,
 			&state_store,
+			"pubfi",
 		)
 		.expect("candidate selection should succeed")
 		.expect("one issue should be selected");
@@ -2321,11 +2373,65 @@ read_first = [{read_first}]
 			vec![later_identifier, earlier_identifier],
 			&workflow,
 			&state_store,
+			"pubfi",
 		)
 		.expect("candidate selection should succeed")
 		.expect("one issue should be selected");
 
 		assert_eq!(selected.identifier, "PUB-101");
+	}
+
+	#[test]
+	fn candidate_selection_skips_todo_issue_with_nonterminal_blockers() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut blocked_high_priority = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:15:17.133Z",
+		);
+
+		blocked_high_priority.blockers = vec![sample_blocker("issue-9", "PUB-109", "In Progress")];
+
+		let unblocked_lower_priority = sample_issue_with_sort_fields(
+			"issue-3",
+			"PUB-103",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let selected = orchestrator::select_issue_candidate(
+			vec![blocked_high_priority, unblocked_lower_priority],
+			&workflow,
+			&state_store,
+			"pubfi",
+		)
+		.expect("candidate selection should succeed")
+		.expect("one issue should be selected");
+
+		assert_eq!(selected.identifier, "PUB-103");
+	}
+
+	#[test]
+	fn candidate_selection_respects_single_dispatch_slot() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+
+		state_store.upsert_lease("pubfi", "issue-active", "run-1").expect("lease should record");
+
+		let selected = orchestrator::select_issue_candidate(
+			vec![sample_issue("Todo", &[])],
+			&workflow,
+			&state_store,
+			"pubfi",
+		)
+		.expect("candidate selection should succeed");
+
+		assert!(selected.is_none(), "project-level dispatch slot should block new selection");
 	}
 
 	#[test]

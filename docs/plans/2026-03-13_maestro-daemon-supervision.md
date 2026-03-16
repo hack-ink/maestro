@@ -104,7 +104,7 @@
       {
         "id": "run-daemon-pilot",
         "title": "Run one daemon-driven self-supervision pilot on a fresh bounded issue",
-        "status": "in_progress",
+        "status": "done",
         "objective": "Prove that Maestro can supervise a bounded internal issue through the daemon path once reconciliation and visibility exist.",
         "inputs": [
           "Merged XY-127 and XY-129",
@@ -136,9 +136,9 @@
     }
   },
   "state": {
-    "phase": "executing",
-    "current_task_id": "run-daemon-pilot",
-    "next_task_id": "run-daemon-pilot",
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
     "blockers": [],
     "evidence": [
       "2026-03-13: Current runtime guidance already states that stall and liveness policy must use schema, live telemetry, and upstream implementation evidence together.",
@@ -169,24 +169,25 @@
       "2026-03-16: Finished the imported docs/config cleanup on `main` with 8d299d0, 2e85cb7, and 553cfac; XY-137 is now a duplicate of XY-140, XY-140 is Done, and current checked-in pilot authority no longer points at old helixbox slugs.",
       "2026-03-16: Fresh seed XY-142 was selected by Maestro through run-once dry-run and live execution, produced the expected README diff in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff.",
       "2026-03-16: XY-136 is now Done. The remaining daemon-supervision gap is XY-143 because the XY-142 journal showed that manual-attention exits can still leave operator status recorded as `succeeded` and that the child blocker comment overstated the observed network/git limits.",
+      "2026-03-16: PR #6 merged the XY-142 pilot seed and PR #7 merged the XY-143 reliability follow-up, so the daemon-supervision phase now has a completed pilot, completed follow-up fix, and no remaining runtime blocker before XY-125.",
       "2026-03-16: Current `main` already uses clone-backed `.workspaces` lanes, so XY-141's linked-worktree issue description remains stale backlog context rather than a missing prerequisite for this subplan."
     ],
-    "last_updated": "2026-03-16T11:24:36Z",
+    "last_updated": "2026-03-16T15:21:10Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "The imported daemon pilot itself is now proven via XY-142 and XY-136 is Done, but this subplan cannot close until XY-143 resolves the remaining manual-attention status/comment mismatch exposed by that pilot.",
+      "current_gap": "No remaining daemon-supervision blocker; the pilot and its XY-143 reliability follow-up are both merged, so execution can move to XY-125.",
       "required_prerequisite": "Merged XY-134 (historical PUB-618)",
-      "active_lane": "x/maestro-xy-143",
+      "active_lane": null,
       "active_workspace": null,
-      "confirmed_main_head": "70f8b283933ea673f275ec62db3ea3e83f59ccb3",
+      "confirmed_main_head": "e407908fd8f361bf0e9b5ab56d6aedb6b9ba67fa",
       "pilot_tracker_issue": "XY-136",
       "pilot_tracker_issue_url": null,
       "pilot_seed_issue": "XY-142",
       "pilot_seed_issue_url": null,
       "pilot_runner_root": null,
-      "active_pr": "https://github.com/hack-ink/maestro/pull/5",
-      "active_commit": "d816dc72a1166f895f2ad0e6798e59726ceecff5",
-      "followup_issue": "XY-143",
+      "active_pr": null,
+      "active_commit": "e407908fd8f361bf0e9b5ab56d6aedb6b9ba67fa",
+      "followup_issue": null,
       "followup_issue_url": null,
       "open_docs_seed_issues": [],
       "stale_backlog_issue": "XY-141"

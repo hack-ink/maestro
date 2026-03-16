@@ -70,7 +70,7 @@
       {
         "id": "daemon-supervision-plan",
         "title": "Execute the daemon supervision subplan",
-        "status": "in_progress",
+        "status": "done",
         "objective": "Use the dedicated subplan to land daemon reconciliation and operator visibility before structural changes begin.",
         "inputs": [
           "docs/plans/2026-03-13_maestro-daemon-supervision.md"
@@ -88,7 +88,7 @@
       {
         "id": "structural-followups-plan",
         "title": "Execute the structural follow-ups subplan",
-        "status": "pending",
+        "status": "in_progress",
         "objective": "Use the dedicated subplan to stage claim policy, retry/backoff, reload semantics, and remove-SQLite work only after the earlier phases are proven.",
         "inputs": [
           "docs/plans/2026-03-13_maestro-structural-runtime-followups.md"
@@ -115,8 +115,8 @@
   },
   "state": {
     "phase": "executing",
-    "current_task_id": "daemon-supervision-plan",
-    "next_task_id": "daemon-supervision-plan",
+    "current_task_id": "structural-followups-plan",
+    "next_task_id": "structural-followups-plan",
     "blockers": [],
     "evidence": [
         "2026-03-13: The earlier combined self-bootstrap plan mixed PR-backed handoff, daemon supervision, and later structural changes in one contract.",
@@ -159,18 +159,20 @@
         "2026-03-16: Verified the current repo routing is `y/hackink`; the PUB-era helixbox evidence above remains historical provenance from the pre-fork lane, not the current source of execution authority.",
         "2026-03-16: The carried-forward hardening backlog in hackink now maps the completed early phases to XY-134 Done (historical PUB-618), XY-127 Done (historical PUB-611), XY-129 Done (historical PUB-613), and XY-139 Done (historical PUB-625).",
         "2026-03-16: Finished the imported authority cleanup on `main`: 8d299d0 realigned the split plans, 2e85cb7 fixed checked-in hackink pilot config/docs drift, 553cfac finished the carried-forward status docs seed, XY-137 was closed as a duplicate of XY-140, and XY-140 moved to Done.",
-        "2026-03-16: Fresh seed XY-142 was selected by Maestro, executed in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff; XY-136 is now Done, and the remaining daemon-supervision follow-up is XY-143."
+        "2026-03-16: Fresh seed XY-142 was selected by Maestro, executed in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff; XY-136 is now Done, and the remaining daemon-supervision follow-up is XY-143.",
+        "2026-03-16: PR #6 merged XY-142 and PR #7 merged XY-143; both Linear issues are now Done, so the daemon-supervision phase is complete and the next active phase is structural follow-ups starting at XY-125.",
+        "2026-03-16: XY-141 still sits in the project as stale imported backlog context, but current `main` already uses clone-backed `.workspaces` lanes and does not require XY-141 as a prerequisite for XY-125."
       ],
-      "last_updated": "2026-03-16T11:24:36Z",
+      "last_updated": "2026-03-16T15:21:10Z",
     "replan_reason": null,
     "context_snapshot": {
       "first_subplan": "docs/plans/2026-03-13_maestro-pr-backed-handoff.md",
       "program_shape": "Three subplans in strict order",
-      "active_subplan": "docs/plans/2026-03-13_maestro-daemon-supervision.md",
+      "active_subplan": "docs/plans/2026-03-13_maestro-structural-runtime-followups.md",
       "blocking_review_pr": null,
-      "blocking_followup_issue": "XY-143",
-      "next_validation_issue": "XY-143",
-      "active_lane": null,
+      "blocking_followup_issue": null,
+      "next_validation_issue": "XY-125",
+      "active_lane": "x/maestro-xy-125",
       "active_workspace": null,
       "tracker_project": "hackink/Maestro Pilot Ops Hardening",
       "imported_issue_map": {
@@ -181,8 +183,7 @@
         "stalled_run_followup": "XY-139"
       },
       "open_followups": [
-        "XY-141",
-        "XY-143"
+        "XY-141"
       ],
       "next_structural_issue_after_daemon_closeout": "XY-125"
     }
