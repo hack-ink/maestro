@@ -35,17 +35,17 @@ If `protocol probe` does not return `PROBE_OK`, stop there. The orchestrator loo
 For the recommended first deployment, keep the live local config at `tmp/maestro.toml` and point it back at this repository. If you need a checked-in template, copy `maestro.example.toml` first.
 
 ```text
-/path/to/maestro/
+/path/to/hack-ink/maestro/
   maestro.example.toml
   tmp/maestro.toml
 
-/path/to/maestro/
+/path/to/hack-ink/maestro/
   AGENTS.md
   WORKFLOW.md
 
-/path/to/maestro/.workspaces/
-  PUB-600/
-  PUB-601/
+/path/to/hack-ink/maestro/.workspaces/
+  XY-123/
+  XY-124/
 ```
 
 `maestro` resolves config in this order:
@@ -62,13 +62,13 @@ The local state is scoped by configured `id`, so reconciliation and cleanup oper
 
 ```toml
 id = "maestro"
-repo_root = "/absolute/path/to/helixbox/maestro"
-workspace_root = "/absolute/path/to/helixbox/maestro/.workspaces"
+repo_root = "/absolute/path/to/hack-ink/maestro"
+workspace_root = "/absolute/path/to/hack-ink/maestro/.workspaces"
 workflow_path = "WORKFLOW.md"
 
 [tracker]
-project_slug = "maestro-pilot-ops-hardening-8c4cd895b10d"
-api_key = "$HELIXBOX_LINEAR_API_KEY"
+project_slug = "maestro-pilot-ops-hardening-1a216b6d7100"
+api_key = "$LINEAR_API_KEY"
 
 [agent]
 transport = "stdio://"
@@ -83,7 +83,7 @@ Notes:
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
 - `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
-- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in helixbox Linear, whose current project slug is `maestro-pilot-ops-hardening-8c4cd895b10d`.
+- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear, whose current project slug is `maestro-pilot-ops-hardening-1a216b6d7100`.
 
 ## Target repository contract
 
@@ -184,8 +184,8 @@ Each issue gets a deterministic lane:
 Example:
 
 ```text
-branch  x/maestro-pub-600
-path    /absolute/path/to/helixbox/maestro/.workspaces/PUB-600
+branch  x/maestro-xy-123
+path    /absolute/path/to/hack-ink/maestro/.workspaces/XY-123
 ```
 
 Retries reuse the same workspace path.
@@ -210,8 +210,8 @@ Start with Linear:
 Then inspect the workspace mentioned in the comment:
 
 ```sh
-git -C /absolute/path/to/helixbox/maestro/.workspaces/PUB-600 status --short
-git -C /absolute/path/to/helixbox/maestro/.workspaces/PUB-600 log --oneline --decorate -5
+git -C /absolute/path/to/hack-ink/maestro/.workspaces/XY-123 status --short
+git -C /absolute/path/to/hack-ink/maestro/.workspaces/XY-123 log --oneline --decorate -5
 ```
 
 Before dropping to local storage internals, inspect the supported runtime surface:

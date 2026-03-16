@@ -91,7 +91,7 @@ impl ProjectTrackerConfig {
 		&self.project_slug
 	}
 
-	/// Tracker API key value or environment-variable reference like `$HELIXBOX_LINEAR_API_KEY`.
+	/// Tracker API key value or environment-variable reference like `$LINEAR_API_KEY`.
 	pub fn api_key(&self) -> &str {
 		&self.api_key
 	}
