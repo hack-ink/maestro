@@ -34,9 +34,10 @@ Realign `maestro` with the important ownership and runtime boundaries from upstr
 
 ## Execution State
 
-- Last Updated: 2026-03-12
-- Next Checkpoint: Task 6
-- Blockers: none in architecture. The next dry run depends only on a local `maestro.toml` whose `tracker.api_key` is set to either a literal Linear token or a `$ENV_VAR` reference.
+- Last Updated: 2026-03-16
+- Status: superseded on 2026-03-13 by the split-plan program at [2026-03-13_maestro-first-live-pilot-hardening.md](./2026-03-13_maestro-first-live-pilot-hardening.md) and its subplans.
+- Next Checkpoint: None in this file. Do not resume from Task 6 here.
+- Blockers: none. Remaining execution authority now lives in the split plans aligned to the current `hackink` `XY-*` backlog.
 
 ## Decision Notes
 
@@ -273,11 +274,11 @@ Main executor
 
 **Status**
 
-pending
+superseded
 
 **Outcome**
 
-One carefully chosen `maestro` issue has been exercised through the new ownership model, first in `dry-run`, then in one live run, with enough evidence captured to decide whether the next target repo can be onboarded safely.
+Execution authority for the first live self-dogfood pilot moved into the split plan set on 2026-03-13. Treat this task as historical context only and continue from the split-plan files instead of reopening this monolithic plan.
 
 **Files**
 

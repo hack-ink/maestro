@@ -5,13 +5,13 @@
     "plan_id": "maestro-daemon-supervision-2026-03-13",
     "goal": "Make Maestro capable of supervising its own development through a daemon-driven, reconciled, and operator-visible loop after PR-backed handoff exists.",
     "success_criteria": [
-      "PUB-611 is merged and active runs reconcile correctly on each daemon tick.",
-      "PUB-613 is merged and operators can inspect current run state without ad hoc SQL or source reading.",
+      "XY-127 is merged and active runs reconcile correctly on each daemon tick.",
+      "XY-129 is merged and operators can inspect current run state without ad hoc SQL or source reading.",
       "One fresh daemon-driven live lane completes with PR-backed handoff, clean reconciliation, and usable operator visibility.",
       "Any remaining manual intervention points are written down as explicit follow-up gaps rather than left implicit."
     ],
     "constraints": [
-      "Assume PUB-618 is already merged before execution begins.",
+      "Assume XY-134 is already merged before execution begins.",
       "Keep Linear as the durable workflow tracker.",
       "Do not introduce SQLite as a durable operator store.",
       "Tune stall and liveness logic from app-server schema, live telemetry, and upstream implementation evidence, not local timing guesses alone.",
@@ -21,13 +21,13 @@
       "config_path": "./tmp/maestro.toml",
       "daemon_command": "cargo run -- daemon --poll-interval-s 5 --config ./tmp/maestro.toml",
       "execution_project": "Maestro Pilot Ops Hardening",
-      "observability_issue": "PUB-613",
+      "observability_issue": "XY-129",
       "preflight_commands": [
         "cargo run -- protocol probe",
         "cargo run -- run --once --dry-run --config ./tmp/maestro.toml"
       ],
-      "prerequisite_issue": "PUB-618",
-      "primary_issue": "PUB-611",
+      "prerequisite_issue": "XY-134",
+      "primary_issue": "XY-127",
       "verification_commands": [
         "cargo make fmt-check",
         "cargo make lint",
@@ -41,14 +41,14 @@
         "status": "done",
         "objective": "Prevent daemon supervision work from validating against a stale manual review contract.",
         "inputs": [
-          "PUB-618 outcome",
+          "XY-134 outcome",
           "Current runtime docs and main branch state"
         ],
         "outputs": [
           "Confirmed prerequisite that successful runs now yield PR-backed In Review handoff"
         ],
         "verification": [
-          "Read the merged PUB-618 outcome and updated runtime docs"
+          "Read the merged XY-134 outcome and updated runtime docs"
         ],
         "depends_on": []
       },
@@ -58,7 +58,7 @@
         "status": "done",
         "objective": "Reduce manual cleanup by making each daemon tick capable of recognizing stalled or non-active lanes and converging local state.",
         "inputs": [
-          "PUB-611",
+          "XY-127 (historical PUB-611)",
           "docs/spec/system_maestro_runtime.md",
           "docs/spec/system_app_server_contract.md",
           "Relevant Codex app-server implementation evidence for waiting and terminal semantics"
@@ -82,9 +82,9 @@
         "status": "done",
         "objective": "Expose current run state through structured logs and a small status surface so daemon behavior can be supervised directly.",
         "inputs": [
-          "PUB-613",
+          "XY-129 (historical PUB-613)",
           "Protocol events already recorded by the runtime",
-          "Merged PUB-611 behavior"
+          "Merged XY-127 behavior"
         ],
         "outputs": [
           "Structured runtime logs with stable identifiers",
@@ -107,7 +107,7 @@
         "status": "in_progress",
         "objective": "Prove that Maestro can supervise a bounded internal issue through the daemon path once reconciliation and visibility exist.",
         "inputs": [
-          "Merged PUB-611 and PUB-613",
+          "Merged XY-127 and XY-129",
           "One fresh bounded Todo issue in the hardening project",
           "./tmp/maestro.toml"
         ],
@@ -129,8 +129,8 @@
     "replan_policy": {
       "owner": "plan-writing",
       "triggers": [
-        "PUB-611 reveals that stall semantics depend on upstream behavior not yet inspected",
-        "PUB-613 needs to be split before a minimal status surface can land cleanly",
+        "XY-127 reveals that stall semantics depend on upstream behavior not yet inspected",
+        "XY-129 needs to be split before a minimal status surface can land cleanly",
         "The first daemon pilot shows that a smaller child issue is required before retry work begins"
       ]
     }
@@ -163,25 +163,34 @@
       "2026-03-14: Implemented PUB-625 on branch x/maestro-pub-625 in commit e95b47249f877762a7f17285c8d0d35a08b1e249, verified with cargo make lint-fix/fmt/lint/test, opened PR #12 at https://github.com/helixbox/maestro/pull/12, moved PUB-625 to In Review, and requested `@codex review` after a focused self-review.",
       "2026-03-14: PR #12 merged by fast-forward push; `origin/main` now points at e95b47249f877762a7f17285c8d0d35a08b1e249 with the reviewed `delivery/1` commit message preserved, and Linear issue PUB-625 is Done.",
       "2026-03-14: Refreshed `tmp/maestro-runner` to origin/main at e95b47249f877762a7f17285c8d0d35a08b1e249, retained PUB-623 for forensics under `maestro:needs-attention`, opened fresh seed issue PUB-626, reran `cargo run -- protocol probe`, and confirmed `cargo run -- run --once --dry-run --config ./tmp/maestro.toml` now selects PUB-626 on branch x/maestro-pub-626.",
-      "2026-03-14: Started the rerun daemon pilot from `tmp/maestro-runner` with `cargo run -- daemon --poll-interval-s 5 --config ./tmp/maestro.toml`; `maestro status --json` shows active run `pub-626-attempt-1-1773496583`, Linear issue PUB-626 moved to In Progress with a start comment, and the runner workspace now contains README.md plus docs/guide/pilot.md edits while the lane remains active."
+      "2026-03-14: Started the rerun daemon pilot from `tmp/maestro-runner` with `cargo run -- daemon --poll-interval-s 5 --config ./tmp/maestro.toml`; `maestro status --json` shows active run `pub-626-attempt-1-1773496583`, Linear issue PUB-626 moved to In Progress with a start comment, and the runner workspace now contains README.md plus docs/guide/pilot.md edits while the lane remains active.",
+      "2026-03-16: Verified the current repo routing is `y/hackink`; the PUB-era helixbox evidence above is retained as historical provenance only and no longer describes the active tracker authority.",
+      "2026-03-16: The imported prerequisite set is satisfied in hackink with XY-134 Done (historical PUB-618), XY-127 Done (historical PUB-611), XY-129 Done (historical PUB-613), and XY-139 Done (historical PUB-625).",
+      "2026-03-16: The carried-forward daemon pilot itself remains open on XY-136, while XY-137 is still Todo with `maestro:needs-attention` and XY-140 is still In Progress with `maestro:needs-attention`.",
+      "2026-03-16: Current `main` already uses clone-backed `.workspaces` lanes, so XY-141's linked-worktree issue description is stale backlog context rather than a missing prerequisite for this subplan."
     ],
-    "last_updated": "2026-03-14T14:00:12Z",
+    "last_updated": "2026-03-16T08:21:28Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "The post-PUB-625 daemon pilot is live on PUB-626 and still running; the next checkpoint is successful review handoff or a new failure signal.",
-      "required_prerequisite": "Merged PUB-618",
-      "active_lane": "x/maestro-pub-626",
-      "active_workspace": "tmp/maestro-runner/.workspaces/PUB-626",
-      "confirmed_main_head": "e95b47249f877762a7f17285c8d0d35a08b1e249",
-      "pilot_tracker_issue": "PUB-622",
-      "pilot_tracker_issue_url": "https://linear.app/helixbox/issue/PUB-622/run-a-fresh-daemon-driven-maestro-self-supervision-pilot-after-pub-611",
-      "pilot_seed_issue": "PUB-626",
-      "pilot_seed_issue_url": "https://linear.app/helixbox/issue/PUB-626/clarify-that-maestro-status-limit-only-caps-recent-runs-not-active",
-      "pilot_runner_root": "tmp/maestro-runner",
+      "current_gap": "The daemon pilot authority now lives in hackink on XY-136. This subplan cannot close until that imported pilot is reconciled, the overlapping docs-seed issues XY-137 and XY-140 are consolidated, and checked-in pilot config/docs stop pointing at old helixbox slugs.",
+      "required_prerequisite": "Merged XY-134 (historical PUB-618)",
+      "active_lane": null,
+      "active_workspace": null,
+      "confirmed_main_head": "70f8b283933ea673f275ec62db3ea3e83f59ccb3",
+      "pilot_tracker_issue": "XY-136",
+      "pilot_tracker_issue_url": null,
+      "pilot_seed_issue": null,
+      "pilot_seed_issue_url": null,
+      "pilot_runner_root": null,
       "active_pr": null,
-      "active_commit": "e95b47249f877762a7f17285c8d0d35a08b1e249",
-      "followup_issue": null,
-      "followup_issue_url": null
+      "active_commit": "70f8b283933ea673f275ec62db3ea3e83f59ccb3",
+      "followup_issue": "XY-139",
+      "followup_issue_url": null,
+      "open_docs_seed_issues": [
+        "XY-137",
+        "XY-140"
+      ],
+      "stale_backlog_issue": "XY-141"
     }
   }
 }

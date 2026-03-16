@@ -52,7 +52,7 @@
         "id": "pr-backed-handoff-plan",
         "title": "Execute the PR-backed handoff subplan",
         "status": "done",
-        "objective": "Use the dedicated subplan to implement and land PUB-618 before later phases start.",
+        "objective": "Use the dedicated subplan to land the PR-backed handoff phase before later phases start.",
         "inputs": [
           "docs/plans/2026-03-13_maestro-pr-backed-handoff.md"
         ],
@@ -89,12 +89,12 @@
         "id": "structural-followups-plan",
         "title": "Execute the structural follow-ups subplan",
         "status": "pending",
-        "objective": "Use the dedicated subplan to stage retry/backoff and remove-SQLite work only after the earlier phases are proven.",
+        "objective": "Use the dedicated subplan to stage claim policy, retry/backoff, reload semantics, and remove-SQLite work only after the earlier phases are proven.",
         "inputs": [
           "docs/plans/2026-03-13_maestro-structural-runtime-followups.md"
         ],
         "outputs": [
-          "A sequenced structural backlog that preserves retry before remove-SQLite"
+          "A sequenced structural backlog that preserves claim policy before retry/backoff, keeps reload semantics explicit, and leaves remove-SQLite last"
         ],
         "verification": [
           "Subplan completion criteria are met"
@@ -155,19 +155,36 @@
         "2026-03-14: Implemented PUB-625 on branch x/maestro-pub-625 in commit e95b47249f877762a7f17285c8d0d35a08b1e249, verified with cargo make lint-fix/fmt/lint/test, opened PR #12 at https://github.com/helixbox/maestro/pull/12, moved PUB-625 to In Review, and requested `@codex review` after a focused self-review.",
         "2026-03-14: PR #12 merged by fast-forward push; `origin/main` now points at e95b47249f877762a7f17285c8d0d35a08b1e249 with the reviewed `delivery/1` commit message preserved, and daemon supervision can resume.",
         "2026-03-14: Replaced the stale failed seed lane with fresh issue PUB-626, refreshed `tmp/maestro-runner` to origin/main, reran `cargo run -- protocol probe` plus `cargo run -- run --once --dry-run --config ./tmp/maestro.toml`, and confirmed the daemon pilot now targets x/maestro-pub-626.",
-        "2026-03-14: Started the rerun daemon pilot on PUB-626; the issue is now In Progress with a start comment, `maestro status --json` reports active run `pub-626-attempt-1-1773496583`, and the runner workspace contains the expected README plus pilot-guide edits while the live lane is still running."
+        "2026-03-14: Started the rerun daemon pilot on PUB-626; the issue is now In Progress with a start comment, `maestro status --json` reports active run `pub-626-attempt-1-1773496583`, and the runner workspace contains the expected README plus pilot-guide edits while the live lane is still running.",
+        "2026-03-16: Verified the current repo routing is `y/hackink`; the PUB-era helixbox evidence above remains historical provenance from the pre-fork lane, not the current source of execution authority.",
+        "2026-03-16: The carried-forward hardening backlog in hackink now maps the completed early phases to XY-134 Done (historical PUB-618), XY-127 Done (historical PUB-611), XY-129 Done (historical PUB-613), and XY-139 Done (historical PUB-625).",
+        "2026-03-16: The only still-active phase remains daemon supervision because XY-136 is still In Progress, XY-137 and XY-140 still carry `maestro:needs-attention` follow-up state, and structural follow-ups stay intentionally pending behind that cleanup."
       ],
-      "last_updated": "2026-03-14T14:00:12Z",
+      "last_updated": "2026-03-16T08:21:28Z",
     "replan_reason": null,
     "context_snapshot": {
       "first_subplan": "docs/plans/2026-03-13_maestro-pr-backed-handoff.md",
       "program_shape": "Three subplans in strict order",
       "active_subplan": "docs/plans/2026-03-13_maestro-daemon-supervision.md",
       "blocking_review_pr": null,
-      "blocking_followup_issue": null,
-      "next_validation_issue": "PUB-626",
-      "active_lane": "x/maestro-pub-626",
-      "active_workspace": "tmp/maestro-runner/.workspaces/PUB-626"
+      "blocking_followup_issue": "XY-136",
+      "next_validation_issue": "XY-136",
+      "active_lane": null,
+      "active_workspace": null,
+      "tracker_project": "hackink/Maestro Pilot Ops Hardening",
+      "imported_issue_map": {
+        "pr_handoff": "XY-134",
+        "tick_reconciliation": "XY-127",
+        "operator_status": "XY-129",
+        "pilot": "XY-136",
+        "stalled_run_followup": "XY-139"
+      },
+      "open_followups": [
+        "XY-137",
+        "XY-140",
+        "XY-141"
+      ],
+      "next_structural_issue_after_daemon_closeout": "XY-125"
     }
   }
 }
