@@ -808,7 +808,7 @@ where
 			return Ok(None);
 		};
 
-		if !is_issue_eligible(&refreshed_issue, workflow, state_store)? {
+		if !issue_passes_dispatch_policy(&refreshed_issue, workflow) {
 			if !dry_run && is_terminal_issue(&refreshed_issue, workflow) {
 				cleanup_terminal_workspace(
 					state_store,
@@ -1316,26 +1316,34 @@ fn validate_project_contract(
 	Ok(())
 }
 
+fn issue_passes_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
+	let tracker_policy = workflow.frontmatter().tracker();
+
+	if tracker_policy.terminal_states().iter().any(|state| state == &issue.state.name) {
+		return false;
+	}
+	if !tracker_policy.startable_states().iter().any(|state| state == &issue.state.name) {
+		return false;
+	}
+	if issue.has_label(tracker_policy.opt_out_label()) {
+		return false;
+	}
+	if issue.has_label(tracker_policy.needs_attention_label()) {
+		return false;
+	}
+	if !todo_blocker_rule_passes(issue, workflow) {
+		return false;
+	}
+
+	true
+}
+
 fn is_issue_eligible(
 	issue: &TrackerIssue,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 ) -> crate::prelude::Result<bool> {
-	let tracker_policy = workflow.frontmatter().tracker();
-
-	if tracker_policy.terminal_states().iter().any(|state| state == &issue.state.name) {
-		return Ok(false);
-	}
-	if !tracker_policy.startable_states().iter().any(|state| state == &issue.state.name) {
-		return Ok(false);
-	}
-	if issue.has_label(tracker_policy.opt_out_label()) {
-		return Ok(false);
-	}
-	if issue.has_label(tracker_policy.needs_attention_label()) {
-		return Ok(false);
-	}
-	if !todo_blocker_rule_passes(issue, workflow) {
+	if !issue_passes_dispatch_policy(issue, workflow) {
 		return Ok(false);
 	}
 
@@ -2254,6 +2262,26 @@ read_first = [{read_first}]
 		assert!(
 			!orchestrator::is_issue_eligible(&eligible_issue, &workflow, &state_store)
 				.expect("eligibility should succeed")
+		);
+	}
+
+	#[test]
+	fn claimed_issue_still_passes_post_claim_dispatch_policy() {
+		let (_, _, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("Todo", &[]);
+
+		state_store
+			.try_acquire_lease("pubfi", &issue.id, "run-1")
+			.expect("lease acquisition should succeed");
+
+		assert!(
+			orchestrator::issue_passes_dispatch_policy(&issue, &workflow),
+			"post-claim policy should ignore the caller's own lease"
+		);
+		assert!(
+			!orchestrator::is_issue_eligible(&issue, &workflow, &state_store)
+				.expect("pre-claim eligibility should still reject leased issues")
 		);
 	}
 
