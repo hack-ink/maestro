@@ -69,6 +69,10 @@ query IssuesForProject($projectSlug: String!, $after: String) {
             }
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
     pageInfo {
@@ -126,11 +130,40 @@ query IssuesByIds($issueIds: [ID!], $after: String) {
             }
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
     }
     pageInfo {
       hasNextPage
       endCursor
+    }
+  }
+}
+"#;
+const ISSUE_BLOCKERS_QUERY: &str = r#"
+query IssueBlockers($issueId: String!, $after: String) {
+  issues(filter: { id: { eq: $issueId } }, first: 1) {
+    nodes {
+      inverseRelations(first: 50, after: $after) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              id
+              name
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
     }
   }
 }
@@ -200,22 +233,63 @@ impl LinearClient {
 				self.post::<_, IssueConnectionData>(query, &make_variables(after.clone()))?;
 			let connection = data.issues;
 
-			issues.extend(connection.nodes.into_iter().map(map_issue));
+			for issue in connection.nodes {
+				let blockers = self.resolve_issue_blockers(&issue)?;
+
+				issues.push(map_issue(issue, blockers));
+			}
 
 			if !connection.page_info.has_next_page {
 				break;
 			}
 
-			after = connection.page_info.end_cursor;
-
-			if after.is_none() {
-				eyre::bail!(
-					"Linear pagination reported `hasNextPage = true` without an `endCursor`."
-				);
-			}
+			after = Some(require_end_cursor(
+				connection.page_info,
+				"Linear issue pagination reported `hasNextPage = true` without an `endCursor`.",
+			)?);
 		}
 
 		Ok(issues)
+	}
+
+	fn resolve_issue_blockers(&self, issue: &LinearIssue) -> Result<Vec<TrackerIssueBlocker>> {
+		let mut blockers = map_blockers(&issue.inverse_relations.nodes);
+
+		if issue.state.name != "Todo" || !issue.inverse_relations.page_info.has_next_page {
+			return Ok(blockers);
+		}
+
+		let mut after = Some(require_end_cursor(
+			issue.inverse_relations.page_info.clone(),
+			"Linear blocker pagination reported `hasNextPage = true` without an `endCursor`.",
+		)?);
+
+		while let Some(cursor) = after {
+			let data = self.post::<_, IssueBlockersData>(
+				ISSUE_BLOCKERS_QUERY,
+				&IssueBlockersVariables { issue_id: issue.id.clone(), after: Some(cursor) },
+			)?;
+			let Some(issue_page) = data.issues.nodes.into_iter().next() else {
+				eyre::bail!(
+					"Linear blocker pagination did not return the requested issue `{}`.",
+					issue.id
+				);
+			};
+			let blocker_page = issue_page.inverse_relations;
+
+			blockers.extend(map_blockers(&blocker_page.nodes));
+
+			after = if blocker_page.page_info.has_next_page {
+				Some(require_end_cursor(
+					blocker_page.page_info,
+					"Linear blocker pagination reported `hasNextPage = true` without an `endCursor`.",
+				)?)
+			} else {
+				None
+			};
+		}
+
+		Ok(blockers)
 	}
 }
 impl IssueTracker for LinearClient {
@@ -355,9 +429,22 @@ struct IssuesByIdsVariables {
 	after: Option<String>,
 }
 
+#[derive(Serialize)]
+struct IssueBlockersVariables {
+	#[serde(rename = "issueId")]
+	issue_id: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	after: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct IssueConnectionData {
 	issues: IssueConnection,
+}
+
+#[derive(Deserialize)]
+struct IssueBlockersData {
+	issues: IssueBlockerConnection,
 }
 
 #[derive(Deserialize)]
@@ -368,6 +455,17 @@ struct IssueConnection {
 }
 
 #[derive(Deserialize)]
+struct IssueBlockerConnection {
+	nodes: Vec<LinearIssueBlockerPage>,
+}
+
+#[derive(Deserialize)]
+struct LinearIssueBlockerPage {
+	#[serde(rename = "inverseRelations")]
+	inverse_relations: IssueRelationConnection,
+}
+
+#[derive(Clone, Deserialize)]
 struct PageInfo {
 	#[serde(rename = "hasNextPage")]
 	has_next_page: bool,
@@ -412,6 +510,8 @@ struct LabelConnection {
 #[derive(Deserialize)]
 struct IssueRelationConnection {
 	nodes: Vec<LinearIssueRelation>,
+	#[serde(rename = "pageInfo")]
+	page_info: PageInfo,
 }
 
 #[derive(Deserialize)]
@@ -483,7 +583,26 @@ struct CommentCreateData {
 	comment_create: MutationSuccess,
 }
 
-fn map_issue(issue: LinearIssue) -> TrackerIssue {
+fn require_end_cursor(page_info: PageInfo, message: &str) -> Result<String> {
+	page_info.end_cursor.ok_or_else(|| eyre::eyre!(message.to_owned()))
+}
+
+fn map_blockers(relations: &[LinearIssueRelation]) -> Vec<TrackerIssueBlocker> {
+	relations
+		.iter()
+		.filter(|relation| relation.relation_type == "blocks")
+		.map(|relation| TrackerIssueBlocker {
+			id: relation.issue.id.clone(),
+			identifier: relation.issue.identifier.clone(),
+			state: TrackerState {
+				id: relation.issue.state.id.clone(),
+				name: relation.issue.state.name.clone(),
+			},
+		})
+		.collect()
+}
+
+fn map_issue(issue: LinearIssue, blockers: Vec<TrackerIssueBlocker>) -> TrackerIssue {
 	TrackerIssue {
 		id: issue.id,
 		identifier: issue.identifier,
@@ -516,20 +635,7 @@ fn map_issue(issue: LinearIssue) -> TrackerIssue {
 			.into_iter()
 			.map(|label| TrackerLabel { id: label.id, name: label.name })
 			.collect(),
-		blockers: issue
-			.inverse_relations
-			.nodes
-			.into_iter()
-			.filter(|relation| relation.relation_type == "blocks")
-			.map(|relation| TrackerIssueBlocker {
-				id: relation.issue.id,
-				identifier: relation.issue.identifier,
-				state: TrackerState {
-					id: relation.issue.state.id,
-					name: relation.issue.state.name,
-				},
-			})
-			.collect(),
+		blockers,
 	}
 }
 
@@ -537,7 +643,7 @@ fn map_issue(issue: LinearIssue) -> TrackerIssue {
 mod tests {
 	use crate::tracker::linear::{
 		IssueRelationConnection, LabelConnection, LinearIssue, LinearIssueRelation, LinearLabel,
-		LinearRelatedIssue, LinearState, LinearTeam, StateConnection,
+		LinearRelatedIssue, LinearState, LinearTeam, PageInfo, StateConnection,
 	};
 
 	#[test]
@@ -584,14 +690,47 @@ mod tests {
 						},
 					},
 				}],
+				page_info: PageInfo { has_next_page: false, end_cursor: None },
 			},
 		};
-		let mapped = super::map_issue(issue);
+		let blockers = super::map_blockers(&issue.inverse_relations.nodes);
+		let mapped = super::map_issue(issue, blockers);
 
 		assert_eq!(mapped.priority, Some(2));
 		assert_eq!(mapped.created_at, "2026-03-13T04:16:17.133Z");
 		assert_eq!(mapped.blockers.len(), 1);
 		assert_eq!(mapped.blockers[0].identifier, "PUB-102");
 		assert_eq!(mapped.blockers[0].state.name, "In Progress");
+	}
+
+	#[test]
+	fn map_blockers_filters_non_blocking_relations() {
+		let blockers = super::map_blockers(&[
+			LinearIssueRelation {
+				relation_type: String::from("blocks"),
+				issue: LinearRelatedIssue {
+					id: String::from("issue-2"),
+					identifier: String::from("PUB-102"),
+					state: LinearState {
+						id: String::from("state-progress"),
+						name: String::from("In Progress"),
+					},
+				},
+			},
+			LinearIssueRelation {
+				relation_type: String::from("related"),
+				issue: LinearRelatedIssue {
+					id: String::from("issue-3"),
+					identifier: String::from("PUB-103"),
+					state: LinearState {
+						id: String::from("state-done"),
+						name: String::from("Done"),
+					},
+				},
+			},
+		]);
+
+		assert_eq!(blockers.len(), 1);
+		assert_eq!(blockers[0].identifier, "PUB-102");
 	}
 }

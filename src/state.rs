@@ -69,6 +69,34 @@ impl StateStore {
 		Ok(())
 	}
 
+	/// Try to acquire the project's single active dispatch slot for one issue.
+	pub fn try_acquire_lease(
+		&self,
+		project_id: &str,
+		issue_id: &str,
+		run_id: &str,
+	) -> crate::prelude::Result<bool> {
+		let updated = self.connection.execute(
+			"
+			INSERT INTO issue_leases (project_id, issue_id, run_id)
+			SELECT ?1, ?2, ?3
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM issue_leases
+				WHERE project_id = ?1
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM issue_leases
+				WHERE issue_id = ?2
+			)
+			",
+			rusqlite::params![project_id, issue_id, run_id],
+		)?;
+
+		Ok(updated == 1)
+	}
+
 	/// Read the active lease for one issue.
 	pub fn lease_for_issue(&self, issue_id: &str) -> crate::prelude::Result<Option<IssueLease>> {
 		let lease = self
@@ -686,6 +714,32 @@ mod tests {
 		store.clear_lease("PUB-101").expect("lease should be deleted");
 
 		assert!(store.lease_for_issue("PUB-101").expect("lease lookup should succeed").is_none());
+	}
+
+	#[test]
+	fn tries_to_acquire_single_project_dispatch_slot() {
+		let store = StateStore::open_in_memory().expect("in-memory state store should open");
+
+		assert!(
+			store
+				.try_acquire_lease("pubfi", "PUB-101", "run-1")
+				.expect("first lease acquisition should succeed")
+		);
+		assert!(
+			!store
+				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.expect("second lease acquisition should be rejected")
+		);
+		assert!(
+			!store
+				.try_acquire_lease("pubfi", "PUB-101", "run-3")
+				.expect("duplicate issue acquisition should be rejected")
+		);
+		assert!(
+			store
+				.try_acquire_lease("other", "PUB-201", "run-4")
+				.expect("other project should still acquire its own slot")
+		);
 	}
 
 	#[test]

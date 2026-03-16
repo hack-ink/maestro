@@ -786,7 +786,21 @@ where
 
 	let attempt_number = state_store.next_attempt_number(&issue.id)?;
 	let run_id = build_run_id(&issue.identifier, attempt_number)?;
-	let workspace = workspace_manager.ensure_workspace(&issue.identifier, dry_run)?;
+
+	if !dry_run && !state_store.try_acquire_lease(project.id(), &issue.id, &run_id)? {
+		return Ok(None);
+	}
+
+	let workspace = match workspace_manager.ensure_workspace(&issue.identifier, dry_run) {
+		Ok(workspace) => workspace,
+		Err(error) => {
+			if !dry_run {
+				state_store.clear_lease(&issue.id)?;
+			}
+
+			return Err(error);
+		},
+	};
 
 	if !dry_run {
 		state_store.upsert_workspace(
@@ -798,17 +812,25 @@ where
 	}
 
 	let Some(issue) = refresh_issue(tracker, &issue.id)? else {
+		if !dry_run {
+			state_store.clear_lease(&issue.id)?;
+		}
+
 		return Ok(None);
 	};
 
 	if !is_issue_eligible(&issue, workflow, state_store)? {
-		if !dry_run && is_terminal_issue(&issue, workflow) {
-			cleanup_terminal_workspace(
-				state_store,
-				&workspace_manager,
-				&issue.id,
-				&workspace.path,
-			)?;
+		if !dry_run {
+			state_store.clear_lease(&issue.id)?;
+
+			if is_terminal_issue(&issue, workflow) {
+				cleanup_terminal_workspace(
+					state_store,
+					&workspace_manager,
+					&issue.id,
+					&workspace.path,
+				)?;
+			}
 		}
 
 		return Ok(None);
@@ -953,7 +975,6 @@ where
 		"Starting issue run."
 	);
 
-	state_store.upsert_lease(project.id(), &issue_run.issue.id, &issue_run.run_id)?;
 	state_store.upsert_workspace(
 		project.id(),
 		&issue_run.issue.id,
