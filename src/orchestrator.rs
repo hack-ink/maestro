@@ -786,57 +786,64 @@ where
 
 	let attempt_number = state_store.next_attempt_number(&issue.id)?;
 	let run_id = build_run_id(&issue.identifier, attempt_number)?;
+	let lease_issue_id = issue.id.clone();
 
 	if !dry_run && !state_store.try_acquire_lease(project.id(), &issue.id, &run_id)? {
 		return Ok(None);
 	}
 
-	let workspace = match workspace_manager.ensure_workspace(&issue.identifier, dry_run) {
-		Ok(workspace) => workspace,
+	let issue_run = match (|| -> crate::prelude::Result<Option<IssueRunPlan>> {
+		let workspace = workspace_manager.ensure_workspace(&issue.identifier, dry_run)?;
+
+		if !dry_run {
+			state_store.upsert_workspace(
+				project.id(),
+				&lease_issue_id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)?;
+		}
+
+		let Some(refreshed_issue) = refresh_issue(tracker, &lease_issue_id)? else {
+			return Ok(None);
+		};
+
+		if !is_issue_eligible(&refreshed_issue, workflow, state_store)? {
+			if !dry_run && is_terminal_issue(&refreshed_issue, workflow) {
+				cleanup_terminal_workspace(
+					state_store,
+					&workspace_manager,
+					&lease_issue_id,
+					&workspace.path,
+				)?;
+			}
+
+			return Ok(None);
+		}
+
+		Ok(Some(IssueRunPlan {
+			issue: refreshed_issue,
+			workspace,
+			attempt_number,
+			run_id: run_id.clone(),
+		}))
+	})() {
+		Ok(Some(issue_run)) => issue_run,
+		Ok(None) => {
+			if !dry_run {
+				state_store.clear_lease(&lease_issue_id)?;
+			}
+
+			return Ok(None);
+		},
 		Err(error) => {
 			if !dry_run {
-				state_store.clear_lease(&issue.id)?;
+				state_store.clear_lease(&lease_issue_id)?;
 			}
 
 			return Err(error);
 		},
 	};
-
-	if !dry_run {
-		state_store.upsert_workspace(
-			project.id(),
-			&issue.id,
-			&workspace.branch_name,
-			&workspace.path.display().to_string(),
-		)?;
-	}
-
-	let Some(issue) = refresh_issue(tracker, &issue.id)? else {
-		if !dry_run {
-			state_store.clear_lease(&issue.id)?;
-		}
-
-		return Ok(None);
-	};
-
-	if !is_issue_eligible(&issue, workflow, state_store)? {
-		if !dry_run {
-			state_store.clear_lease(&issue.id)?;
-
-			if is_terminal_issue(&issue, workflow) {
-				cleanup_terminal_workspace(
-					state_store,
-					&workspace_manager,
-					&issue.id,
-					&workspace.path,
-				)?;
-			}
-		}
-
-		return Ok(None);
-	}
-
-	let issue_run = IssueRunPlan { issue, workspace, attempt_number, run_id };
 
 	if dry_run {
 		return Ok(Some(RunSummary {
@@ -1848,6 +1855,7 @@ mod tests {
 		listed_issues: Vec<TrackerIssue>,
 		project_exists: bool,
 		refresh_snapshots: RefCell<Vec<Vec<TrackerIssue>>>,
+		refresh_error: RefCell<Option<String>>,
 		comments: RefCell<Vec<String>>,
 		state_updates: RefCell<Vec<(String, String)>>,
 		label_updates: RefCell<Vec<(String, Vec<String>)>>,
@@ -1873,10 +1881,23 @@ mod tests {
 				listed_issues,
 				project_exists,
 				refresh_snapshots: RefCell::new(refresh_snapshots),
+				refresh_error: RefCell::new(None),
 				comments: RefCell::new(Vec::new()),
 				state_updates: RefCell::new(Vec::new()),
 				label_updates: RefCell::new(Vec::new()),
 			}
+		}
+
+		fn with_refresh_error(listed_issues: Vec<TrackerIssue>, message: &str) -> Self {
+			let tracker = Self::with_refresh_snapshots_and_project(
+				listed_issues.clone(),
+				vec![listed_issues],
+				true,
+			);
+
+			*tracker.refresh_error.borrow_mut() = Some(message.to_owned());
+
+			tracker
 		}
 	}
 	impl IssueTracker for FakeTracker {
@@ -1893,6 +1914,10 @@ mod tests {
 		}
 
 		fn refresh_issues(&self, issue_ids: &[String]) -> Result<Vec<TrackerIssue>> {
+			if let Some(message) = self.refresh_error.borrow_mut().take() {
+				return Err(Report::msg(message));
+			}
+
 			let snapshot = {
 				let mut refresh_snapshots = self.refresh_snapshots.borrow_mut();
 
@@ -3217,5 +3242,30 @@ read_first = [{read_first}]
 				.is_some()
 		);
 		assert!(tracker.comments.borrow().is_empty());
+	}
+
+	#[test]
+	fn live_run_clears_claimed_lease_when_refresh_fails_after_workspace_prepare() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let listed_issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_error(
+			vec![listed_issue.clone()],
+			"transient refresh failure",
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let error =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
+				.expect_err("run once should propagate refresh failure");
+
+		assert!(
+			error.to_string().contains("transient refresh failure"),
+			"error should surface the refresh failure"
+		);
+		assert!(
+			state_store
+				.lease_for_issue(&listed_issue.id)
+				.expect("lease lookup should work")
+				.is_none()
+		);
 	}
 }
