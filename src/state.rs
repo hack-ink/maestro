@@ -182,6 +182,22 @@ impl StateStore {
 		Ok(next_attempt)
 	}
 
+	/// Count failed attempts recorded for one issue.
+	pub fn failed_attempt_count(&self, issue_id: &str) -> crate::prelude::Result<i64> {
+		let failed_attempts = self.connection.query_row(
+			"
+			SELECT COUNT(*)
+			FROM run_attempts
+			WHERE issue_id = ?1
+				AND status = 'failed'
+			",
+			rusqlite::params![issue_id],
+			|row| row.get(0),
+		)?;
+
+		Ok(failed_attempts)
+	}
+
 	/// Attach the active thread identifier to a run attempt.
 	pub fn update_run_thread(&self, run_id: &str, thread_id: &str) -> crate::prelude::Result<()> {
 		self.connection.execute(
@@ -765,6 +781,7 @@ mod tests {
 		assert_eq!(run_attempt.thread_id(), Some("thread-1"));
 		assert_eq!(store.event_count("run-1").expect("event count should succeed"), 1);
 		assert_eq!(store.next_attempt_number("PUB-101").expect("next attempt should load"), 2);
+		assert_eq!(store.failed_attempt_count("PUB-101").expect("failed count should load"), 0);
 
 		store.update_run_status("run-1", "interrupted").expect("status should update");
 
@@ -780,6 +797,25 @@ mod tests {
 				.expect("last activity lookup should succeed")
 				.is_some()
 		);
+	}
+
+	#[test]
+	fn counts_only_failed_attempts_per_issue() {
+		let store = StateStore::open_in_memory().expect("in-memory state store should open");
+
+		store
+			.record_run_attempt("run-1", "PUB-101", 1, "succeeded")
+			.expect("first run should record");
+		store
+			.record_run_attempt("run-2", "PUB-101", 2, "failed")
+			.expect("second run should record");
+		store.record_run_attempt("run-3", "PUB-101", 3, "failed").expect("third run should record");
+		store
+			.record_run_attempt("run-4", "PUB-102", 1, "failed")
+			.expect("other issue run should record");
+
+		assert_eq!(store.failed_attempt_count("PUB-101").expect("failed count should load"), 2);
+		assert_eq!(store.failed_attempt_count("PUB-102").expect("failed count should load"), 1);
 	}
 
 	#[test]

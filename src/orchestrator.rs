@@ -645,18 +645,23 @@ where
 		return Ok(());
 	}
 
-	let kind = if exit_status.success() {
-		RetryKind::Continuation
-	} else if run_attempt.attempt_number()
-		>= i64::from(workflow.frontmatter().execution().max_attempts())
-	{
-		retry_queue.release(issue_id);
-
-		return Ok(());
+	let (kind, attempt) = if exit_status.success() {
+		(
+			RetryKind::Continuation,
+			u32::try_from(run_attempt.attempt_number()).unwrap_or(u32::MAX).max(1),
+		)
 	} else {
-		RetryKind::Failure
+		let failed_attempts =
+			u32::try_from(state_store.failed_attempt_count(issue_id)?).unwrap_or(u32::MAX).max(1);
+
+		if failed_attempts >= workflow.frontmatter().execution().max_attempts() {
+			retry_queue.release(issue_id);
+
+			return Ok(());
+		}
+
+		(RetryKind::Failure, failed_attempts)
 	};
-	let attempt = u32::try_from(run_attempt.attempt_number()).unwrap_or(u32::MAX);
 	let delay = retry_delay(kind, attempt.max(1), workflow);
 
 	tracing::info!(
@@ -2717,6 +2722,54 @@ read_first = [{read_first}]
 
 		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
 		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn failure_retry_budget_ignores_prior_continuation_attempts() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-4";
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "succeeded")
+			.expect("first continuation attempt should record");
+		state_store
+			.record_run_attempt("run-2", &issue.id, 2, "succeeded")
+			.expect("second continuation attempt should record");
+		state_store
+			.record_run_attempt("run-3", &issue.id, 3, "succeeded")
+			.expect("third continuation attempt should record");
+		state_store
+			.record_run_attempt(run_id, &issue.id, 4, "failed")
+			.expect("first failure attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			&mut retry_queue,
+			&tracker,
+			&workflow,
+			&state_store,
+			&issue.id,
+			run_id,
+			exit_status,
+		)
+		.expect("first failure after continuations should still schedule");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
+		assert_eq!(entry.attempt, 1);
+		assert_eq!(
+			orchestrator::retry_delay(entry.kind, entry.attempt, &workflow),
+			Duration::from_millis(10_000)
+		);
 	}
 
 	#[test]
