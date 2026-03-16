@@ -124,6 +124,7 @@ struct DaemonRunChild {
 	issue_id: String,
 	run_id: String,
 	attempt_number: i64,
+	from_retry_queue: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -497,6 +498,9 @@ where
 
 		return Ok(());
 	}
+	if daemon_child.from_retry_queue {
+		retry_queue.release(&daemon_child.issue_id);
+	}
 	if !child_exited {
 		stop_daemon_child(&mut daemon_child.child)?;
 	}
@@ -580,10 +584,6 @@ where
 				from_retry_queue.then_some(summary.issue_id.as_str()),
 			)?;
 
-			if from_retry_queue {
-				retry_queue.release(&summary.issue_id);
-			}
-
 			tracing::info!(
 				issue = summary.issue_identifier,
 				workspace = %summary.workspace_path.display(),
@@ -596,6 +596,7 @@ where
 				issue_id: summary.issue_id,
 				run_id: summary.run_id,
 				attempt_number: summary.attempt_number,
+				from_retry_queue,
 			});
 		},
 		None =>
@@ -1219,6 +1220,9 @@ where
 		&& !context.state_store.try_acquire_lease(context.project.id(), &issue.id, &run_id)?
 	{
 		return Ok(None);
+	}
+	if !context.dry_run {
+		context.state_store.record_run_attempt(&run_id, &issue.id, attempt_number, "starting")?;
 	}
 
 	match (|| -> crate::prelude::Result<Option<IssueRunPlan>> {
@@ -2300,6 +2304,7 @@ mod tests {
 		fs,
 		path::{Path, PathBuf},
 		process::Command,
+		thread,
 		time::{Duration, Instant},
 	};
 
@@ -2321,7 +2326,7 @@ mod tests {
 			TrackerState, TrackerTeam,
 		},
 		workflow::WorkflowDocument,
-		workspace::WorkspaceSpec,
+		workspace::{WorkspaceManager, WorkspaceSpec},
 	};
 
 	struct FakeTracker {
@@ -3021,6 +3026,60 @@ read_first = [{read_first}]
 
 		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
 		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn exited_retry_child_keeps_queued_claim_when_no_run_attempt_was_persisted() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let mut child =
+			Command::new("sh").args(["-c", "exit 1"]).spawn().expect("child process should spawn");
+
+		for _ in 0..20 {
+			if child.try_wait().expect("child status should query").is_some() {
+				break;
+			}
+
+			thread::sleep(Duration::from_millis(10));
+		}
+
+		let mut active_child = Some(orchestrator::DaemonRunChild {
+			child,
+			issue_id: issue.id.clone(),
+			run_id: String::from("planned-run"),
+			attempt_number: 1,
+			from_retry_queue: true,
+		});
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now(),
+		});
+
+		orchestrator::inspect_or_clear_active_child(
+			&mut active_child,
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&workspace_manager,
+		)
+		.expect("exited child cleanup should succeed");
+
+		assert!(active_child.is_none(), "exited child should be cleared");
+		assert!(
+			retry_queue.entries.contains_key(&issue.id),
+			"retry claim should remain queued when the child exits before persisting a run attempt"
+		);
 	}
 
 	#[test]
@@ -3760,6 +3819,48 @@ read_first = [{read_first}]
 				.expect("run attempt should exist")
 				.status(),
 			"interrupted"
+		);
+	}
+
+	#[test]
+	fn prepare_issue_run_records_starting_attempt_before_execute() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			},
+			issue.clone(),
+		)
+		.expect("issue preparation should succeed")
+		.expect("active retry issue should prepare");
+
+		assert_eq!(
+			state_store
+				.run_attempt(&issue_run.run_id)
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"starting"
+		);
+		assert_eq!(
+			state_store
+				.lease_for_issue(&issue.id)
+				.expect("lease lookup should succeed")
+				.expect("lease should exist")
+				.run_id(),
+			issue_run.run_id
 		);
 	}
 
