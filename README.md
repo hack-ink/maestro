@@ -14,7 +14,7 @@ The repository is in active bootstrap. The current milestone is the MVP:
 - one `codex app-server` run
 - one authoritative outcome written back to Linear
 
-The CLI surface exists now as a scaffold. The orchestration baseline is in place, and the current follow-up checkpoint is the self-dogfood track in [`docs/plans/2026-03-12_maestro-upstream-alignment-dogfood.md`](docs/plans/2026-03-12_maestro-upstream-alignment-dogfood.md).
+The CLI surface exists now as a scaffold. The orchestration baseline is in place, and the current follow-up checkpoint is the split self-bootstrap program index in [`docs/plans/2026-03-13_maestro-first-live-pilot-hardening.md`](docs/plans/2026-03-13_maestro-first-live-pilot-hardening.md), which sequences the PR-backed handoff phase before daemon supervision and structural follow-ups.
 
 ## Current CLI Shape
 
@@ -54,7 +54,7 @@ The detailed operator runbook, including sample config, filesystem layout, and f
 - Operational guides: [`docs/guide/index.md`](docs/guide/index.md)
 - Repository workflow contract: [`WORKFLOW.md`](WORKFLOW.md)
 - Pilot runbook: [`docs/guide/pilot.md`](docs/guide/pilot.md)
-- Current implementation plan: [`docs/plans/2026-03-12_maestro-upstream-alignment-dogfood.md`](docs/plans/2026-03-12_maestro-upstream-alignment-dogfood.md)
+- Current implementation plan index (split self-bootstrap program): [`docs/plans/2026-03-13_maestro-first-live-pilot-hardening.md`](docs/plans/2026-03-13_maestro-first-live-pilot-hardening.md)
 
 ## Development
 
