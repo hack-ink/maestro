@@ -188,12 +188,19 @@ struct CachedWorkflowDocument {
 	document: WorkflowDocument,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveWorkflowOverride<'a> {
+	child: ChildRunRef<'a>,
+	workflow: &'a WorkflowDocument,
+}
+
 #[derive(Clone, Debug)]
 struct ActiveRunReconciliation {
 	issue: TrackerIssue,
 	run_attempt: RunAttempt,
 	workspace_mapping: Option<WorkspaceMapping>,
 	disposition: ActiveRunDisposition,
+	workflow: WorkflowDocument,
 }
 
 struct TerminalFailureOutcome {
@@ -539,19 +546,30 @@ where
 	};
 	let child_exit_status = daemon_child.child.try_wait()?;
 	let child_exited = child_exit_status.is_some();
-	let reconciliation_workflow =
-		reconciliation_workflow(workflow, Some(&daemon_child.workflow), child_exited);
 	let actions = if child_exited {
 		inspect_exited_daemon_child_reconciliation(
 			tracker,
 			project,
-			reconciliation_workflow,
+			workflow,
 			state_store,
 			&daemon_child.issue_id,
 			&daemon_child.run_id,
 		)?
 	} else {
-		inspect_active_run_reconciliation(tracker, project, reconciliation_workflow, state_store)?
+		inspect_active_run_reconciliation(
+			tracker,
+			project,
+			workflow,
+			state_store,
+			Some(ActiveWorkflowOverride {
+				child: ChildRunRef {
+					issue_id: &daemon_child.issue_id,
+					run_id: &daemon_child.run_id,
+					attempt_number: daemon_child.attempt_number,
+				},
+				workflow: &daemon_child.workflow,
+			}),
+		)?
 	};
 
 	if actions.is_empty() {
@@ -595,28 +613,12 @@ where
 		stop_daemon_child(&mut daemon_child.child)?;
 	}
 
-	apply_active_run_reconciliation(
-		tracker,
-		project,
-		reconciliation_workflow,
-		state_store,
-		workspace_manager,
-		actions,
-	)?;
+	apply_active_run_reconciliation(tracker, project, state_store, workspace_manager, actions)?;
 
 	active_child.take();
 
 	Ok(())
 }
-
-fn reconciliation_workflow<'a>(
-	current_workflow: &'a WorkflowDocument,
-	active_workflow: Option<&'a WorkflowDocument>,
-	child_exited: bool,
-) -> &'a WorkflowDocument {
-	if child_exited { current_workflow } else { active_workflow.unwrap_or(current_workflow) }
-}
-
 fn clear_orphaned_daemon_child_state(
 	state_store: &StateStore,
 	child: ChildRunRef<'_>,
@@ -952,6 +954,7 @@ fn inspect_active_run_reconciliation<T>(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
+	active_workflow_override: Option<ActiveWorkflowOverride<'_>>,
 ) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
 where
 	T: IssueTracker,
@@ -961,6 +964,7 @@ where
 		project,
 		workflow,
 		state_store,
+		active_workflow_override,
 		OffsetDateTime::now_utc().unix_timestamp(),
 	)
 }
@@ -970,6 +974,7 @@ fn inspect_active_run_reconciliation_at<T>(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
+	active_workflow_override: Option<ActiveWorkflowOverride<'_>>,
 	now_unix_epoch: i64,
 ) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
 where
@@ -994,9 +999,15 @@ where
 		let Some(run_attempt) = state_store.run_attempt(lease.run_id())? else {
 			continue;
 		};
-		let disposition = if is_terminal_issue(&issue, workflow) {
+		let action_workflow = active_reconciliation_workflow_for_lease(
+			workflow,
+			active_workflow_override,
+			&issue,
+			&run_attempt,
+		);
+		let disposition = if is_terminal_issue(&issue, action_workflow) {
 			Some(ActiveRunDisposition::Terminal)
-		} else if is_issue_nonactive_for_run(&issue, workflow) {
+		} else if is_issue_nonactive_for_run(&issue, action_workflow) {
 			Some(ActiveRunDisposition::NonActive)
 		} else {
 			stalled_idle_duration(state_store, &run_attempt, now_unix_epoch)?
@@ -1009,6 +1020,7 @@ where
 				run_attempt,
 				workspace_mapping: state_store.workspace_for_issue(&issue.id)?,
 				disposition,
+				workflow: action_workflow.clone(),
 			});
 		}
 	}
@@ -1071,13 +1083,28 @@ where
 		run_attempt,
 		workspace_mapping: state_store.workspace_for_issue(issue_id)?,
 		disposition: ActiveRunDisposition::Stalled { idle_for },
+		workflow: workflow.clone(),
 	}])
+}
+
+fn active_reconciliation_workflow_for_lease<'a>(
+	current_workflow: &'a WorkflowDocument,
+	active_workflow_override: Option<ActiveWorkflowOverride<'a>>,
+	issue: &TrackerIssue,
+	run_attempt: &RunAttempt,
+) -> &'a WorkflowDocument {
+	match active_workflow_override {
+		Some(override_context)
+			if override_context.child.issue_id == issue.id
+				&& override_context.child.run_id == run_attempt.run_id() =>
+			override_context.workflow,
+		_ => current_workflow,
+	}
 }
 
 fn apply_active_run_reconciliation<T>(
 	tracker: &T,
 	project: &ServiceConfig,
-	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	workspace_manager: &WorkspaceManager,
 	actions: Vec<ActiveRunReconciliation>,
@@ -1156,7 +1183,7 @@ where
 				handle_failure(
 					tracker,
 					project,
-					workflow,
+					&action.workflow,
 					state_store,
 					&issue_run,
 					&Report::new(StalledRunNeedsAttention {
@@ -2901,19 +2928,67 @@ read_first = [{read_first}]
 
 	#[test]
 	fn active_child_reconciliation_keeps_spawn_time_workflow_until_exit() {
-		let (_temp_dir, _config, current_workflow) = temp_project_layout();
+		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let active_workflow = WorkflowDocument::parse_markdown(
 			&sample_workflow_markdown(&["AGENTS.md"], "Spawn-time workflow policy.\n")
 				.replace("max_attempts = 3", "max_attempts = 5"),
 		)
 		.expect("workflow should parse");
-		let during_run =
-			orchestrator::reconciliation_workflow(&current_workflow, Some(&active_workflow), false);
-		let after_exit =
-			orchestrator::reconciliation_workflow(&current_workflow, Some(&active_workflow), true);
+		let current_workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown(&["AGENTS.md"], "Current workflow policy.\n")
+				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]"),
+		)
+		.expect("workflow should parse");
+		let child_issue = sample_issue("Todo", &[]);
+		let stale_issue = sample_issue_with_sort_fields(
+			"issue-stale",
+			"PUB-202",
+			"Todo",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![child_issue.clone(), stale_issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
 
-		assert_eq!(during_run, &active_workflow);
-		assert_eq!(after_exit, &current_workflow);
+		state_store
+			.record_run_attempt("run-child", &child_issue.id, 1, "running")
+			.expect("child run attempt should record");
+		state_store
+			.upsert_lease("pubfi", &child_issue.id, "run-child")
+			.expect("child lease should record");
+		state_store
+			.record_run_attempt("run-stale", &stale_issue.id, 1, "running")
+			.expect("stale run attempt should record");
+		state_store
+			.upsert_lease("pubfi", &stale_issue.id, "run-stale")
+			.expect("stale lease should record");
+
+		let actions = orchestrator::inspect_active_run_reconciliation_at(
+			&tracker,
+			&config,
+			&current_workflow,
+			&state_store,
+			Some(orchestrator::ActiveWorkflowOverride {
+				child: orchestrator::ChildRunRef {
+					issue_id: &child_issue.id,
+					run_id: "run-child",
+					attempt_number: 1,
+				},
+				workflow: &active_workflow,
+			}),
+			OffsetDateTime::now_utc().unix_timestamp() + 1,
+		)
+		.expect("active-run inspection should succeed");
+
+		assert!(
+			actions.iter().all(|action| action.issue.id != child_issue.id),
+			"the current child should keep its spawn-time workflow snapshot"
+		);
+		assert!(actions.iter().any(|action| {
+			action.issue.id == stale_issue.id
+				&& matches!(action.disposition, orchestrator::ActiveRunDisposition::NonActive)
+		}));
 	}
 
 	fn expected_developer_instructions(
@@ -4320,6 +4395,7 @@ read_first = [{read_first}]
 			&config,
 			&workflow,
 			&state_store,
+			None,
 			now,
 		)
 		.expect("active-run inspection should succeed");
@@ -4417,6 +4493,7 @@ read_first = [{read_first}]
 			&config,
 			&workflow,
 			&state_store,
+			None,
 			now,
 		)
 		.expect("active-run inspection should succeed");
@@ -4461,12 +4538,12 @@ read_first = [{read_first}]
 				.workspace_for_issue(&issue.id)
 				.expect("workspace query should succeed"),
 			disposition: orchestrator::ActiveRunDisposition::NonActive,
+			workflow: workflow.clone(),
 		};
 
 		orchestrator::apply_active_run_reconciliation(
 			&tracker,
 			&config,
-			&workflow,
 			&state_store,
 			&workspace_manager,
 			vec![action],
@@ -4531,12 +4608,12 @@ read_first = [{read_first}]
 			disposition: orchestrator::ActiveRunDisposition::Stalled {
 				idle_for: ACTIVE_RUN_IDLE_TIMEOUT + Duration::from_secs(1),
 			},
+			workflow: workflow.clone(),
 		};
 
 		orchestrator::apply_active_run_reconciliation(
 			&tracker,
 			&config,
-			&workflow,
 			&state_store,
 			&workspace_manager,
 			vec![action],
