@@ -1135,12 +1135,18 @@ where
 	let Some(run_attempt) = state_store.run_attempt(run_id)? else {
 		return Ok(Vec::new());
 	};
+	let workspace_mapping = state_store.workspace_for_issue(issue_id)?;
 
 	if run_attempt.status() != "failed" || !is_issue_active_for_run(&issue, workflow) {
 		return Ok(Vec::new());
 	}
 
-	let Some(idle_for) = stalled_protocol_idle_duration(state_store, run_id, now_unix_epoch)?
+	let Some(idle_for) = stalled_protocol_idle_duration(
+		state_store,
+		&run_attempt,
+		workspace_mapping.as_ref(),
+		now_unix_epoch,
+	)?
 	else {
 		return Ok(Vec::new());
 	};
@@ -1148,7 +1154,7 @@ where
 	Ok(vec![ActiveRunReconciliation {
 		issue,
 		run_attempt,
-		workspace_mapping: state_store.workspace_for_issue(issue_id)?,
+		workspace_mapping,
 		disposition: ActiveRunDisposition::Stalled { idle_for },
 		workflow: workflow.clone(),
 	}])
@@ -1318,10 +1324,13 @@ fn last_observed_run_activity_unix_epoch(
 
 fn stalled_protocol_idle_duration(
 	state_store: &StateStore,
-	run_id: &str,
+	run_attempt: &RunAttempt,
+	workspace_mapping: Option<&WorkspaceMapping>,
 	now_unix_epoch: i64,
 ) -> crate::prelude::Result<Option<Duration>> {
-	let Some(last_activity) = state_store.last_protocol_activity_unix_epoch(run_id)? else {
+	let Some(last_activity) =
+		last_observed_protocol_activity_unix_epoch(state_store, run_attempt, workspace_mapping)?
+	else {
 		return Ok(None);
 	};
 	let Some(idle_for) = observed_idle_duration(last_activity, now_unix_epoch) else {
@@ -1333,6 +1342,29 @@ fn stalled_protocol_idle_duration(
 	}
 
 	Ok(None)
+}
+
+fn last_observed_protocol_activity_unix_epoch(
+	state_store: &StateStore,
+	run_attempt: &RunAttempt,
+	workspace_mapping: Option<&WorkspaceMapping>,
+) -> crate::prelude::Result<Option<i64>> {
+	let state_store_activity =
+		state_store.last_protocol_activity_unix_epoch(run_attempt.run_id())?;
+	let workspace_activity = match workspace_mapping {
+		Some(mapping) => state::read_run_protocol_activity_marker(
+			mapping.workspace_path(),
+			run_attempt.run_id(),
+			run_attempt.attempt_number(),
+		)?,
+		None => None,
+	};
+
+	Ok(match (state_store_activity, workspace_activity) {
+		(Some(left), Some(right)) => Some(left.max(right)),
+		(Some(activity), None) | (None, Some(activity)) => Some(activity),
+		(None, None) => None,
+	})
 }
 
 fn observed_idle_duration(last_activity_unix_epoch: i64, now_unix_epoch: i64) -> Option<Duration> {
@@ -2762,7 +2794,7 @@ mod tests {
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, RunSummary,
 		},
 		prelude::Result,
-		state::{RUN_ACTIVITY_MARKER_FILE, StateStore},
+		state::{self, RUN_ACTIVITY_MARKER_FILE, StateStore},
 		tracker::{
 			IssueTracker, TrackerIssue, TrackerIssueBlocker, TrackerLabel, TrackerProject,
 			TrackerState, TrackerTeam,
@@ -4870,17 +4902,29 @@ read_first = [{read_first}]
 		let run_id = "run-protocol-future-activity";
 
 		state_store
+			.record_run_attempt(run_id, "issue-1", 1, "running")
+			.expect("run attempt should record");
+		state_store
 			.append_event(run_id, 1, "thread/status/changed", "{\"status\":\"active\"}")
 			.expect("protocol event should record");
 
+		let run_attempt = state_store
+			.run_attempt(run_id)
+			.expect("run attempt lookup should succeed")
+			.expect("run attempt should exist");
 		let last_activity = state_store
 			.last_protocol_activity_unix_epoch(run_id)
 			.expect("protocol activity lookup should succeed")
 			.expect("protocol activity should exist");
 
 		assert_eq!(
-			orchestrator::stalled_protocol_idle_duration(&state_store, run_id, last_activity - 1)
-				.expect("protocol idle duration should evaluate"),
+			orchestrator::stalled_protocol_idle_duration(
+				&state_store,
+				&run_attempt,
+				None,
+				last_activity - 1,
+			)
+			.expect("protocol idle duration should evaluate"),
 			None
 		);
 	}
@@ -5255,21 +5299,32 @@ read_first = [{read_first}]
 		);
 		let tracker = FakeTracker::new(vec![issue.clone()]);
 		let run_id = "run-stalled-after-exit";
+		let workspace_path = config.workspace_root().join(&issue.identifier);
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
 
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
 		state_store
-			.append_event(run_id, 1, "thread/status/changed", "{\"status\":\"active\"}")
-			.expect("protocol event should record");
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-205",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace mapping should record");
 		state_store
-			.update_run_status(run_id, "failed")
+			.record_run_attempt(run_id, &issue.id, 1, "failed")
 			.expect("run should exit as failed before daemon inspects it");
 
-		let last_protocol_activity = state_store
-			.last_protocol_activity_unix_epoch(run_id)
-			.expect("protocol activity query should succeed")
-			.expect("protocol activity should exist");
+		state::write_run_protocol_activity_marker(&workspace_path, run_id, 1)
+			.expect("protocol marker should write");
+
+		let last_protocol_activity =
+			state::read_run_protocol_activity_marker(&workspace_path, run_id, 1)
+				.expect("protocol marker should read")
+				.expect("protocol activity should exist");
 		let actions = orchestrator::inspect_exited_daemon_child_reconciliation_at(
 			&tracker,
 			&config,

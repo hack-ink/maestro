@@ -144,7 +144,14 @@ impl<'a> RunRecorder<'a> {
 
 	fn record(&mut self, event_type: &str, payload: &str) -> Result<()> {
 		self.state_store.append_event(self.run_id, self.next_sequence, event_type, payload)?;
-		self.mark_activity()?;
+
+		if let Some(marker_path) = self.activity_marker_path {
+			state::write_run_protocol_activity_marker(
+				marker_path,
+				self.run_id,
+				self.attempt_number,
+			)?;
+		}
 
 		self.next_sequence += 1;
 

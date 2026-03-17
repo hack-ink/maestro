@@ -683,20 +683,36 @@ impl WorkspaceMappingRecord {
 	}
 }
 
+#[derive(Default)]
+struct RunActivityMarkerRecord {
+	run_id: Option<String>,
+	attempt_number: Option<i64>,
+	last_activity_unix_epoch: Option<i64>,
+	last_protocol_activity_unix_epoch: Option<i64>,
+}
+
 pub(crate) fn write_run_activity_marker(
 	workspace_path: &Path,
 	run_id: &str,
 	attempt_number: i64,
 ) -> Result<()> {
-	let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
-	let marker_body = format!(
-		"run_id={run_id}\nattempt_number={attempt_number}\nlast_activity_unix_epoch={}\n",
-		OffsetDateTime::now_utc().unix_timestamp()
-	);
+	write_run_activity_marker_at(
+		workspace_path,
+		run_id,
+		attempt_number,
+		OffsetDateTime::now_utc().unix_timestamp(),
+		None,
+	)
+}
 
-	fs::write(marker_path, marker_body)?;
+pub(crate) fn write_run_protocol_activity_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+) -> Result<()> {
+	let now = OffsetDateTime::now_utc().unix_timestamp();
 
-	Ok(())
+	write_run_activity_marker_at(workspace_path, run_id, attempt_number, now, Some(now))
 }
 
 pub(crate) fn read_run_activity_marker(
@@ -704,15 +720,68 @@ pub(crate) fn read_run_activity_marker(
 	run_id: &str,
 	attempt_number: i64,
 ) -> Result<Option<i64>> {
+	let marker = read_run_activity_marker_record(workspace_path)?.filter(|marker| {
+		marker.run_id.as_deref() == Some(run_id) && marker.attempt_number == Some(attempt_number)
+	});
+
+	Ok(marker.and_then(|marker| marker.last_activity_unix_epoch))
+}
+
+pub(crate) fn read_run_protocol_activity_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+) -> Result<Option<i64>> {
+	let marker = read_run_activity_marker_record(workspace_path)?.filter(|marker| {
+		marker.run_id.as_deref() == Some(run_id) && marker.attempt_number == Some(attempt_number)
+	});
+
+	Ok(marker.and_then(|marker| marker.last_protocol_activity_unix_epoch))
+}
+
+fn write_run_activity_marker_at(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	last_activity_unix_epoch: i64,
+	last_protocol_activity_unix_epoch: Option<i64>,
+) -> Result<()> {
+	let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
+	let preserved_protocol_activity =
+		read_run_activity_marker_record(workspace_path)?.and_then(|marker| {
+			(marker.run_id.as_deref() == Some(run_id)
+				&& marker.attempt_number == Some(attempt_number))
+			.then_some(marker.last_protocol_activity_unix_epoch)
+			.flatten()
+		});
+	let last_protocol_activity_unix_epoch =
+		last_protocol_activity_unix_epoch.or(preserved_protocol_activity);
+	let mut marker_body = format!(
+		"run_id={run_id}\nattempt_number={attempt_number}\nlast_activity_unix_epoch={last_activity_unix_epoch}\n"
+	);
+
+	if let Some(last_protocol_activity_unix_epoch) = last_protocol_activity_unix_epoch {
+		marker_body.push_str(
+			format!("last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n")
+				.as_str(),
+		);
+	}
+
+	fs::write(marker_path, marker_body)?;
+
+	Ok(())
+}
+
+fn read_run_activity_marker_record(
+	workspace_path: &Path,
+) -> Result<Option<RunActivityMarkerRecord>> {
 	let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
 	let marker_body = match fs::read_to_string(&marker_path) {
 		Ok(body) => body,
 		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
 		Err(error) => return Err(error.into()),
 	};
-	let mut marker_run_id = None;
-	let mut marker_attempt_number = None;
-	let mut marker_last_activity = None;
+	let mut marker = RunActivityMarkerRecord::default();
 
 	for line in marker_body.lines() {
 		let Some((key, value)) = line.split_once('=') else {
@@ -720,16 +789,17 @@ pub(crate) fn read_run_activity_marker(
 		};
 
 		match key {
-			"run_id" => marker_run_id = Some(value.to_owned()),
-			"attempt_number" => marker_attempt_number = value.parse::<i64>().ok(),
-			"last_activity_unix_epoch" => marker_last_activity = value.parse::<i64>().ok(),
+			"run_id" => marker.run_id = Some(value.to_owned()),
+			"attempt_number" => marker.attempt_number = value.parse::<i64>().ok(),
+			"last_activity_unix_epoch" =>
+				marker.last_activity_unix_epoch = value.parse::<i64>().ok(),
+			"last_protocol_activity_unix_epoch" =>
+				marker.last_protocol_activity_unix_epoch = value.parse::<i64>().ok(),
 			_ => {},
 		}
 	}
 
-	Ok((marker_run_id.as_deref() == Some(run_id) && marker_attempt_number == Some(attempt_number))
-		.then_some(marker_last_activity)
-		.flatten())
+	Ok(Some(marker))
 }
 
 fn timestamp_parts() -> TimestampParts {
