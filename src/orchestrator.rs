@@ -65,6 +65,11 @@ struct RunSummary {
 	run_id: String,
 }
 
+struct MaterializedDaemonSpawnState {
+	workspace: WorkspaceSpec,
+	retry_budget_base: i64,
+}
+
 #[derive(Clone, Debug)]
 struct IssueRunPlan {
 	issue: TrackerIssue,
@@ -747,13 +752,11 @@ where
 
 			validate_review_handoff_runtime(false)?;
 
-			let retry_budget_base = state_store.retry_budget_attempt_count(&summary.issue_id)?;
-
 			if !state_store.try_acquire_lease(project.id(), &summary.issue_id, &summary.run_id)? {
 				return Ok(());
 			}
 
-			let materialized_workspace = materialize_run_summary_workspace(project, &summary)
+			let daemon_spawn_state = materialize_daemon_spawn_state(project, state_store, &summary)
 				.inspect_err(|_error| {
 					let _ = state_store.clear_lease(&summary.issue_id);
 				})?;
@@ -767,8 +770,8 @@ where
 			state_store.upsert_workspace(
 				project.id(),
 				&summary.issue_id,
-				&materialized_workspace.branch_name,
-				&materialized_workspace.path.display().to_string(),
+				&daemon_spawn_state.workspace.branch_name,
+				&daemon_spawn_state.workspace.path.display().to_string(),
 			)?;
 
 			#[cfg(unix)]
@@ -781,7 +784,7 @@ where
 				dispatch_mode: summary.dispatch_mode,
 				preferred_run_id: summary.run_id.as_str(),
 				preferred_attempt_number: summary.attempt_number,
-				preferred_retry_budget_base: retry_budget_base,
+				preferred_retry_budget_base: daemon_spawn_state.retry_budget_base,
 				workflow,
 				dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
 			})
@@ -791,7 +794,7 @@ where
 			})?;
 
 			if let Err(error) = state::write_run_activity_marker_for_process(
-				&materialized_workspace.path,
+				&daemon_spawn_state.workspace.path,
 				&summary.run_id,
 				summary.attempt_number,
 				child.id(),
@@ -810,7 +813,7 @@ where
 
 			tracing::info!(
 				issue = summary.issue_identifier,
-				workspace = %materialized_workspace.path.display(),
+				workspace = %daemon_spawn_state.workspace.path.display(),
 				retry = from_retry_queue,
 				"Spawned daemon child for active issue lane."
 			);
@@ -833,6 +836,18 @@ where
 	}
 
 	Ok(())
+}
+
+fn materialize_daemon_spawn_state(
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	summary: &RunSummary,
+) -> crate::prelude::Result<MaterializedDaemonSpawnState> {
+	let workspace = materialize_run_summary_workspace(project, summary)?;
+	let retry_budget_base =
+		retry_budget_base_for_issue_workspace(state_store, &summary.issue_id, &workspace.path)?;
+
+	Ok(MaterializedDaemonSpawnState { workspace, retry_budget_base })
 }
 
 fn materialize_run_summary_workspace(
@@ -6103,6 +6118,39 @@ read_first = [{read_first}]
 			process::id(),
 		)
 		.expect("child activity marker should write after workspace materialization");
+	}
+
+	#[test]
+	fn materialize_daemon_spawn_state_uses_retained_retry_budget_marker() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let retained_workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("retained workspace should exist");
+
+		state::write_run_retry_budget_attempt_count(&retained_workspace.path, "older-run", 4, 2)
+			.expect("retry budget marker should write");
+
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("dry-run planning should succeed")
+				.expect("retained lane should still be selected");
+		let daemon_spawn_state =
+			orchestrator::materialize_daemon_spawn_state(&config, &state_store, &summary)
+				.expect("daemon parent should materialize workspace and retry budget together");
+
+		assert_eq!(daemon_spawn_state.workspace.path, summary.workspace_path);
+		assert_eq!(
+			daemon_spawn_state.retry_budget_base, 2,
+			"daemon child handoff should preserve retry budget from the retained workspace marker"
+		);
 	}
 
 	#[test]
