@@ -43,7 +43,7 @@ cargo run -- run --once --dry-run --config ./tmp/maestro.toml
 cargo run -- run --once --config ./tmp/maestro.toml
 ```
 
-After those bounded checks pass, switch to `cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml` when you want the long-running poll loop for the pilot.
+After those bounded checks pass, switch to `cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml` when you want the long-running poll loop for the pilot. Daemon mode currently requires a Unix target because the parent process hands the single project dispatch-slot lock to the spawned `run --once` child via file-descriptor inheritance.
 
 The detailed operator runbook, including sample config, filesystem layout, and failure inspection, lives in [`docs/guide/pilot.md`](docs/guide/pilot.md).
 

@@ -162,6 +162,8 @@ After `protocol probe`, `run --once --dry-run`, and `run --once` all behave as e
 cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml
 ```
 
+Daemon mode currently requires a Unix target because the parent process hands the single project dispatch-slot lock to the spawned `run --once` child via file-descriptor inheritance.
+
 During daemon mode, each poll tick now does two distinct things:
 
 1. inspect any currently leased active lane

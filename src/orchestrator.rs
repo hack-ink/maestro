@@ -422,6 +422,8 @@ pub(crate) fn run_daemon(
 		eyre::bail!("`daemon --poll-interval-s` must be greater than zero.");
 	}
 
+	validate_daemon_runtime()?;
+
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		eyre::bail!("No maestro config found. Pass --config or create tmp/maestro.toml.");
 	};
@@ -1874,6 +1876,19 @@ fn validate_review_handoff_runtime(dry_run: bool) -> crate::prelude::Result<()> 
 	validate_command_available("gh", "PR-backed review handoff")?;
 
 	Ok(())
+}
+
+fn validate_daemon_runtime() -> crate::prelude::Result<()> {
+	#[cfg(unix)]
+	{
+		Ok(())
+	}
+	#[cfg(not(unix))]
+	{
+		eyre::bail!(
+			"daemon mode is only supported on unix targets because parent-child dispatch-slot handoff requires unix file-descriptor inheritance."
+		);
+	}
 }
 
 fn validate_command_available(command: &str, purpose: &str) -> crate::prelude::Result<()> {
@@ -4583,6 +4598,7 @@ read_first = [{read_first}]
 	#[test]
 	fn live_runs_require_gh_preflight() {
 		assert!(orchestrator::validate_review_handoff_runtime(true).is_ok());
+		assert!(orchestrator::validate_daemon_runtime().is_ok());
 		assert!(orchestrator::validate_command_available("git", "test preflight").is_ok());
 
 		let error = orchestrator::validate_command_available(
