@@ -2087,7 +2087,15 @@ where
 			dynamic_tool_handler: Some(&tracker_tool_bridge),
 		},
 		state_store,
-	)?;
+	)
+	.map_err(|error| {
+		preserve_manual_attention_request(
+			tracker_tool_bridge.completion_disposition(),
+			issue_run,
+			workflow,
+			error,
+		)
+	})?;
 
 	match tracker_tool_bridge.completion_disposition()? {
 		RunCompletionDisposition::ReviewHandoff => {
@@ -2128,6 +2136,24 @@ where
 		attempt_number: issue_run.attempt_number,
 		run_id: issue_run.run_id.clone(),
 	})
+}
+
+fn preserve_manual_attention_request(
+	completion_disposition: crate::prelude::Result<RunCompletionDisposition>,
+	issue_run: &IssueRunPlan,
+	workflow: &WorkflowDocument,
+	error: Report,
+) -> Report {
+	if matches!(completion_disposition, Ok(RunCompletionDisposition::ManualAttention)) {
+		return Report::new(ManualAttentionRequested {
+			issue_identifier: issue_run.issue.identifier.clone(),
+			label: workflow.frontmatter().tracker().needs_attention_label().to_owned(),
+			run_id: issue_run.run_id.clone(),
+		})
+		.wrap_err(error);
+	}
+
+	error
 }
 
 fn handle_failure<T>(
@@ -4659,6 +4685,34 @@ read_first = [{read_first}]
 		assert!(comment.contains("- error_class: `human_attention_required`"));
 		assert!(comment.contains("stop automatic retries and hand off manually"));
 		assert!(comment.contains("clear label `maestro:needs-attention`"));
+	}
+
+	#[test]
+	fn preserve_manual_attention_request_wraps_finalize_miss() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: issue.identifier.clone(),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1-123"),
+			retry_budget_base: 0,
+		};
+		let error = orchestrator::preserve_manual_attention_request(
+			Ok(orchestrator::RunCompletionDisposition::ManualAttention),
+			&issue_run,
+			&workflow,
+			Report::msg("run completed without issue_terminal_finalize"),
+		);
+
+		assert!(error.downcast_ref::<orchestrator::ManualAttentionRequested>().is_some());
+		assert!(error.to_string().contains("run completed without issue_terminal_finalize"));
 	}
 
 	#[test]
