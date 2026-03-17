@@ -25,7 +25,7 @@ use crate::{
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
-	state::{ProjectRunStatus, RunAttempt, StateStore, WorkspaceMapping},
+	state::{self, ProjectRunStatus, RunAttempt, StateStore, WorkspaceMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
 	workflow::WorkflowDocument,
 	workspace::{WorkspaceManager, WorkspaceSpec},
@@ -1058,6 +1058,7 @@ where
 		let Some(run_attempt) = state_store.run_attempt(lease.run_id())? else {
 			continue;
 		};
+		let workspace_mapping = state_store.workspace_for_issue(&issue.id)?;
 		let action_workflow = active_reconciliation_workflow_for_lease(
 			workflow,
 			active_workflow_override,
@@ -1069,15 +1070,20 @@ where
 		} else if is_issue_nonactive_for_run(&issue, action_workflow) {
 			Some(ActiveRunDisposition::NonActive)
 		} else {
-			stalled_idle_duration(state_store, &run_attempt, now_unix_epoch)?
-				.map(|idle_for| ActiveRunDisposition::Stalled { idle_for })
+			stalled_idle_duration(
+				state_store,
+				&run_attempt,
+				workspace_mapping.as_ref(),
+				now_unix_epoch,
+			)?
+			.map(|idle_for| ActiveRunDisposition::Stalled { idle_for })
 		};
 
 		if let Some(disposition) = disposition {
 			actions.push(ActiveRunReconciliation {
 				issue: issue.clone(),
 				run_attempt,
-				workspace_mapping: state_store.workspace_for_issue(&issue.id)?,
+				workspace_mapping,
 				disposition,
 				workflow: action_workflow.clone(),
 			});
@@ -1262,13 +1268,15 @@ where
 fn stalled_idle_duration(
 	state_store: &StateStore,
 	run_attempt: &RunAttempt,
+	workspace_mapping: Option<&WorkspaceMapping>,
 	now_unix_epoch: i64,
 ) -> crate::prelude::Result<Option<Duration>> {
 	if !matches!(run_attempt.status(), "starting" | "running") {
 		return Ok(None);
 	}
 
-	let Some(last_activity) = state_store.last_run_activity_unix_epoch(run_attempt.run_id())?
+	let Some(last_activity) =
+		last_observed_run_activity_unix_epoch(state_store, run_attempt, workspace_mapping)?
 	else {
 		return Ok(None);
 	};
@@ -1281,6 +1289,28 @@ fn stalled_idle_duration(
 	}
 
 	Ok(None)
+}
+
+fn last_observed_run_activity_unix_epoch(
+	state_store: &StateStore,
+	run_attempt: &RunAttempt,
+	workspace_mapping: Option<&WorkspaceMapping>,
+) -> crate::prelude::Result<Option<i64>> {
+	let state_store_activity = state_store.last_run_activity_unix_epoch(run_attempt.run_id())?;
+	let workspace_activity = match workspace_mapping {
+		Some(mapping) => state::read_run_activity_marker(
+			mapping.workspace_path(),
+			run_attempt.run_id(),
+			run_attempt.attempt_number(),
+		)?,
+		None => None,
+	};
+
+	Ok(match (state_store_activity, workspace_activity) {
+		(Some(left), Some(right)) => Some(left.max(right)),
+		(Some(activity), None) | (None, Some(activity)) => Some(activity),
+		(None, None) => None,
+	})
 }
 
 fn stalled_protocol_idle_duration(
@@ -1827,6 +1857,7 @@ where
 			personality: workflow.frontmatter().agent().personality().map(str::to_owned),
 			service_tier: workflow.frontmatter().agent().service_tier().map(str::to_owned),
 			timeout: ACTIVE_RUN_IDLE_TIMEOUT,
+			activity_marker_path: Some(issue_run.workspace.path.clone()),
 			dynamic_tool_handler: Some(&tracker_tool_bridge),
 		},
 		state_store,
@@ -2725,7 +2756,7 @@ mod tests {
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, RunSummary,
 		},
 		prelude::Result,
-		state::StateStore,
+		state::{RUN_ACTIVITY_MARKER_FILE, StateStore},
 		tracker::{
 			IssueTracker, TrackerIssue, TrackerIssueBlocker, TrackerLabel, TrackerProject,
 			TrackerState, TrackerTeam,
@@ -4761,10 +4792,66 @@ read_first = [{read_first}]
 					.run_attempt(run_id)
 					.expect("run lookup should succeed")
 					.expect("run attempt should exist"),
+				None,
 				last_activity - 1
 			)
 			.expect("idle duration should evaluate"),
 			None
+		);
+	}
+
+	#[test]
+	fn active_run_reconciliation_uses_workspace_activity_marker_from_child_process() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker = FakeTracker::new(vec![issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-shared-activity";
+		let workspace_path = config.workspace_root().join("PUB-101");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace mapping should record");
+
+		let last_activity = state_store
+			.last_run_activity_unix_epoch(run_id)
+			.expect("last activity lookup should succeed")
+			.expect("run activity should exist");
+		let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
+
+		fs::write(
+			&marker_path,
+			format!(
+				"run_id={run_id}\nattempt_number=1\nlast_activity_unix_epoch={}\n",
+				last_activity + ACTIVE_RUN_IDLE_TIMEOUT.as_secs() as i64
+			),
+		)
+		.expect("activity marker should write");
+
+		let actions = orchestrator::inspect_active_run_reconciliation_at(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			None,
+			last_activity + ACTIVE_RUN_IDLE_TIMEOUT.as_secs() as i64 + 1,
+		)
+		.expect("active run inspection should succeed");
+
+		assert!(
+			actions.is_empty(),
+			"fresh child activity marker should prevent daemon stall reconciliation"
 		);
 	}
 

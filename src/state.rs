@@ -3,6 +3,8 @@
 use std::{
 	cmp::Ordering,
 	collections::HashMap,
+	fs,
+	io::ErrorKind,
 	path::{Path, PathBuf},
 	sync::{Mutex, MutexGuard},
 };
@@ -10,6 +12,8 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::prelude::{Result, eyre};
+
+pub(crate) const RUN_ACTIVITY_MARKER_FILE: &str = ".maestro-run-activity";
 
 /// Local runtime store for leases, attempts, workspaces, and protocol events.
 #[derive(Default)]
@@ -677,6 +681,55 @@ impl WorkspaceMappingRecord {
 			workspace_path: self.workspace_path.clone(),
 		}
 	}
+}
+
+pub(crate) fn write_run_activity_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+) -> Result<()> {
+	let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
+	let marker_body = format!(
+		"run_id={run_id}\nattempt_number={attempt_number}\nlast_activity_unix_epoch={}\n",
+		OffsetDateTime::now_utc().unix_timestamp()
+	);
+
+	fs::write(marker_path, marker_body)?;
+
+	Ok(())
+}
+
+pub(crate) fn read_run_activity_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+) -> Result<Option<i64>> {
+	let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
+	let marker_body = match fs::read_to_string(&marker_path) {
+		Ok(body) => body,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
+	let mut marker_run_id = None;
+	let mut marker_attempt_number = None;
+	let mut marker_last_activity = None;
+
+	for line in marker_body.lines() {
+		let Some((key, value)) = line.split_once('=') else {
+			continue;
+		};
+
+		match key {
+			"run_id" => marker_run_id = Some(value.to_owned()),
+			"attempt_number" => marker_attempt_number = value.parse::<i64>().ok(),
+			"last_activity_unix_epoch" => marker_last_activity = value.parse::<i64>().ok(),
+			_ => {},
+		}
+	}
+
+	Ok((marker_run_id.as_deref() == Some(run_id) && marker_attempt_number == Some(attempt_number))
+		.then_some(marker_last_activity)
+		.flatten())
 }
 
 fn timestamp_parts() -> TimestampParts {

@@ -231,6 +231,7 @@ The local runtime store may keep only the data needed to operate safely during t
 
 This runtime state is process-memory only. `maestro` must not require a durable local database file for normal operation or restart recovery.
 The local runtime store must not become the operator-facing source of workflow truth.
+For daemon-child supervision, the active lane may also carry a short-lived workspace heartbeat marker at `.workspaces/<ISSUE>/.maestro-run-activity`. That marker is advisory, keyed to the current `run_id` plus `attempt`, and exists only so the daemon can observe child activity across process boundaries without reviving a durable local state database.
 
 ## Supported operator visibility surface
 
@@ -263,6 +264,7 @@ After a process restart, recent-run history may be shallow because attempt and e
 - If Linear still shows a non-terminal `In Progress` issue and its retained workspace exists locally, `maestro` must treat that lane as a retry-style recovery candidate before selecting fresh `Todo` work.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
 - While daemon mode is running an active lane, that child must keep the workflow snapshot it started with; repo-owned `WORKFLOW.md` reloads affect later decisions without restarting the in-flight child.
+- While daemon mode is supervising an active child process, stall detection must consult the child-updated `.maestro-run-activity` marker for the current `run_id` plus `attempt` instead of trusting only the daemon's process-local in-memory journal.
 - While daemon mode owns a queued retry entry, that queued claim must take priority over normal candidate selection in the current single-slot runtime.
 - While daemon mode is idle between lanes, it may reload the configured repo-owned `WORKFLOW.md` on each tick and immediately apply a newly valid document to future dispatch, retry, post-exit reconciliation, and prompt generation.
 - If that same configured `WORKFLOW.md` path becomes invalid after a successful load, daemon mode must log the reload failure and keep the last known good document active instead of dropping the tick or clearing runtime policy.

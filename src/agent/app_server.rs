@@ -1,5 +1,6 @@
 use std::{
 	env,
+	path::PathBuf,
 	time::{Duration, Instant},
 };
 
@@ -16,7 +17,7 @@ use crate::{
 		},
 	},
 	prelude::{Result, eyre},
-	state::StateStore,
+	state::{self, StateStore},
 };
 
 pub(crate) const ACTIVE_RUN_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -45,6 +46,7 @@ pub(crate) struct AppServerRunRequest<'a> {
 	pub(crate) personality: Option<String>,
 	pub(crate) service_tier: Option<String>,
 	pub(crate) timeout: Duration,
+	pub(crate) activity_marker_path: Option<PathBuf>,
 	pub(crate) dynamic_tool_handler: Option<&'a dyn DynamicToolHandler>,
 }
 
@@ -118,15 +120,31 @@ struct RunOutcome {
 struct RunRecorder<'a> {
 	state_store: &'a StateStore,
 	run_id: &'a str,
+	attempt_number: i64,
+	activity_marker_path: Option<&'a PathBuf>,
 	next_sequence: i64,
 }
 impl<'a> RunRecorder<'a> {
-	fn new(state_store: &'a StateStore, run_id: &'a str) -> Self {
-		Self { state_store, run_id, next_sequence: 1 }
+	fn new(
+		state_store: &'a StateStore,
+		run_id: &'a str,
+		attempt_number: i64,
+		activity_marker_path: Option<&'a PathBuf>,
+	) -> Self {
+		Self { state_store, run_id, attempt_number, activity_marker_path, next_sequence: 1 }
+	}
+
+	fn mark_activity(&self) -> Result<()> {
+		if let Some(marker_path) = self.activity_marker_path {
+			state::write_run_activity_marker(marker_path, self.run_id, self.attempt_number)?;
+		}
+
+		Ok(())
 	}
 
 	fn record(&mut self, event_type: &str, payload: &str) -> Result<()> {
 		self.state_store.append_event(self.run_id, self.next_sequence, event_type, payload)?;
+		self.mark_activity()?;
 
 		self.next_sequence += 1;
 
@@ -345,6 +363,10 @@ pub(crate) fn execute_app_server_run(
 		"starting",
 	)?;
 
+	if let Some(marker_path) = request.activity_marker_path.as_ref() {
+		state::write_run_activity_marker(marker_path, &request.run_id, request.attempt_number)?;
+	}
+
 	let result = execute_app_server_run_inner(request, state_store);
 
 	if result.is_err() {
@@ -354,6 +376,10 @@ pub(crate) fn execute_app_server_run(
 			request.attempt_number,
 			"failed",
 		)?;
+
+		if let Some(marker_path) = request.activity_marker_path.as_ref() {
+			state::write_run_activity_marker(marker_path, &request.run_id, request.attempt_number)?;
+		}
 	}
 
 	result
@@ -377,6 +403,7 @@ pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
 			personality: None,
 			service_tier: None,
 			timeout: PROBE_TIMEOUT,
+			activity_marker_path: None,
 			dynamic_tool_handler: Some(&probe_tool_handler),
 		},
 		&state_store,
@@ -396,7 +423,12 @@ fn execute_app_server_run_inner(
 	request: &AppServerRunRequest<'_>,
 	state_store: &StateStore,
 ) -> Result<AppServerRunResult> {
-	let mut recorder = RunRecorder::new(state_store, &request.run_id);
+	let mut recorder = RunRecorder::new(
+		state_store,
+		&request.run_id,
+		request.attempt_number,
+		request.activity_marker_path.as_ref(),
+	);
 	let mut client = AppServerClient::spawn(&request.listen)?;
 	let initialize_response = client.initialize(request.dynamic_tool_handler.is_some())?;
 
@@ -418,6 +450,7 @@ fn execute_app_server_run_inner(
 	let thread_id = thread_response.thread.id.clone();
 
 	state_store.update_run_thread(&request.run_id, &thread_id)?;
+	recorder.mark_activity()?;
 
 	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
 
@@ -431,6 +464,7 @@ fn execute_app_server_run_inner(
 		request.attempt_number,
 		"running",
 	)?;
+	recorder.mark_activity()?;
 
 	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
 
@@ -449,6 +483,7 @@ fn execute_app_server_run_inner(
 		request.attempt_number,
 		"succeeded",
 	)?;
+	recorder.mark_activity()?;
 
 	Ok(AppServerRunResult {
 		user_agent: initialize_response.user_agent,
