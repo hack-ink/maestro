@@ -55,6 +55,7 @@ struct RunSummary {
 	project_id: String,
 	issue_id: String,
 	issue_identifier: String,
+	dispatch_mode: IssueDispatchMode,
 	branch_name: String,
 	workspace_path: PathBuf,
 	attempt_number: i64,
@@ -65,6 +66,7 @@ struct RunSummary {
 struct IssueRunPlan {
 	issue: TrackerIssue,
 	workspace: WorkspaceSpec,
+	dispatch_mode: IssueDispatchMode,
 	attempt_number: i64,
 	run_id: String,
 	retry_budget_base: i64,
@@ -272,7 +274,7 @@ struct OperatorWorkspaceStatus {
 	workspace_path: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IssueDispatchMode {
 	Normal,
 	Retry,
@@ -742,7 +744,7 @@ where
 			let child = spawn_run_once_child(
 				config_path,
 				summary.issue_id.as_str(),
-				if from_retry_queue { IssueDispatchMode::Retry } else { IssueDispatchMode::Normal },
+				summary.dispatch_mode,
 				summary.run_id.as_str(),
 				summary.attempt_number,
 				retry_budget_base,
@@ -1241,6 +1243,7 @@ where
 				let issue_run = IssueRunPlan {
 					issue: action.issue.clone(),
 					workspace,
+					dispatch_mode: IssueDispatchMode::Retry,
 					attempt_number: action.run_attempt.attempt_number(),
 					run_id: action.run_attempt.run_id().to_owned(),
 					retry_budget_base: 0,
@@ -1596,6 +1599,7 @@ where
 		Ok(Some(IssueRunPlan {
 			issue: refreshed_issue,
 			workspace,
+			dispatch_mode: context.dispatch_mode,
 			attempt_number,
 			run_id: run_id.clone(),
 			retry_budget_base,
@@ -1635,6 +1639,7 @@ where
 			project_id: project.id().to_owned(),
 			issue_id: issue_run.issue.id.clone(),
 			issue_identifier: issue_run.issue.identifier.clone(),
+			dispatch_mode: issue_run.dispatch_mode,
 			branch_name: issue_run.workspace.branch_name.clone(),
 			workspace_path: issue_run.workspace.path.clone(),
 			attempt_number: issue_run.attempt_number,
@@ -1896,6 +1901,7 @@ where
 		project_id: project.id().to_owned(),
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
+		dispatch_mode: issue_run.dispatch_mode,
 		branch_name: issue_run.workspace.branch_name.clone(),
 		workspace_path: issue_run.workspace.path.clone(),
 		attempt_number: issue_run.attempt_number,
@@ -3891,6 +3897,7 @@ read_first = [{read_first}]
 				project_id: String::from("pubfi"),
 				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				branch_name: String::from("x/pubfi-pub-101"),
 				workspace_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
 				attempt_number: 1,
@@ -3912,6 +3919,7 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
 			retry_budget_base: 0,
@@ -3953,6 +3961,7 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
 			retry_budget_base: 0,
@@ -5066,6 +5075,7 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
 			retry_budget_base: 0,
@@ -5169,6 +5179,7 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			attempt_number: 4,
 			run_id: String::from("pub-101-attempt-4-123"),
 			retry_budget_base: 0,
@@ -5299,6 +5310,7 @@ read_first = [{read_first}]
 				.expect("active recovered issue should be selected");
 
 		assert_eq!(summary.issue_id, issue.id);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
 		assert_eq!(summary.workspace_path, expected_workspace);
 		assert!(
 			state_store
