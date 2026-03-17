@@ -1281,7 +1281,11 @@ where
 						&workspace_path,
 						action.run_attempt.run_id(),
 						action.run_attempt.attempt_number(),
-						state_store.retry_budget_attempt_count(&action.issue.id)?,
+						retry_budget_base_for_issue_workspace(
+							state_store,
+							&action.issue.id,
+							&workspace_path,
+						)?,
 					)?;
 				}
 
@@ -1310,13 +1314,18 @@ where
 						reused_existing: true,
 					},
 				);
+				let retry_budget_base = retry_budget_base_for_issue_workspace(
+					state_store,
+					&action.issue.id,
+					&workspace.path,
+				)?;
 				let issue_run = IssueRunPlan {
 					issue: action.issue.clone(),
 					workspace,
 					dispatch_mode: IssueDispatchMode::Retry,
 					attempt_number: action.run_attempt.attempt_number(),
 					run_id: action.run_attempt.run_id().to_owned(),
-					retry_budget_base: 0,
+					retry_budget_base,
 				};
 
 				handle_failure(
@@ -1688,13 +1697,12 @@ where
 		},
 		None => (next_attempt_number, build_run_id(&issue.identifier, next_attempt_number)?),
 	};
-	let persisted_retry_budget_attempts =
-		state::read_run_retry_budget_attempt_count(&planned_workspace.path)?.unwrap_or(0);
 	let retry_budget_base = context.preferred_retry_budget_base.unwrap_or(0).max(
-		context
-			.state_store
-			.retry_budget_attempt_count(&issue.id)?
-			.max(persisted_retry_budget_attempts),
+		retry_budget_base_for_issue_workspace(
+			context.state_store,
+			&issue.id,
+			&planned_workspace.path,
+		)?,
 	);
 	let lease_issue_id = issue.id.clone();
 
@@ -2383,6 +2391,16 @@ fn write_retry_budget_marker(
 	)
 }
 
+fn retry_budget_base_for_issue_workspace(
+	state_store: &StateStore,
+	issue_id: &str,
+	workspace_path: &Path,
+) -> crate::prelude::Result<i64> {
+	Ok(state_store
+		.retry_budget_attempt_count(issue_id)?
+		.max(state::read_run_retry_budget_attempt_count(workspace_path)?.unwrap_or(0)))
+}
+
 fn clear_terminal_guard_marker(workspace_path: &Path) -> crate::prelude::Result<()> {
 	let marker_path = workspace_path.join(TERMINAL_GUARD_MARKER_FILE);
 
@@ -2391,6 +2409,26 @@ fn clear_terminal_guard_marker(workspace_path: &Path) -> crate::prelude::Result<
 		Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
 		Err(error) => Err(error.into()),
 	}
+}
+
+fn clear_recovered_issue_lease(
+	project_id: &str,
+	issue_id: &str,
+	expected_run_id: Option<&str>,
+	state_store: &StateStore,
+) -> crate::prelude::Result<()> {
+	let Some(lease) = state_store.lease_for_issue(issue_id)? else {
+		return Ok(());
+	};
+
+	if lease.project_id() != project_id {
+		return Ok(());
+	}
+	if expected_run_id.is_some_and(|run_id| lease.run_id() != run_id) {
+		return Ok(());
+	}
+
+	state_store.clear_lease(issue_id)
 }
 
 fn is_issue_eligible(
@@ -2660,18 +2698,29 @@ where
 		)?;
 
 		if issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)? {
-			if let Some(marker) = state::read_run_activity_marker_snapshot(&workspace.path)?
-				&& workspace_activity_marker_is_fresh(&marker, now_unix_epoch)
-			{
-				state_store.record_run_attempt(
-					marker.run_id(),
-					&issue.id,
-					marker.attempt_number(),
-					"running",
-				)?;
-				state_store.upsert_lease(project.id(), &issue.id, marker.run_id())?;
+			match state::read_run_activity_marker_snapshot(&workspace.path)? {
+				Some(marker) if workspace_activity_marker_is_fresh(&marker, now_unix_epoch) => {
+					state_store.record_run_attempt(
+						marker.run_id(),
+						&issue.id,
+						marker.attempt_number(),
+						"running",
+					)?;
+					state_store.upsert_lease(project.id(), &issue.id, marker.run_id())?;
 
-				continue;
+					continue;
+				},
+				Some(marker) => {
+					clear_recovered_issue_lease(
+						project.id(),
+						&issue.id,
+						Some(marker.run_id()),
+						state_store,
+					)?;
+				},
+				None => {
+					clear_recovered_issue_lease(project.id(), &issue.id, None, state_store)?;
+				},
 			}
 
 			active_issues.push(issue);
@@ -5650,6 +5699,70 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn stalled_run_reconciliation_preserves_retry_budget_marker_from_retained_workspace() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager = crate::workspace::WorkspaceManager::new(
+			"pubfi",
+			config.repo_root(),
+			config.workspace_root(),
+		);
+		let issue = sample_issue("In Progress", &[]);
+		let run_id = "run-stalled-budget";
+		let workspace_path = config.workspace_root().join("PUB-101");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+		state::write_run_retry_budget_attempt_count(&workspace_path, "older-run", 2, 2)
+			.expect("retry budget marker should write");
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 3, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace mapping should record");
+
+		let action = orchestrator::ActiveRunReconciliation {
+			issue: issue.clone(),
+			run_attempt: state_store
+				.run_attempt(run_id)
+				.expect("run attempt query should succeed")
+				.expect("run attempt should exist"),
+			workspace_mapping: state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace query should succeed"),
+			disposition: orchestrator::ActiveRunDisposition::Stalled {
+				idle_for: ACTIVE_RUN_IDLE_TIMEOUT + Duration::from_secs(1),
+			},
+			workflow: workflow.clone(),
+		};
+
+		orchestrator::apply_active_run_reconciliation(
+			&tracker,
+			&config,
+			&state_store,
+			&workspace_manager,
+			vec![action],
+		)
+		.expect("reconciliation should succeed");
+
+		assert_eq!(
+			state::read_run_retry_budget_attempt_count(&workspace_path)
+				.expect("retry budget marker should read")
+				.expect("retry budget marker should remain present"),
+			2,
+			"stalled reconciliation should preserve the retained retry-budget base"
+		);
+	}
+
+	#[test]
 	fn terminal_failures_without_needs_attention_label_use_nonstartable_guard_state() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![]);
@@ -5995,6 +6108,57 @@ read_first = [{read_first}]
 		assert!(
 			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none(),
 			"dead marker recovery should not reconstruct a live lease"
+		);
+	}
+
+	#[test]
+	fn run_project_once_clears_recovered_lease_when_marker_turns_stale() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("recovered workspace should exist");
+
+		state::write_run_activity_marker(&workspace.path, "run-1", 1)
+			.expect("fresh activity marker should write");
+
+		let initial_summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("initial recovery should succeed");
+
+		assert!(
+			initial_summary.is_none(),
+			"fresh recovered activity should block redispatch and reconstruct the live lease"
+		);
+		assert_eq!(
+			state_store
+				.lease_for_issue(&issue.id)
+				.expect("lease lookup should succeed")
+				.expect("recovered lease should exist")
+				.run_id(),
+			"run-1"
+		);
+
+		state::write_run_activity_marker_for_process(&workspace.path, "run-1", 1, u32::MAX)
+			.expect("stale activity marker should write");
+
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("stale recovery should succeed")
+				.expect("stale recovered lease should no longer block retry planning");
+
+		assert_eq!(summary.issue_id, issue.id);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none(),
+			"stale recovered markers should clear the reconstructed lease before retry planning"
 		);
 	}
 
