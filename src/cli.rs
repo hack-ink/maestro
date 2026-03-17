@@ -91,6 +91,9 @@ struct RunCommand {
 	/// Reuse a daemon-planned attempt number for an issue-targeted run.
 	#[arg(long, value_name = "ATTEMPT", hide = true, requires = "issue_id")]
 	attempt_number: Option<i64>,
+	/// Reuse a daemon-planned workflow snapshot for an issue-targeted run.
+	#[arg(long, value_name = "MARKDOWN", hide = true, requires = "issue_id")]
+	workflow_snapshot: Option<String>,
 	/// Override the service config path.
 	#[arg(long, value_name = "PATH")]
 	config: Option<PathBuf>,
@@ -113,6 +116,7 @@ impl RunCommand {
 			self.dispatch_mode.map(Into::into),
 			self.run_id.as_deref(),
 			self.attempt_number,
+			self.workflow_snapshot.as_deref(),
 		)
 	}
 }
@@ -226,6 +230,7 @@ mod tests {
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
+				workflow_snapshot: None,
 				config: None
 			})
 		));
@@ -244,6 +249,7 @@ mod tests {
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
+				workflow_snapshot: None,
 				config: None
 			})
 		));
@@ -263,6 +269,8 @@ mod tests {
 			"mae-1-attempt-2-123",
 			"--attempt-number",
 			"2",
+			"--workflow-snapshot",
+			"workflow-snapshot",
 		]);
 
 		assert!(matches!(
@@ -274,6 +282,7 @@ mod tests {
 				dispatch_mode: Some(RunIssueDispatchMode::Normal),
 				run_id: Some(_),
 				attempt_number: Some(2),
+				workflow_snapshot: Some(_),
 				config: None
 			})
 		));

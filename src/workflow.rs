@@ -2,7 +2,7 @@
 
 use std::{fs, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::prelude::{Result, eyre};
 
@@ -41,10 +41,23 @@ impl WorkflowDocument {
 	pub fn body(&self) -> &str {
 		&self.body
 	}
+
+	/// Render the workflow back to Markdown for process-to-process handoff.
+	pub fn to_markdown(&self) -> Result<String> {
+		let frontmatter = toml::to_string(&self.frontmatter)?;
+		let mut markdown = format!("{FRONTMATTER_DELIMITER}\n{frontmatter}{FRONTMATTER_DELIMITER}");
+
+		if !self.body.is_empty() {
+			markdown.push_str("\n\n");
+			markdown.push_str(&self.body);
+		}
+
+		Ok(markdown)
+	}
 }
 
 /// Typed TOML frontmatter for a downstream workflow document.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowFrontmatter {
 	version: u8,
 	tracker: WorkflowTracker,
@@ -103,7 +116,7 @@ impl WorkflowFrontmatter {
 }
 
 /// Tracker-facing repository policy.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowTracker {
 	provider: TrackerProvider,
 	#[serde(alias = "project")]
@@ -171,7 +184,7 @@ impl WorkflowTracker {
 }
 
 /// Supported tracker providers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackerProvider {
 	/// Linear issue tracking.
@@ -179,7 +192,7 @@ pub enum TrackerProvider {
 }
 
 /// Repo-local agent defaults.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowAgent {
 	#[serde(default = "default_transport")]
 	transport: String,
@@ -237,7 +250,7 @@ impl Default for WorkflowAgent {
 }
 
 /// Repo-local execution policy.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowExecution {
 	#[serde(default = "default_max_attempts")]
 	max_attempts: u32,
@@ -274,7 +287,7 @@ impl Default for WorkflowExecution {
 }
 
 /// Repo-local early-load context.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowContext {
 	#[serde(default = "default_read_first")]
 	read_first: Vec<String>,
@@ -448,5 +461,43 @@ Read `AGENTS.md` first.
 		let result = WorkflowDocument::parse_markdown("Read `AGENTS.md` first.");
 
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn workflow_document_markdown_round_trips() {
+		let document = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+
+[agent]
+transport = "stdio://"
+sandbox = "workspace-write"
+approval_policy = "never"
+
+[execution]
+max_attempts = 5
+max_retry_backoff_ms = 120000
+validation_commands = ["cargo make test"]
+
+[context]
+read_first = ["AGENTS.md", "README.md"]
++++
+
+Read `AGENTS.md` first.
+Then validate the lane.
+			"#,
+		)
+		.expect("workflow document should parse");
+		let reparsed = WorkflowDocument::parse_markdown(
+			&document.to_markdown().expect("workflow markdown should render"),
+		)
+		.expect("rendered workflow should parse");
+
+		assert_eq!(reparsed, document);
 	}
 }

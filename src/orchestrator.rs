@@ -307,6 +307,7 @@ pub(crate) fn run_once(
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
 	preferred_run_id: Option<&str>,
 	preferred_attempt_number: Option<i64>,
+	preferred_workflow_snapshot: Option<&str>,
 ) -> crate::prelude::Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
@@ -338,6 +339,7 @@ pub(crate) fn run_once(
 		preferred_issue_id,
 		preferred_dispatch_mode,
 		preferred_run_identity,
+		preferred_workflow_snapshot,
 	)? {
 		if dry_run {
 			println!(
@@ -690,6 +692,7 @@ where
 				if from_retry_queue { IssueDispatchMode::Retry } else { IssueDispatchMode::Normal },
 				summary.run_id.as_str(),
 				summary.attempt_number,
+				workflow,
 			)?;
 
 			tracing::info!(
@@ -725,8 +728,10 @@ fn spawn_run_once_child(
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_id: &str,
 	preferred_attempt_number: i64,
+	workflow: &WorkflowDocument,
 ) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
+	let workflow_snapshot = workflow.to_markdown()?;
 	let mut command = Command::new(executable);
 
 	command
@@ -744,7 +749,8 @@ fn spawn_run_once_child(
 			},
 		])
 		.args(["--run-id", preferred_run_id])
-		.args(["--attempt-number", &preferred_attempt_number.to_string()]);
+		.args(["--attempt-number", &preferred_attempt_number.to_string()])
+		.args(["--workflow-snapshot", workflow_snapshot.as_str()]);
 
 	let child = command.spawn()?;
 
@@ -1256,10 +1262,10 @@ fn run_configured_cycle(
 	preferred_issue_id: Option<&str>,
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
 	preferred_run_identity: Option<PreferredRunIdentity<'_>>,
+	preferred_workflow_snapshot: Option<&str>,
 ) -> crate::prelude::Result<Option<RunSummary>> {
 	let config = ServiceConfig::from_path(config_path)?;
-	let workflow_path = config.repo_root().join(config.workflow_path());
-	let workflow = WorkflowDocument::from_path(&workflow_path)?;
+	let workflow = load_configured_cycle_workflow(&config, preferred_workflow_snapshot)?;
 	let api_key = config.tracker().resolve_api_key()?;
 	let tracker = LinearClient::new(api_key)?;
 
@@ -1277,6 +1283,18 @@ fn run_configured_cycle(
 	}
 
 	run_project_once(&tracker, &config, &workflow, state_store, dry_run)
+}
+
+fn load_configured_cycle_workflow(
+	config: &ServiceConfig,
+	preferred_workflow_snapshot: Option<&str>,
+) -> crate::prelude::Result<WorkflowDocument> {
+	let workflow_path = config.repo_root().join(config.workflow_path());
+
+	match preferred_workflow_snapshot {
+		Some(snapshot) => WorkflowDocument::parse_markdown(snapshot),
+		None => WorkflowDocument::from_path(&workflow_path),
+	}
 }
 
 fn run_project_once<T>(
@@ -2924,6 +2942,41 @@ read_first = [{read_first}]
 		assert_ne!(reloaded, workflow);
 		assert_eq!(reloaded.frontmatter().execution().max_attempts(), 5);
 		assert_eq!(reloaded.body(), "Updated workflow policy.");
+	}
+
+	#[test]
+	fn configured_cycle_workflow_snapshot_overrides_invalid_disk_workflow() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workflow_snapshot = workflow.to_markdown().expect("workflow markdown should render");
+
+		fs::write(config.repo_root().join("WORKFLOW.md"), "not valid workflow markdown")
+			.expect("invalid workflow should be written");
+
+		assert!(
+			orchestrator::load_configured_cycle_workflow(&config, None).is_err(),
+			"without an override the configured workflow load should fail"
+		);
+
+		let loaded =
+			orchestrator::load_configured_cycle_workflow(&config, Some(&workflow_snapshot))
+				.expect("configured workflow load should accept the supplied snapshot");
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &loaded,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			preferred_run_identity: None,
+		})
+		.expect("target issue dry run should succeed with the supplied snapshot");
+
+		assert!(summary.is_some(), "the child path should still run off the cached snapshot");
 	}
 
 	#[test]
