@@ -753,6 +753,11 @@ where
 				return Ok(());
 			}
 
+			let materialized_workspace = materialize_run_summary_workspace(project, &summary)
+				.inspect_err(|_error| {
+					let _ = state_store.clear_lease(&summary.issue_id);
+				})?;
+
 			state_store.record_run_attempt(
 				&summary.run_id,
 				&summary.issue_id,
@@ -762,8 +767,8 @@ where
 			state_store.upsert_workspace(
 				project.id(),
 				&summary.issue_id,
-				&summary.branch_name,
-				&summary.workspace_path.display().to_string(),
+				&materialized_workspace.branch_name,
+				&materialized_workspace.path.display().to_string(),
 			)?;
 
 			#[cfg(unix)]
@@ -786,7 +791,7 @@ where
 			})?;
 
 			if let Err(error) = state::write_run_activity_marker_for_process(
-				&summary.workspace_path,
+				&materialized_workspace.path,
 				&summary.run_id,
 				summary.attempt_number,
 				child.id(),
@@ -805,7 +810,7 @@ where
 
 			tracing::info!(
 				issue = summary.issue_identifier,
-				workspace = %summary.workspace_path.display(),
+				workspace = %materialized_workspace.path.display(),
 				retry = from_retry_queue,
 				"Spawned daemon child for active issue lane."
 			);
@@ -828,6 +833,34 @@ where
 	}
 
 	Ok(())
+}
+
+fn materialize_run_summary_workspace(
+	project: &ServiceConfig,
+	summary: &RunSummary,
+) -> crate::prelude::Result<WorkspaceSpec> {
+	let workspace_manager =
+		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
+	let workspace = workspace_manager.ensure_workspace(&summary.issue_identifier, false)?;
+
+	if workspace.path != summary.workspace_path {
+		eyre::bail!(
+			"planned workspace path `{}` diverged from materialized path `{}` for issue `{}`",
+			summary.workspace_path.display(),
+			workspace.path.display(),
+			summary.issue_identifier
+		);
+	}
+	if workspace.branch_name != summary.branch_name {
+		eyre::bail!(
+			"planned branch `{}` diverged from materialized branch `{}` for issue `{}`",
+			summary.branch_name,
+			workspace.branch_name,
+			summary.issue_identifier
+		);
+	}
+
+	Ok(workspace)
 }
 
 fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude::Result<Child> {
@@ -3028,7 +3061,7 @@ mod tests {
 		cell::RefCell,
 		fs,
 		path::{Path, PathBuf},
-		process::Command,
+		process::{self, Command},
 		thread,
 		time::{Duration, Instant},
 	};
@@ -6032,6 +6065,44 @@ read_first = [{read_first}]
 				.is_some(),
 			"workspace mapping should be reconstructed from the retained lane"
 		);
+	}
+
+	#[test]
+	fn materialize_run_summary_workspace_creates_workspace_before_child_activity_marker() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("dry-run planning should succeed")
+				.expect("brand-new lane should be selected");
+
+		assert!(
+			!summary.workspace_path.exists(),
+			"dry-run planning should not materialize the workspace yet"
+		);
+
+		let workspace = orchestrator::materialize_run_summary_workspace(&config, &summary)
+			.expect("daemon parent should materialize the workspace before child startup");
+
+		assert_eq!(workspace.path, summary.workspace_path);
+		assert_eq!(workspace.branch_name, summary.branch_name);
+		assert!(
+			workspace.path.exists(),
+			"materialized workspace should exist before writing child activity markers"
+		);
+
+		state::write_run_activity_marker_for_process(
+			&workspace.path,
+			&summary.run_id,
+			summary.attempt_number,
+			process::id(),
+		)
+		.expect("child activity marker should write after workspace materialization");
 	}
 
 	#[test]
