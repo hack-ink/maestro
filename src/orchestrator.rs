@@ -620,7 +620,7 @@ where
 					run_id: &daemon_child.run_id,
 					attempt_number: daemon_child.attempt_number,
 				},
-				child_exit_status.is_some_and(|status| status.success()),
+				false,
 			)?;
 
 			if let Some(exit_status) = child_exit_status {
@@ -4353,7 +4353,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn exited_child_cleanup_clears_orphaned_active_run_state() {
+	fn exited_child_cleanup_preserves_run_status_on_clean_exit() {
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("In Progress", &[]);
 
@@ -4365,7 +4365,7 @@ read_first = [{read_first}]
 		orchestrator::clear_orphaned_daemon_child_state(
 			&state_store,
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id: "run-1", attempt_number: 1 },
-			true,
+			false,
 		)
 		.expect("orphaned child cleanup should succeed");
 
@@ -4378,7 +4378,14 @@ read_first = [{read_first}]
 				.expect("run attempt lookup should succeed")
 				.expect("run attempt should exist")
 				.status(),
-			"interrupted"
+			"running"
+		);
+		assert_eq!(
+			state_store
+				.retry_budget_attempt_count(&issue.id)
+				.expect("retry budget count should succeed"),
+			0,
+			"clean exits should not consume retry budget during orphan cleanup"
 		);
 	}
 
@@ -4418,6 +4425,40 @@ read_first = [{read_first}]
 				.expect("run attempt should exist")
 				.status(),
 			"running"
+		);
+	}
+
+	#[test]
+	fn exited_child_cleanup_marks_interrupted_when_requested() {
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Progress", &[]);
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+
+		orchestrator::clear_orphaned_daemon_child_state(
+			&state_store,
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id: "run-1", attempt_number: 1 },
+			true,
+		)
+		.expect("orphaned child cleanup should succeed");
+
+		assert_eq!(
+			state_store
+				.run_attempt("run-1")
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"interrupted"
+		);
+		assert_eq!(
+			state_store
+				.retry_budget_attempt_count(&issue.id)
+				.expect("retry budget count should succeed"),
+			1,
+			"explicitly interrupted cleanups should consume retry budget"
 		);
 	}
 
