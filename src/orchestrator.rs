@@ -43,6 +43,7 @@ pub(crate) struct RunOnceRequest<'a> {
 	pub(crate) config_path: Option<&'a Path>,
 	pub(crate) dry_run: bool,
 	pub(crate) preferred_issue_id: Option<&'a str>,
+	pub(crate) preferred_lease_acquired: bool,
 	pub(crate) preferred_dispatch_mode: Option<IssueDispatchMode>,
 	pub(crate) preferred_run_id: Option<&'a str>,
 	pub(crate) preferred_attempt_number: Option<i64>,
@@ -83,6 +84,7 @@ struct RunCycleRequest<'a> {
 	state_store: &'a StateStore,
 	dry_run: bool,
 	preferred_issue_id: Option<&'a str>,
+	preferred_lease_acquired: bool,
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -97,6 +99,7 @@ struct PrepareIssueRunContext<'a, T> {
 	state_store: &'a StateStore,
 	workspace_manager: &'a WorkspaceManager,
 	dry_run: bool,
+	lease_preacquired: bool,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -311,6 +314,7 @@ struct TargetIssueRunContext<'a, T> {
 	state_store: &'a StateStore,
 	issue_id: &'a str,
 	dry_run: bool,
+	lease_preacquired: bool,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -361,6 +365,7 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		state_store: &state_store,
 		dry_run: request.dry_run,
 		preferred_issue_id: request.preferred_issue_id,
+		preferred_lease_acquired: request.preferred_lease_acquired,
 		preferred_dispatch_mode: request.preferred_dispatch_mode,
 		preferred_run_identity,
 		preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -720,6 +725,8 @@ where
 
 	match next_run {
 		Some((summary, from_retry_queue)) => {
+			state_store.configure_dispatch_slot_root(project.id(), project.workspace_root())?;
+
 			validate_review_handoff_runtime(false)?;
 
 			let retry_budget_base = state_store.retry_budget_attempt_count(&summary.issue_id)?;
@@ -814,6 +821,7 @@ fn spawn_run_once_child(
 		.args(["--run-id", preferred_run_id])
 		.args(["--attempt-number", &preferred_attempt_number.to_string()])
 		.args(["--retry-budget-base", &preferred_retry_budget_base.to_string()])
+		.arg("--lease-preacquired")
 		.args(["--workflow-snapshot", workflow_snapshot.as_str()]);
 
 	let child = command.spawn()?;
@@ -865,6 +873,7 @@ where
 		state_store,
 		issue_id: &entry.issue_id,
 		dry_run: true,
+		lease_preacquired: false,
 		dispatch_mode: IssueDispatchMode::Retry,
 		preferred_run_identity: None,
 		preferred_retry_budget_base: None,
@@ -1390,6 +1399,7 @@ fn run_configured_cycle(
 			state_store: request.state_store,
 			issue_id,
 			dry_run: request.dry_run,
+			lease_preacquired: request.preferred_lease_acquired,
 			dispatch_mode: request.preferred_dispatch_mode.unwrap_or(IssueDispatchMode::Retry),
 			preferred_run_identity: request.preferred_run_identity,
 			preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -1423,6 +1433,9 @@ where
 {
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
+
+	state_store.configure_dispatch_slot_root(project.id(), project.workspace_root())?;
+
 	let recovered_state =
 		recover_runtime_state_from_tracker_and_workspaces(tracker, project, workflow, state_store)?;
 
@@ -1466,6 +1479,7 @@ where
 			state_store,
 			workspace_manager: &workspace_manager,
 			dry_run,
+			lease_preacquired: false,
 			dispatch_mode,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -1490,6 +1504,10 @@ where
 		context.project.repo_root(),
 		context.project.workspace_root(),
 	);
+
+	context
+		.state_store
+		.configure_dispatch_slot_root(context.project.id(), context.project.workspace_root())?;
 
 	recover_runtime_state_from_tracker_and_workspaces(
 		context.tracker,
@@ -1537,6 +1555,7 @@ where
 			state_store: context.state_store,
 			workspace_manager: &workspace_manager,
 			dry_run: context.dry_run,
+			lease_preacquired: context.lease_preacquired,
 			dispatch_mode: context.dispatch_mode,
 			preferred_run_identity: context.preferred_run_identity,
 			preferred_retry_budget_base: context.preferred_retry_budget_base,
@@ -1581,6 +1600,7 @@ where
 	let lease_issue_id = issue.id.clone();
 
 	if !context.dry_run
+		&& !context.lease_preacquired
 		&& !context.state_store.try_acquire_lease(context.project.id(), &issue.id, &run_id)?
 	{
 		return Ok(None);
@@ -3197,6 +3217,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			dry_run: true,
+			lease_preacquired: false,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3407,6 +3428,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			dry_run: true,
+			lease_preacquired: false,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3432,6 +3454,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			dry_run: true,
+			lease_preacquired: false,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3460,6 +3483,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			dry_run: true,
+			lease_preacquired: false,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3490,6 +3514,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			dry_run: true,
+			lease_preacquired: false,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4572,6 +4597,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 				workspace_manager: &workspace_manager,
 				dry_run: false,
+				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 				preferred_run_identity: None,
 				preferred_retry_budget_base: None,
@@ -4616,6 +4642,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 				workspace_manager: &workspace_manager,
 				dry_run: false,
+				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 					run_id: "planned-run",
@@ -4641,6 +4668,61 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn prepare_issue_run_allows_preacquired_cross_process_slot() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let parent_store = StateStore::open_in_memory().expect("parent state store should open");
+		let child_store = StateStore::open_in_memory().expect("child state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+
+		parent_store
+			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.expect("parent dispatch-slot root should configure");
+		child_store
+			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.expect("child dispatch-slot root should configure");
+
+		assert!(
+			parent_store
+				.try_acquire_lease(config.id(), &issue.id, "planned-run")
+				.expect("parent should acquire the shared dispatch slot")
+		);
+
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &child_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				lease_preacquired: true,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
+					run_id: "planned-run",
+					attempt_number: 1,
+				}),
+				preferred_retry_budget_base: None,
+			},
+			issue.clone(),
+		)
+		.expect("preacquired issue preparation should succeed")
+		.expect("targeted issue should prepare under the preacquired lease");
+
+		assert_eq!(issue_run.run_id, "planned-run");
+		assert!(
+			child_store
+				.lease_for_issue(&issue.id)
+				.expect("child lease lookup should succeed")
+				.is_none(),
+			"preacquired child runs should not mint a second local lease"
+		);
+	}
+
+	#[test]
 	fn prepare_issue_run_rejects_stale_preferred_identity_after_attempt_advance() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
@@ -4662,6 +4744,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 				workspace_manager: &workspace_manager,
 				dry_run: false,
+				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 					run_id: "planned-run",
@@ -5193,6 +5276,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 				workspace_manager: &workspace_manager,
 				dry_run: false,
+				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_run_identity: None,
 				preferred_retry_budget_base: None,

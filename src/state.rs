@@ -3,7 +3,7 @@
 use std::{
 	cmp::Ordering,
 	collections::HashMap,
-	fs,
+	fs::{self, File, OpenOptions, TryLockError},
 	io::ErrorKind,
 	path::{Path, PathBuf},
 	sync::{Mutex, MutexGuard},
@@ -14,6 +14,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::prelude::{Result, eyre};
 
 pub(crate) const RUN_ACTIVITY_MARKER_FILE: &str = ".maestro-run-activity";
+
+const DISPATCH_SLOT_LOCK_FILE: &str = ".maestro-dispatch-slot.lock";
 
 /// Local runtime store for leases, attempts, workspaces, and protocol events.
 #[derive(Default)]
@@ -29,6 +31,21 @@ impl StateStore {
 	/// Open an in-memory runtime store for tests and probes.
 	pub fn open_in_memory() -> Result<Self> {
 		Ok(Self::default())
+	}
+
+	/// Configure the shared cross-process dispatch-slot root for one project.
+	pub fn configure_dispatch_slot_root(
+		&self,
+		project_id: &str,
+		workspace_root: impl AsRef<Path>,
+	) -> Result<()> {
+		let mut state = self.lock()?;
+
+		state
+			.dispatch_lock_roots
+			.insert(project_id.to_owned(), workspace_root.as_ref().to_path_buf());
+
+		Ok(())
 	}
 
 	/// Create or replace the active lease for one issue.
@@ -62,6 +79,27 @@ impl StateStore {
 			.any(|lease| lease.project_id == project_id || lease.issue_id == issue_id)
 		{
 			return Ok(false);
+		}
+
+		if let Some(dispatch_lock_root) = state.dispatch_lock_roots.get(project_id) {
+			fs::create_dir_all(dispatch_lock_root)?;
+
+			let lock_file = OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create(true)
+				.truncate(false)
+				.open(dispatch_lock_root.join(DISPATCH_SLOT_LOCK_FILE))?;
+
+			match lock_file.try_lock() {
+				Ok(()) => {
+					state
+						.dispatch_slot_guards
+						.insert(project_id.to_owned(), DispatchSlotGuard { _lock_file: lock_file });
+				},
+				Err(TryLockError::WouldBlock) => return Ok(false),
+				Err(TryLockError::Error(error)) => return Err(error.into()),
+			}
 		}
 
 		state.leases.insert(
@@ -101,8 +139,13 @@ impl StateStore {
 	/// Remove the active lease for one issue.
 	pub fn clear_lease(&self, issue_id: &str) -> Result<()> {
 		let mut state = self.lock()?;
+		let Some(lease) = state.leases.remove(issue_id) else {
+			return Ok(());
+		};
 
-		state.leases.remove(issue_id);
+		if !state.leases.values().any(|active| active.project_id() == lease.project_id()) {
+			state.dispatch_slot_guards.remove(lease.project_id());
+		}
 
 		Ok(())
 	}
@@ -573,12 +616,18 @@ impl WorkspaceMapping {
 	}
 }
 
+struct DispatchSlotGuard {
+	_lock_file: File,
+}
+
 #[derive(Default)]
 struct StateData {
 	leases: HashMap<String, IssueLease>,
 	run_attempts: HashMap<String, RunAttemptRecord>,
 	events: HashMap<String, Vec<ProtocolEventRecord>>,
 	workspaces: HashMap<String, WorkspaceMappingRecord>,
+	dispatch_lock_roots: HashMap<String, PathBuf>,
+	dispatch_slot_guards: HashMap<String, DispatchSlotGuard>,
 }
 impl StateData {
 	fn project_run_status(
@@ -831,6 +880,8 @@ fn compare_project_run_status(left: &ProjectRunStatus, right: &ProjectRunStatus)
 mod tests {
 	use std::path::Path;
 
+	use tempfile::TempDir;
+
 	use crate::state::StateStore;
 
 	#[test]
@@ -876,6 +927,39 @@ mod tests {
 			store
 				.try_acquire_lease("other", "PUB-201", "run-4")
 				.expect("other project should still acquire its own slot")
+		);
+	}
+
+	#[test]
+	fn shared_dispatch_slot_blocks_across_process_local_stores() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let store_one = StateStore::open_in_memory().expect("first store should open");
+		let store_two = StateStore::open_in_memory().expect("second store should open");
+
+		store_one
+			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.expect("first store should configure dispatch slot root");
+		store_two
+			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.expect("second store should configure dispatch slot root");
+
+		assert!(
+			store_one
+				.try_acquire_lease("pubfi", "PUB-101", "run-1")
+				.expect("first shared lease acquisition should succeed")
+		);
+		assert!(
+			!store_two
+				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.expect("second store should observe the shared slot as busy")
+		);
+
+		store_one.clear_lease("PUB-101").expect("shared lease should clear");
+
+		assert!(
+			store_two
+				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.expect("shared slot should reopen after the first lease clears")
 		);
 	}
 

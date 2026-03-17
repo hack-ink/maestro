@@ -85,6 +85,9 @@ struct RunCommand {
 	/// Override the dispatch policy for an issue-targeted run.
 	#[arg(long, value_name = "MODE", value_enum, hide = true, requires = "issue_id")]
 	dispatch_mode: Option<RunIssueDispatchMode>,
+	/// Reuse a daemon-held lease for an issue-targeted child run.
+	#[arg(long, hide = true, requires = "issue_id")]
+	lease_preacquired: bool,
 	/// Reuse a daemon-planned run identifier for an issue-targeted run.
 	#[arg(long, value_name = "RUN_ID", hide = true, requires = "issue_id")]
 	run_id: Option<String>,
@@ -116,6 +119,7 @@ impl RunCommand {
 			config_path: self.config.as_deref(),
 			dry_run: self.dry_run,
 			preferred_issue_id: self.issue_id.as_deref(),
+			preferred_lease_acquired: self.lease_preacquired,
 			preferred_dispatch_mode: self.dispatch_mode.map(Into::into),
 			preferred_run_id: self.run_id.as_deref(),
 			preferred_attempt_number: self.attempt_number,
@@ -231,6 +235,7 @@ mod tests {
 				once: true,
 				dry_run: true,
 				issue_id: None,
+				lease_preacquired: false,
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
@@ -251,6 +256,7 @@ mod tests {
 				once: true,
 				dry_run: false,
 				issue_id: Some(_),
+				lease_preacquired: false,
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
@@ -287,6 +293,7 @@ mod tests {
 				once: true,
 				dry_run: false,
 				issue_id: Some(_),
+				lease_preacquired: false,
 				dispatch_mode: Some(RunIssueDispatchMode::Normal),
 				run_id: Some(_),
 				attempt_number: Some(2),

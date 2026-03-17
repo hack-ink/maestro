@@ -1,6 +1,6 @@
 use std::{
 	env,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	time::{Duration, Instant},
 };
 
@@ -136,7 +136,7 @@ impl<'a> RunRecorder<'a> {
 
 	fn mark_activity(&self) -> Result<()> {
 		if let Some(marker_path) = self.activity_marker_path {
-			state::write_run_activity_marker(marker_path, self.run_id, self.attempt_number)?;
+			write_activity_marker_best_effort(marker_path, self.run_id, self.attempt_number);
 		}
 
 		Ok(())
@@ -146,11 +146,11 @@ impl<'a> RunRecorder<'a> {
 		self.state_store.append_event(self.run_id, self.next_sequence, event_type, payload)?;
 
 		if let Some(marker_path) = self.activity_marker_path {
-			state::write_run_protocol_activity_marker(
+			write_protocol_activity_marker_best_effort(
 				marker_path,
 				self.run_id,
 				self.attempt_number,
-			)?;
+			);
 		}
 
 		self.next_sequence += 1;
@@ -371,7 +371,7 @@ pub(crate) fn execute_app_server_run(
 	)?;
 
 	if let Some(marker_path) = request.activity_marker_path.as_ref() {
-		state::write_run_activity_marker(marker_path, &request.run_id, request.attempt_number)?;
+		write_activity_marker_best_effort(marker_path, &request.run_id, request.attempt_number);
 	}
 
 	let result = execute_app_server_run_inner(request, state_store);
@@ -385,7 +385,7 @@ pub(crate) fn execute_app_server_run(
 		)?;
 
 		if let Some(marker_path) = request.activity_marker_path.as_ref() {
-			state::write_run_activity_marker(marker_path, &request.run_id, request.attempt_number)?;
+			write_activity_marker_best_effort(marker_path, &request.run_id, request.attempt_number);
 		}
 	}
 
@@ -424,6 +424,36 @@ pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
 	}
 
 	Ok(result)
+}
+
+fn write_activity_marker_best_effort(marker_path: &Path, run_id: &str, attempt_number: i64) {
+	if let Err(error) = state::write_run_activity_marker(marker_path, run_id, attempt_number) {
+		tracing::warn!(
+			?error,
+			run_id,
+			attempt_number,
+			marker_path = %marker_path.display(),
+			"Failed to update workspace activity marker."
+		);
+	}
+}
+
+fn write_protocol_activity_marker_best_effort(
+	marker_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+) {
+	if let Err(error) =
+		state::write_run_protocol_activity_marker(marker_path, run_id, attempt_number)
+	{
+		tracing::warn!(
+			?error,
+			run_id,
+			attempt_number,
+			marker_path = %marker_path.display(),
+			"Failed to update workspace protocol-activity marker."
+		);
+	}
 }
 
 fn execute_app_server_run_inner(
@@ -746,11 +776,19 @@ fn thread_id_from_value(value: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-	use std::time::{Duration, Instant};
+	use std::{
+		path::PathBuf,
+		time::{Duration, Instant},
+	};
 
-	use crate::agent::{
-		app_server::AppServerRunResult,
-		json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
+	use tempfile::TempDir;
+
+	use crate::{
+		agent::{
+			app_server::AppServerRunResult,
+			json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
+		},
+		state::StateStore,
 	};
 
 	fn notification_message(method: &str, params: serde_json::Value) -> WireMessage {
@@ -840,5 +878,19 @@ mod tests {
 		let last_activity_at = now.checked_sub(Duration::from_secs(301)).expect("instant math");
 
 		assert!(super::remaining_idle_budget(last_activity_at, now, timeout).is_none());
+	}
+
+	#[test]
+	fn run_recorder_keeps_events_when_marker_write_fails() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let missing_workspace = PathBuf::from(temp_dir.path()).join("missing-workspace");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut recorder =
+			super::RunRecorder::new(&state_store, "run-1", 1, Some(&missing_workspace));
+
+		recorder.mark_activity().expect("marker failures should be non-fatal");
+		recorder.record("turn/started", "{\"turn\":\"1\"}").expect("event should record");
+
+		assert_eq!(state_store.event_count("run-1").expect("event count should load"), 1);
 	}
 }
