@@ -14,6 +14,7 @@ use std::{
 };
 
 use color_eyre::Report;
+use libc::pid_t;
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -2790,16 +2791,21 @@ fn workspace_activity_marker_is_fresh(marker: &RunActivityMarker, now_unix_epoch
 
 #[cfg(unix)]
 fn process_is_alive(process_id: u32) -> bool {
-	let Ok(process_id) = i32::try_from(process_id) else {
+	let Ok(process_id) = pid_t::try_from(process_id) else {
 		return false;
 	};
 
-	Command::new("kill")
-		.args(["-0", &process_id.to_string()])
-		.stdout(Stdio::null())
-		.stderr(Stdio::null())
-		.status()
-		.is_ok_and(|status| status.success())
+	if process_id <= 0 {
+		return false;
+	}
+
+	// Use the kernel liveness probe directly so recovery does not depend on a shell
+	// builtin or `kill` binary being present on PATH.
+	match unsafe { libc::kill(process_id, 0) } {
+		0 => true,
+		-1 => matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM)),
+		_ => false,
+	}
 }
 
 #[cfg(not(unix))]
@@ -6227,6 +6233,24 @@ read_first = [{read_first}]
 		assert!(
 			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none(),
 			"dead marker recovery should not reconstruct a live lease"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn process_is_alive_accepts_current_process_without_shelling_out() {
+		assert!(
+			orchestrator::process_is_alive(process::id()),
+			"current process should always be reported as alive"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn process_is_alive_rejects_invalid_pid_sentinel() {
+		assert!(
+			!orchestrator::process_is_alive(u32::MAX),
+			"sentinel pid values should never be treated as live processes"
 		);
 	}
 
