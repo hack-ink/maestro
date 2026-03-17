@@ -21,6 +21,7 @@ pub(crate) const ISSUE_TRANSITION_TOOL_NAME: &str = "issue_transition";
 pub(crate) const ISSUE_COMMENT_TOOL_NAME: &str = "issue_comment";
 pub(crate) const ISSUE_LABEL_ADD_TOOL_NAME: &str = "issue_label_add";
 pub(crate) const ISSUE_REVIEW_HANDOFF_TOOL_NAME: &str = "issue_review_handoff";
+pub(crate) const ISSUE_TERMINAL_FINALIZE_TOOL_NAME: &str = "issue_terminal_finalize";
 
 static GH_PULL_REQUEST_INSPECTOR: GhPullRequestInspector = GhPullRequestInspector;
 static LOCAL_GIT_REPO_INSPECTOR: LocalGitRepoInspector = LocalGitRepoInspector;
@@ -28,6 +29,9 @@ static LOCAL_GIT_REPO_INSPECTOR: LocalGitRepoInspector = LocalGitRepoInspector;
 pub(crate) trait DynamicToolHandler {
 	fn tool_specs(&self) -> Vec<DynamicToolSpec>;
 	fn handle_call(&self, tool_name: &str, arguments: Value) -> DynamicToolCallResponse;
+	fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
+		Ok(())
+	}
 }
 
 pub(crate) trait PullRequestInspector {
@@ -63,6 +67,7 @@ pub(crate) struct TrackerToolBridge<'a> {
 	manual_attention_requested: RefCell<bool>,
 	manual_attention_comment_recorded: RefCell<bool>,
 	pending_review_handoff: RefCell<Option<PendingReviewHandoff>>,
+	finalized_completion_path: RefCell<Option<RunCompletionDisposition>>,
 }
 impl<'a> TrackerToolBridge<'a> {
 	#[cfg(test)]
@@ -81,6 +86,7 @@ impl<'a> TrackerToolBridge<'a> {
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
 			pending_review_handoff: RefCell::new(None),
+			finalized_completion_path: RefCell::new(None),
 		}
 	}
 
@@ -102,6 +108,7 @@ impl<'a> TrackerToolBridge<'a> {
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
 			pending_review_handoff: RefCell::new(None),
+			finalized_completion_path: RefCell::new(None),
 		}
 	}
 
@@ -191,23 +198,44 @@ impl<'a> TrackerToolBridge<'a> {
 		];
 
 		if self.review_context.is_some() {
-			tool_specs.push(DynamicToolSpec {
-				name: ISSUE_REVIEW_HANDOFF_TOOL_NAME.to_owned(),
-				description: String::from(
-					"Record a PR-backed review handoff for the currently leased issue after the branch is pushed and a non-draft PR is ready for review.",
-				),
-				input_schema: serde_json::json!({
-					"type": "object",
-					"properties": {
-						"issue_id": { "type": "string" },
-						"issue_identifier": { "type": "string" },
-						"pr_url": { "type": "string" },
-						"summary": { "type": "string" }
-					},
-					"required": ["pr_url", "summary"],
-					"additionalProperties": false
-				}),
-			});
+			tool_specs.extend([
+				DynamicToolSpec {
+					name: ISSUE_REVIEW_HANDOFF_TOOL_NAME.to_owned(),
+					description: String::from(
+						"Record a PR-backed review handoff for the currently leased issue after the branch is pushed and a non-draft PR is ready for review.",
+					),
+					input_schema: serde_json::json!({
+						"type": "object",
+						"properties": {
+							"issue_id": { "type": "string" },
+							"issue_identifier": { "type": "string" },
+							"pr_url": { "type": "string" },
+							"summary": { "type": "string" }
+						},
+						"required": ["pr_url", "summary"],
+						"additionalProperties": false
+					}),
+				},
+				DynamicToolSpec {
+					name: ISSUE_TERMINAL_FINALIZE_TOOL_NAME.to_owned(),
+					description: String::from(
+						"Finalize the current run's terminal tracker path after either PR-backed review handoff or the manual-attention exit has been fully recorded.",
+					),
+					input_schema: serde_json::json!({
+						"type": "object",
+						"properties": {
+							"issue_id": { "type": "string" },
+							"issue_identifier": { "type": "string" },
+							"path": {
+								"type": "string",
+								"enum": ["review_handoff", "manual_attention"]
+							}
+						},
+						"required": ["path"],
+						"additionalProperties": false
+					}),
+				},
+			]);
 		}
 
 		tool_specs.extend([DynamicToolSpec {
@@ -236,6 +264,7 @@ impl<'a> TrackerToolBridge<'a> {
 			ISSUE_COMMENT_TOOL_NAME => self.handle_comment(arguments),
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME => self.handle_review_handoff(arguments),
 			ISSUE_LABEL_ADD_TOOL_NAME => self.handle_add_label(arguments),
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME => self.handle_terminal_finalize(arguments),
 			_ =>
 				DynamicToolCallResponse::failure(format!("Unsupported tracker tool `{tool_name}`.")),
 		}
@@ -454,6 +483,51 @@ impl<'a> TrackerToolBridge<'a> {
 		}
 	}
 
+	fn handle_terminal_finalize(&self, arguments: Value) -> DynamicToolCallResponse {
+		let parsed = match serde_json::from_value::<TerminalFinalizeArgs>(arguments) {
+			Ok(parsed) => parsed,
+			Err(error) => {
+				return DynamicToolCallResponse::failure(format!(
+					"Invalid `issue.terminal_finalize` arguments: {error}"
+				));
+			},
+		};
+
+		if let Err(error) = self.ensure_issue_scope(&parsed.scope) {
+			return DynamicToolCallResponse::failure(error);
+		}
+
+		let requested_path = match parsed.path.as_str() {
+			"review_handoff" => RunCompletionDisposition::ReviewHandoff,
+			"manual_attention" => RunCompletionDisposition::ManualAttention,
+			other => {
+				return DynamicToolCallResponse::failure(format!(
+					"`{ISSUE_TERMINAL_FINALIZE_TOOL_NAME}` path must be `review_handoff` or `manual_attention`, not `{other}`."
+				));
+			},
+		};
+		let actual_path = match self.completion_disposition() {
+			Ok(actual_path) => actual_path,
+			Err(error) => return DynamicToolCallResponse::failure(error.to_string()),
+		};
+
+		if requested_path != actual_path {
+			return DynamicToolCallResponse::failure(format!(
+				"`{ISSUE_TERMINAL_FINALIZE_TOOL_NAME}` requested path `{}`, but the recorded terminal path is `{}`.",
+				requested_path.as_str(),
+				actual_path.as_str()
+			));
+		}
+
+		self.finalized_completion_path.replace(Some(actual_path));
+
+		DynamicToolCallResponse::success(format!(
+			"Finalized terminal path `{}` for issue `{}`. You can only finish the turn after this succeeds.",
+			actual_path.as_str(),
+			self.issue.identifier
+		))
+	}
+
 	fn ensure_issue_scope(&self, scope: &ScopeArgs) -> Result<(), String> {
 		if let Some(issue_id) = scope.issue_id.as_deref()
 			&& issue_id != self.issue.id
@@ -651,6 +725,44 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 	fn handle_call(&self, tool_name: &str, arguments: Value) -> DynamicToolCallResponse {
 		self.handle_call_inner(tool_name, arguments)
 	}
+
+	fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
+		let completion_path = self.completion_disposition()?;
+		let Some(finalized_path) = *self.finalized_completion_path.borrow() else {
+			let Some(review_context) = self.review_context.as_ref() else {
+				eyre::bail!(
+					"Review handoff context is unavailable for issue `{}`.",
+					self.issue.identifier
+				);
+			};
+
+			eyre::bail!(
+				"Run `{}` completed, but issue `{}` never called `{}` for terminal path `{}`.",
+				review_context.run_id,
+				self.issue.identifier,
+				ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+				completion_path.as_str()
+			);
+		};
+
+		if finalized_path != completion_path {
+			let Some(review_context) = self.review_context.as_ref() else {
+				eyre::bail!(
+					"Review handoff context is unavailable for issue `{}`.",
+					self.issue.identifier
+				);
+			};
+
+			eyre::bail!(
+				"Run `{}` finalized terminal path `{}`, but the recorded terminal path resolved to `{}` at turn completion.",
+				review_context.run_id,
+				finalized_path.as_str(),
+				completion_path.as_str()
+			);
+		}
+
+		Ok(())
+	}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -666,6 +778,14 @@ pub(crate) struct ReviewHandoffContext {
 pub(crate) enum RunCompletionDisposition {
 	ManualAttention,
 	ReviewHandoff,
+}
+impl RunCompletionDisposition {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::ManualAttention => "manual_attention",
+			Self::ReviewHandoff => "review_handoff",
+		}
+	}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -834,6 +954,13 @@ struct LabelArgs {
 	scope: ScopeArgs,
 	#[serde(alias = "label_name")]
 	label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalFinalizeArgs {
+	#[serde(flatten)]
+	scope: ScopeArgs,
+	path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1037,9 +1164,10 @@ mod tests {
 	use crate::{
 		agent::tracker_tool_bridge::{
 			DynamicToolHandler, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
-			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, LocalRepoDetails,
-			LocalRepoInspector, PullRequestDetails, PullRequestInspector, ReviewHandoffContext,
-			RunCompletionDisposition, TrackerToolBridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			ISSUE_TRANSITION_TOOL_NAME, LocalRepoDetails, LocalRepoInspector, PullRequestDetails,
+			PullRequestInspector, ReviewHandoffContext, RunCompletionDisposition,
+			TrackerToolBridge,
 		},
 		prelude::{Result, eyre},
 		tracker::{
@@ -1519,6 +1647,30 @@ Use the tracker tools.
 	}
 
 	#[test]
+	fn turn_completion_rejects_xy_156_shape_without_terminal_tracker_action() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let error = DynamicToolHandler::validate_turn_completion(
+			&bridge,
+			"Implementation and tests are done, but commit, push, PR, and tracker handoff remain.",
+		)
+		.expect_err("turn completion should reject missing terminal tracker actions");
+
+		assert!(error.to_string().contains("recorded neither a PR-backed review handoff"));
+	}
+
+	#[test]
 	fn manual_attention_requires_explanatory_comment() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
@@ -1682,6 +1834,180 @@ Use the tracker tools.
 		assert!(comments[0].contains("- pr_url: `https://github.com/helixbox/maestro/pull/42`"));
 		assert!(comments[0].contains("- validation_result: `passed`"));
 		assert!(comments[0].contains("- workspace_path: `.workspaces/PUB-618`"));
+	}
+
+	#[test]
+	fn turn_completion_requires_explicit_terminal_finalize_after_review_handoff() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(vec![Ok(PullRequestDetails {
+			head_ref_name: String::from("x/maestro-pub-618"),
+			head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+			head_repository_name: String::from("maestro"),
+			head_repository_owner: String::from("helixbox"),
+			is_draft: false,
+			state: String::from("OPEN"),
+			url: String::from("https://github.com/helixbox/maestro/pull/52"),
+		})]);
+		let local_repo_inspector = FakeLocalRepoInspector::new(vec![Ok(sample_local_repo())]);
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/52",
+				"summary": "Ready for review."
+			}),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::validate_turn_completion(&bridge, "done")
+			.expect_err("review handoff should still require explicit finalization");
+
+		assert!(error.to_string().contains(ISSUE_TERMINAL_FINALIZE_TOOL_NAME));
+		assert!(error.to_string().contains("review_handoff"));
+	}
+
+	#[test]
+	fn terminal_finalize_accepts_matching_review_handoff_path() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(vec![Ok(PullRequestDetails {
+			head_ref_name: String::from("x/maestro-pub-618"),
+			head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+			head_repository_name: String::from("maestro"),
+			head_repository_owner: String::from("helixbox"),
+			is_draft: false,
+			state: String::from("OPEN"),
+			url: String::from("https://github.com/helixbox/maestro/pull/53"),
+		})]);
+		let local_repo_inspector = FakeLocalRepoInspector::new(vec![Ok(sample_local_repo())]);
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let review_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/53",
+				"summary": "Ready for review."
+			}),
+		);
+		let finalize_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			serde_json::json!({ "path": "review_handoff" }),
+		);
+
+		assert!(review_response.success);
+		assert!(finalize_response.success);
+
+		DynamicToolHandler::validate_turn_completion(&bridge, "done")
+			.expect("matching finalization should allow the turn to complete");
+	}
+
+	#[test]
+	fn terminal_finalize_rejects_mismatched_path() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(vec![Ok(PullRequestDetails {
+			head_ref_name: String::from("x/maestro-pub-618"),
+			head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+			head_repository_name: String::from("maestro"),
+			head_repository_owner: String::from("helixbox"),
+			is_draft: false,
+			state: String::from("OPEN"),
+			url: String::from("https://github.com/helixbox/maestro/pull/54"),
+		})]);
+		let local_repo_inspector = FakeLocalRepoInspector::new(vec![Ok(sample_local_repo())]);
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let review_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/54",
+				"summary": "Ready for review."
+			}),
+		);
+		let finalize_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			serde_json::json!({ "path": "manual_attention" }),
+		);
+
+		assert!(review_response.success);
+		assert!(!finalize_response.success);
+		assert!(matches!(
+			finalize_response.content_items.as_slice(),
+			[crate::agent::tracker_tool_bridge::DynamicToolContentItem::InputText { text }]
+				if text.contains(
+					"requested path `manual_attention`, but the recorded terminal path is `review_handoff`"
+				)
+		));
+	}
+
+	#[test]
+	fn terminal_finalize_accepts_matching_manual_attention_path() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let label_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:needs-attention" }),
+		);
+		let comment_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_COMMENT_TOOL_NAME,
+			serde_json::json!({
+				"body": "Blocked on missing tracker permission; handing off for manual repair."
+			}),
+		);
+		let finalize_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			serde_json::json!({ "path": "manual_attention" }),
+		);
+
+		assert!(label_response.success);
+		assert!(comment_response.success);
+		assert!(finalize_response.success);
+
+		DynamicToolHandler::validate_turn_completion(&bridge, "done")
+			.expect("matching manual-attention finalization should allow the turn to complete");
 	}
 
 	#[test]

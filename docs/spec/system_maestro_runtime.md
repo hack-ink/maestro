@@ -147,12 +147,14 @@ Before applying success or failure writeback, `maestro` must classify the finish
 
 | Disposition | Required agent signal | Forbidden co-signal | Runtime effect |
 | --- | --- | --- | --- |
-| `review_handoff` | `issue_review_handoff` | `maestro:needs-attention` | Run validation commands, revalidate PR state, post completion comment, transition to `In Review`. |
-| `manual_attention` | `maestro:needs-attention` plus an explanatory issue comment | `issue_review_handoff` | Skip PR-backed success writeback and validation commands, then treat the run as a human-required failure immediately. |
+| `review_handoff` | `issue_review_handoff` plus `issue_terminal_finalize(path = "review_handoff")` | `maestro:needs-attention` | Run validation commands, revalidate PR state, post completion comment, transition to `In Review`. |
+| `manual_attention` | `maestro:needs-attention` plus an explanatory issue comment, then `issue_terminal_finalize(path = "manual_attention")` | `issue_review_handoff` | Skip PR-backed success writeback and validation commands, then treat the run as a human-required failure immediately. |
 
 If neither signal exists, or both signals exist, `maestro` must fail the attempt instead of inferring operator intent.
 If the label is recorded without the required explanatory comment, `maestro` must also fail the attempt instead of treating it as a valid `manual_attention` exit.
+If the resolved terminal path is not explicitly finalized through `issue_terminal_finalize`, the app-server wrapper must fail the turn before `maestro` records the attempt as successful.
 The explanatory comment for `manual_attention` must describe the exact observed blocker and should include the failed command plus raw error text when available instead of speculating about unverified capability limits.
+Saved plan completion, including `phase = "done"`, is never a substitute for the explicit terminal-finalization call.
 
 ### Success writeback
 
@@ -163,6 +165,7 @@ During the run, the coding agent should prepare a PR-backed handoff by:
 1. pushing the lane branch
 2. creating or updating a non-draft PR for that branch
 3. calling the dedicated review handoff tool with the PR URL and a short summary
+4. calling `issue_terminal_finalize(path = "review_handoff")`
 
 After agent execution and post-run validation succeed, `maestro` should:
 
@@ -202,6 +205,7 @@ Retry-exhausted or human-required failures:
 1. Transition the issue to `Todo`.
 2. Add the label `maestro:needs-attention`.
 3. Post a structured failure comment.
+4. Finalize the terminal path with `issue_terminal_finalize(path = "manual_attention")`.
 
 If the coding agent explicitly requests human attention by adding `maestro:needs-attention`, `maestro` must stop automatic retries for that attempt, skip PR-backed success writeback, and treat the lane as a human-required failure immediately.
 

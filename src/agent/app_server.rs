@@ -514,6 +514,8 @@ fn execute_app_server_run_inner(
 		request.dynamic_tool_handler,
 	)?;
 
+	validate_turn_completion(request.dynamic_tool_handler, &run_outcome.final_output)?;
+
 	state_store.record_run_attempt(
 		&request.run_id,
 		&request.issue_id,
@@ -529,6 +531,17 @@ fn execute_app_server_run_inner(
 		event_count: state_store.event_count(&request.run_id)?,
 		final_output: run_outcome.final_output,
 	})
+}
+
+fn validate_turn_completion(
+	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
+	final_output: &str,
+) -> Result<()> {
+	if let Some(dynamic_tool_handler) = dynamic_tool_handler {
+		dynamic_tool_handler.validate_turn_completion(final_output)?;
+	}
+
+	Ok(())
 }
 
 fn build_turn_start_request(thread_id: &str, user_input: &str) -> TurnStartRequest {
@@ -785,11 +798,31 @@ mod tests {
 
 	use crate::{
 		agent::{
-			app_server::AppServerRunResult,
+			app_server::{AppServerRunResult, ProbeDynamicToolHandler},
 			json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
+			tracker_tool_bridge::{DynamicToolCallResponse, DynamicToolHandler, DynamicToolSpec},
 		},
 		state::StateStore,
 	};
+
+	struct RejectingCompletionHandler;
+	impl DynamicToolHandler for RejectingCompletionHandler {
+		fn tool_specs(&self) -> Vec<DynamicToolSpec> {
+			Vec::new()
+		}
+
+		fn handle_call(
+			&self,
+			_tool_name: &str,
+			_arguments: serde_json::Value,
+		) -> DynamicToolCallResponse {
+			DynamicToolCallResponse::failure(String::from("unused"))
+		}
+
+		fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
+			Err(crate::prelude::eyre::eyre!("terminal finalization missing"))
+		}
+	}
 
 	fn notification_message(method: &str, params: serde_json::Value) -> WireMessage {
 		WireMessage {
@@ -892,5 +925,25 @@ mod tests {
 		recorder.record("turn/started", "{\"turn\":\"1\"}").expect("event should record");
 
 		assert_eq!(state_store.event_count("run-1").expect("event count should load"), 1);
+	}
+
+	#[test]
+	fn completion_validation_uses_dynamic_tool_handler() {
+		let error = super::validate_turn_completion(Some(&RejectingCompletionHandler), "finished")
+			.expect_err("completion validator should be consulted");
+
+		assert!(error.to_string().contains("terminal finalization missing"));
+	}
+
+	#[test]
+	fn completion_validation_defaults_to_noop_without_handler() {
+		super::validate_turn_completion(None, "finished")
+			.expect("missing dynamic handler should not fail completion");
+	}
+
+	#[test]
+	fn probe_handler_allows_completion_validation() {
+		super::validate_turn_completion(Some(&ProbeDynamicToolHandler), "PROBE_OK")
+			.expect("probe handler should not override completion validation");
 	}
 }

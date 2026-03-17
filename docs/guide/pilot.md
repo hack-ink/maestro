@@ -153,8 +153,10 @@ On a normal successful run, `maestro` will:
 6. let the coding agent perform the normal-path `In Progress` transition and start comment through issue-scoped tools
 7. run Codex through direct `app-server`
 8. run the configured validation commands inside the workspace
-9. require the coding agent to record a PR-backed review handoff through the issue-scoped tool bridge
+9. require the coding agent to record a PR-backed review handoff and explicitly finalize the terminal path through the issue-scoped tool bridge
 10. let `maestro` write the completion comment and `In Review` transition only after its own validation succeeds
+
+Saved plan completion alone is not a successful lane exit. Even if coding work and repository checks are done, the turn is still incomplete until the agent records either the review-handoff path or the manual-attention path and then calls `issue_terminal_finalize` for that same path.
 
 After `protocol probe`, `run --once --dry-run`, and `run --once` all behave as expected, use daemon mode for the long-running pilot loop:
 

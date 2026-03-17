@@ -21,9 +21,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
 	agent::{
 		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, ISSUE_COMMENT_TOOL_NAME,
-		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME,
-		ReviewHandoffContext, ReviewHandoffWritebackFailed, RunCompletionDisposition,
-		TrackerToolBridge,
+		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
+		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
@@ -2599,12 +2599,13 @@ fn build_developer_instructions(
 	));
 
 	sections.push(format!(
-		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain the exact observed blocker in a comment, including the failed command and raw error when available. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
+		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete, end the turn, or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
 		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
 		label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
 		review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 		in_progress = workflow.frontmatter().tracker().in_progress_state(),
 		run_id = issue_run.run_id,
 		attempt = issue_run.attempt_number,
@@ -2622,7 +2623,7 @@ fn build_user_input(
 	issue_run: &IssueRunPlan,
 ) -> String {
 	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}` and explain why in a comment. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.",
+		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not end the turn or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.",
 		identifier = issue.identifier,
 		title = issue.title,
 		description = if issue.description.trim().is_empty() {
@@ -2634,6 +2635,7 @@ fn build_user_input(
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
 		label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
 		review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 		in_progress = workflow.frontmatter().tracker().in_progress_state(),
 		run_id = issue_run.run_id,
 		attempt = issue_run.attempt_number,
@@ -3096,7 +3098,8 @@ mod tests {
 		config::ServiceConfig,
 		orchestrator::{
 			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
-			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, RunSummary,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			ISSUE_TRANSITION_TOOL_NAME, RunSummary,
 		},
 		prelude::Result,
 		state::{self, RUN_ACTIVITY_MARKER_FILE, StateStore},
@@ -3593,12 +3596,13 @@ read_first = [{read_first}]
 		));
 
 		sections.push(format!(
-			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}` and explain the exact observed blocker in a comment, including the failed command and raw error when available. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Never write to any other issue.",
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete, end the turn, or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- Never write to any other issue.",
 			issue = issue_run.issue.identifier,
 			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 			comment_tool = ISSUE_COMMENT_TOOL_NAME,
 			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
 			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 			in_progress = workflow.frontmatter().tracker().in_progress_state(),
 			run_id = issue_run.run_id,
 			attempt = issue_run.attempt_number,
@@ -4285,6 +4289,8 @@ read_first = [{read_first}]
 				.contains("Do not speculate about capabilities you did not directly verify.")
 		);
 		assert!(instructions.contains(ISSUE_REVIEW_HANDOFF_TOOL_NAME));
+		assert!(instructions.contains(ISSUE_TERMINAL_FINALIZE_TOOL_NAME));
+		assert!(instructions.contains("mark a saved plan `phase = \"done\"`"));
 		assert!(!instructions.contains("WORKFLOW.md\n"));
 		assert!(!instructions.contains("Follow the repository policy."));
 	}

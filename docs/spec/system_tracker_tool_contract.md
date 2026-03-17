@@ -42,24 +42,30 @@ The follow-up MVP should support these issue-scoped operations:
   - validate and record a PR-backed success handoff for the current issue
 - `issue_label_add`
   - add a label to the current issue when workflow policy requires it
+- `issue_terminal_finalize`
+  - explicitly finalize the current run's terminal tracker path after the required tracker writes already exist
 
 Additional operations such as richer metadata updates may be added later, but they are not required for the first PR-backed self-dogfood pilot.
 
 ## Completion signal contract
 
-At turn completion, the issue-scoped tool bridge must leave `maestro` with exactly one terminal completion signal for the leased issue:
+At turn completion, the issue-scoped tool bridge must leave `maestro` with exactly one terminal completion signal for the leased issue and a matching explicit terminal-finalization call:
 
 - `review_handoff`
   - produced by `issue_review_handoff`
+  - finalized by `issue_terminal_finalize(path = "review_handoff")`
   - means the lane is claiming review-ready success
 - `manual_attention`
   - produced by adding the configured `needs_attention_label` and leaving an explanatory comment
+  - finalized by `issue_terminal_finalize(path = "manual_attention")`
   - means the lane is explicitly handing the issue back to a human instead of asking for `In Review`
 
 Invalid outcomes:
 
 - both signals are present
 - neither signal is present
+- a signal is present, but the matching `issue_terminal_finalize` call never happened
+- `issue_terminal_finalize` names a different path than the currently recorded terminal signal
 
 In either invalid case, `maestro` must fail the attempt rather than infer which path the agent intended.
 
@@ -73,6 +79,7 @@ In either invalid case, `maestro` must fail the attempt rather than infer which 
 - Adding the configured `needs_attention_label` is an explicit human-required failure exit for the active lane. In that case the agent must leave a comment explaining the blocker, must not also record `issue_review_handoff`, and `maestro` must stop automatic retries for that attempt.
 - Human-attention comments must describe the exact observed blocker and should include the failed command plus raw error text when available. The agent must not speculate about capabilities or environment restrictions that it did not directly verify.
 - The human-attention exit is not complete until the explanatory comment is successfully written after the label request. A label-only signal must be rejected as an invalid completion disposition.
+- The run is not complete until `issue_terminal_finalize` succeeds against the matching terminal path. A saved plan reaching `phase = "done"` or an agent summary message is not a substitute.
 - Issues that carry the configured `needs_attention_label` must remain ineligible for future automatic selection until a human clears the label.
 - `issue_review_handoff` and the human-attention exit are mutually exclusive terminal signals for the same turn.
 - Before a live run starts, `maestro` must preflight the local GitHub CLI dependency used for review handoff inspection instead of discovering a missing `gh` binary only after an otherwise successful turn.
@@ -86,6 +93,7 @@ In either invalid case, `maestro` must fail the attempt rather than infer which 
 - If a tracker tool call fails transiently, the failure should be surfaced to the run journal so retry logic can reason about it.
 - If a tracker tool call fails because it targeted the wrong issue or an unsupported operation, treat that as a policy violation, not as a retryable transport error.
 - If the turn completes without a valid recorded `issue_review_handoff` and without an explicit human-attention exit, `maestro` must treat the run as failed rather than silently moving the issue to `In Review`.
+- If the turn completes without a matching `issue_terminal_finalize` call for the resolved terminal path, `maestro` must treat the run as failed before reporting the attempt as successful.
 - If PR-backed success writeback partially succeeds, for example the issue reaches `In Review` but the completion comment fails to post, `maestro` must treat the lane as human-required and must not place it back on the automatic retry path.
 
 ## Future expansion

@@ -1,0 +1,148 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-162-terminal-tracker-handoff-2026-03-18",
+    "goal": "Implement XY-162 by preventing self-bootstrap lanes from ending a turn cleanly after coding and verification work unless the lane explicitly records one valid terminal tracker path.",
+    "success_criteria": [
+      "A lane cannot present coding work as complete unless it has explicitly finalized either a PR-backed review handoff or a manual-attention exit for the leased issue.",
+      "Saved plan completion cannot be treated as sufficient success when the lane has not recorded a terminal tracker outcome.",
+      "Runtime behavior, issue-scoped tool policy, and operator docs all describe the same terminal turn contract.",
+      "Regression coverage reproduces the XY-156 shape where implementation and tests finished but commit, push, PR, and tracker handoff remained undone."
+    ],
+    "constraints": [
+      "Keep the existing PR-backed In Review handoff model; do not redesign broader delivery or landing automation.",
+      "Do not widen scope into unrelated review lifecycle cleanup outside the lane completion contract.",
+      "Preserve Maestro ownership of final success writeback and terminal failure handling after the agent records its terminal intent.",
+      "Keep the fix grounded in the existing app-server dynamic tool bridge and runtime completion flow unless a smaller repo-local contract change is insufficient."
+    ],
+    "defaults": {
+      "authority_issue": "XY-162",
+      "config_path": "./tmp/maestro.toml",
+      "failing_run_id": "xy-156-attempt-1-1773769844",
+      "verification_commands": [
+        "cargo make fmt-check",
+        "cargo make lint",
+        "cargo make test"
+      ]
+    },
+    "tasks": [
+      {
+        "id": "design-terminal-turn-contract",
+        "title": "Design the terminal turn contract for self-bootstrap lanes",
+        "status": "done",
+        "objective": "Decide the smallest runtime-owned contract that makes terminal tracker handoff explicit and prevents saved plan completion from masquerading as run success.",
+        "inputs": [
+          "XY-162 issue scope",
+          "XY-156 failing lane transcript",
+          "Current tracker tool bridge, app-server wrapper, and runtime completion rules"
+        ],
+        "outputs": [
+          "A concrete decision on how the turn must declare terminal tracker completion",
+          "An implementation boundary between in-turn signaling and post-run writeback"
+        ],
+        "verification": [
+          "The chosen contract explains how coding-complete but handoff-missing lanes are rejected",
+          "The design leaves the existing review-handoff versus manual-attention model intact"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "implement-terminal-finalization-gate",
+        "title": "Implement explicit terminal finalization in the runtime path",
+        "status": "done",
+        "objective": "Wire the app-server and tracker bridge so the agent must explicitly finalize one terminal tracker path before the run can succeed.",
+        "inputs": [
+          "Design decision from design-terminal-turn-contract",
+          "src/agent/app_server.rs",
+          "src/agent/tracker_tool_bridge.rs",
+          "src/orchestrator.rs"
+        ],
+        "outputs": [
+          "Code that records or validates an explicit in-turn terminal completion signal",
+          "Runtime gating that no longer treats a finished coding turn as sufficient without the terminal signal"
+        ],
+        "verification": [
+          "The runtime still accepts valid review handoff and manual-attention paths",
+          "The XY-156-shaped missing-handoff path fails before Maestro reports a successful run"
+        ],
+        "depends_on": [
+          "design-terminal-turn-contract"
+        ]
+      },
+      {
+        "id": "align-terminal-contract-docs",
+        "title": "Align specs and operator guidance with the new terminal contract",
+        "status": "done",
+        "objective": "Update the repo-owned docs so the required terminal-finalization rule matches the runtime behavior and pilot expectations.",
+        "inputs": [
+          "Implemented runtime behavior",
+          "docs/spec/system_tracker_tool_contract.md",
+          "docs/spec/system_maestro_runtime.md",
+          "docs/guide/pilot.md"
+        ],
+        "outputs": [
+          "Normative text for the explicit terminal turn contract",
+          "Operator guidance that explains why plan completion alone is not a successful exit"
+        ],
+        "verification": [
+          "Spec and guide text use the same terminal-path terminology as the runtime",
+          "Docs no longer imply that coding completion alone can end a successful lane"
+        ],
+        "depends_on": [
+          "implement-terminal-finalization-gate"
+        ]
+      },
+      {
+        "id": "verify-xy-162-delivery",
+        "title": "Verify the XY-162 regression fix",
+        "status": "done",
+        "objective": "Prove the new contract catches the missing-handoff failure shape and leaves the repo green under the standard checks.",
+        "inputs": [
+          "Updated runtime and docs",
+          "Targeted regression tests",
+          "Repo-native verification commands"
+        ],
+        "outputs": [
+          "Focused regression evidence for the missing-handoff path",
+          "Passing fmt, lint, and test results"
+        ],
+        "verification": [
+          "Add or update tests that model the XY-156 terminal-missing path",
+          "Run the full defaults.verification_commands set successfully"
+        ],
+        "depends_on": [
+          "align-terminal-contract-docs"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "The app-server transport cannot express a reliable terminal-finalization contract without a broader protocol change",
+        "The fix requires changing external Codex skills instead of repo-local runtime and prompt surfaces",
+        "The runtime needs a broader delivery lifecycle redesign beyond the bounded review-handoff versus manual-attention exit model"
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-18: The retained XY-156 transcript shows the lane ended with implementation and verification complete while commit, push, PR creation, and tracker handoff were still listed as remaining work.",
+      "2026-03-18: TrackerToolBridge now exposes `issue_terminal_finalize`, requires a matching explicit terminal-finalization path at turn completion, and rejects both the XY-156 no-signal shape and the review-handoff-without-finalize shape in unit tests.",
+      "2026-03-18: The app-server wrapper now calls dynamic-tool completion validation before it marks a run attempt successful, so missing terminal finalization fails inside the run wrapper instead of only later in orchestrator post-processing.",
+      "2026-03-18: The child prompt contract now requires `issue_terminal_finalize` after `issue_review_handoff` or manual attention and explicitly forbids ending the turn or marking a saved plan `phase = \"done\"` before that succeeds.",
+      "2026-03-18: docs/spec/system_tracker_tool_contract.md, docs/spec/system_maestro_runtime.md, and docs/guide/pilot.md now describe the explicit terminal-finalization rule consistently.",
+      "2026-03-18: Local verification passed for cargo make fmt-check, cargo make lint, and cargo make test."
+    ],
+    "last_updated": "2026-03-17T19:16:10Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "authority_issue": "XY-162",
+      "failing_run_id": "xy-156-attempt-1-1773769844",
+      "primary_gap": "A self-bootstrap lane can end with code and tests complete while terminal tracker handoff remains undone."
+    }
+  }
+}

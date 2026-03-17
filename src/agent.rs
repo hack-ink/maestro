@@ -8,7 +8,7 @@ pub(crate) use self::{
 	},
 	tracker_tool_bridge::{
 		ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
-		ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext, ReviewHandoffWritebackFailed,
-		RunCompletionDisposition, TrackerToolBridge,
+		ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
+		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,
 	},
 };
