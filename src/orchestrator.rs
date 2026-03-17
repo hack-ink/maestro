@@ -1,10 +1,11 @@
+#[cfg(unix)] use std::os::fd::AsRawFd;
 use std::{
 	cmp::Ordering,
 	collections::{HashMap, HashSet},
 	env,
 	error::Error,
 	fmt::{self, Display, Formatter},
-	fs,
+	fs::{self, File},
 	io::ErrorKind,
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
@@ -44,6 +45,7 @@ pub(crate) struct RunOnceRequest<'a> {
 	pub(crate) dry_run: bool,
 	pub(crate) preferred_issue_id: Option<&'a str>,
 	pub(crate) preferred_lease_acquired: bool,
+	pub(crate) preferred_dispatch_slot_fd: Option<i32>,
 	pub(crate) preferred_dispatch_mode: Option<IssueDispatchMode>,
 	pub(crate) preferred_run_id: Option<&'a str>,
 	pub(crate) preferred_attempt_number: Option<i64>,
@@ -85,10 +87,22 @@ struct RunCycleRequest<'a> {
 	dry_run: bool,
 	preferred_issue_id: Option<&'a str>,
 	preferred_lease_acquired: bool,
+	preferred_dispatch_slot_fd: Option<i32>,
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
 	preferred_workflow_snapshot: Option<&'a str>,
+}
+
+struct SpawnRunOnceChildRequest<'a> {
+	config_path: &'a Path,
+	preferred_issue_id: &'a str,
+	dispatch_mode: IssueDispatchMode,
+	preferred_run_id: &'a str,
+	preferred_attempt_number: i64,
+	preferred_retry_budget_base: i64,
+	workflow: &'a WorkflowDocument,
+	dispatch_slot_handoff: Option<&'a File>,
 }
 
 #[derive(Clone, Copy)]
@@ -315,6 +329,7 @@ struct TargetIssueRunContext<'a, T> {
 	issue_id: &'a str,
 	dry_run: bool,
 	lease_preacquired: bool,
+	preferred_dispatch_slot_fd: Option<i32>,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -366,6 +381,7 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		dry_run: request.dry_run,
 		preferred_issue_id: request.preferred_issue_id,
 		preferred_lease_acquired: request.preferred_lease_acquired,
+		preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
 		preferred_dispatch_mode: request.preferred_dispatch_mode,
 		preferred_run_identity,
 		preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -748,15 +764,20 @@ where
 				&summary.workspace_path.display().to_string(),
 			)?;
 
-			let mut child = spawn_run_once_child(
+			#[cfg(unix)]
+			let dispatch_slot_handoff = Some(state_store.clone_dispatch_slot_for_child(project.id())?);
+			#[cfg(not(unix))]
+			let dispatch_slot_handoff: Option<File> = None;
+			let mut child = spawn_run_once_child(SpawnRunOnceChildRequest {
 				config_path,
-				summary.issue_id.as_str(),
-				summary.dispatch_mode,
-				summary.run_id.as_str(),
-				summary.attempt_number,
-				retry_budget_base,
+				preferred_issue_id: summary.issue_id.as_str(),
+				dispatch_mode: summary.dispatch_mode,
+				preferred_run_id: summary.run_id.as_str(),
+				preferred_attempt_number: summary.attempt_number,
+				preferred_retry_budget_base: retry_budget_base,
 				workflow,
-			)
+				dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
+			})
 			.inspect_err(|_error| {
 				let _ = state_store.update_run_status(&summary.run_id, "failed");
 				let _ = state_store.clear_lease(&summary.issue_id);
@@ -777,6 +798,8 @@ where
 			}
 
 			state_store.update_run_status(&summary.run_id, "running")?;
+			#[cfg(unix)]
+			state_store.release_dispatch_slot(project.id())?;
 
 			tracing::info!(
 				issue = summary.issue_identifier,
@@ -805,38 +828,35 @@ where
 	Ok(())
 }
 
-fn spawn_run_once_child(
-	config_path: &Path,
-	preferred_issue_id: &str,
-	dispatch_mode: IssueDispatchMode,
-	preferred_run_id: &str,
-	preferred_attempt_number: i64,
-	preferred_retry_budget_base: i64,
-	workflow: &WorkflowDocument,
-) -> crate::prelude::Result<Child> {
+fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
-	let workflow_snapshot = workflow.to_markdown()?;
+	let workflow_snapshot = request.workflow.to_markdown()?;
 	let mut command = Command::new(executable);
 
 	command
 		.args(["run", "--once", "--config"])
-		.arg(config_path)
+		.arg(request.config_path)
 		.stdin(Stdio::null())
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit())
-		.args(["--issue-id", preferred_issue_id])
+		.args(["--issue-id", request.preferred_issue_id])
 		.args([
 			"--dispatch-mode",
-			match dispatch_mode {
+			match request.dispatch_mode {
 				IssueDispatchMode::Normal => "normal",
 				IssueDispatchMode::Retry => "retry",
 			},
 		])
-		.args(["--run-id", preferred_run_id])
-		.args(["--attempt-number", &preferred_attempt_number.to_string()])
-		.args(["--retry-budget-base", &preferred_retry_budget_base.to_string()])
+		.args(["--run-id", request.preferred_run_id])
+		.args(["--attempt-number", &request.preferred_attempt_number.to_string()])
+		.args(["--retry-budget-base", &request.preferred_retry_budget_base.to_string()])
 		.arg("--lease-preacquired")
 		.args(["--workflow-snapshot", workflow_snapshot.as_str()]);
+
+	#[cfg(unix)]
+	if let Some(dispatch_slot_handoff) = request.dispatch_slot_handoff {
+		command.args(["--dispatch-slot-fd", &dispatch_slot_handoff.as_raw_fd().to_string()]);
+	}
 
 	let child = command.spawn()?;
 
@@ -888,6 +908,7 @@ where
 		issue_id: &entry.issue_id,
 		dry_run: true,
 		lease_preacquired: false,
+		preferred_dispatch_slot_fd: None,
 		dispatch_mode: IssueDispatchMode::Retry,
 		preferred_run_identity: None,
 		preferred_retry_budget_base: None,
@@ -1428,6 +1449,7 @@ fn run_configured_cycle(
 			issue_id,
 			dry_run: request.dry_run,
 			lease_preacquired: request.preferred_lease_acquired,
+			preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
 			dispatch_mode: request.preferred_dispatch_mode.unwrap_or(IssueDispatchMode::Retry),
 			preferred_run_identity: request.preferred_run_identity,
 			preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -1537,6 +1559,30 @@ where
 		.state_store
 		.configure_dispatch_slot_root(context.project.id(), context.project.workspace_root())?;
 
+	if context.lease_preacquired && !context.dry_run {
+		let preferred_run_identity = context.preferred_run_identity.ok_or_else(|| {
+			eyre::eyre!("daemon child lease handoff requires a planned run identifier")
+		})?;
+		let dispatch_slot_fd = context.preferred_dispatch_slot_fd.ok_or_else(|| {
+			eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot fd")
+		})?;
+
+		#[cfg(unix)]
+		{
+			context.state_store.adopt_preacquired_lease(
+				context.project.id(),
+				context.issue_id,
+				preferred_run_identity.run_id,
+				dispatch_slot_fd,
+			)?;
+		}
+
+		#[cfg(not(unix))]
+		{
+			eyre::bail!("daemon child lease handoff is only supported on unix targets");
+		}
+	}
+
 	recover_runtime_state_from_tracker_and_workspaces(
 		context.tracker,
 		context.project,
@@ -1558,7 +1604,9 @@ where
 	validate_tracker_project(context.tracker, context.project.tracker().project_slug())?;
 	validate_review_handoff_runtime(context.dry_run)?;
 
-	if !has_available_dispatch_slot(context.project.id(), context.state_store)? {
+	if !context.lease_preacquired
+		&& !has_available_dispatch_slot(context.project.id(), context.state_store)?
+	{
 		return Ok(None);
 	}
 
@@ -2893,6 +2941,7 @@ fn sleep_until_next_tick(poll_interval: Duration, tick_started_at: Instant) {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)] use std::os::fd::IntoRawFd;
 	use std::{
 		cell::RefCell,
 		fs,
@@ -3318,6 +3367,7 @@ read_first = [{read_first}]
 			issue_id: &issue.id,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3529,6 +3579,7 @@ read_first = [{read_first}]
 			issue_id: &issue.id,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3555,6 +3606,7 @@ read_first = [{read_first}]
 			issue_id: &issue.id,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3584,6 +3636,7 @@ read_first = [{read_first}]
 			issue_id: &issue.id,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3615,6 +3668,7 @@ read_first = [{read_first}]
 			issue_id: &issue.id,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4807,6 +4861,7 @@ read_first = [{read_first}]
 		);
 	}
 
+	#[cfg(unix)]
 	#[test]
 	fn prepare_issue_run_allows_preacquired_cross_process_slot() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
@@ -4831,6 +4886,19 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
+		let child_guard = parent_store
+			.clone_dispatch_slot_for_child(config.id())
+			.expect("child should inherit the shared dispatch-slot fd");
+
+		child_store
+			.adopt_preacquired_lease(
+				config.id(),
+				&issue.id,
+				"planned-run",
+				child_guard.into_raw_fd(),
+			)
+			.expect("child should adopt the inherited lease guard");
+
 		let issue_run = orchestrator::prepare_issue_run(
 			orchestrator::PrepareIssueRunContext {
 				tracker: &tracker,
@@ -4853,12 +4921,14 @@ read_first = [{read_first}]
 		.expect("targeted issue should prepare under the preacquired lease");
 
 		assert_eq!(issue_run.run_id, "planned-run");
-		assert!(
+		assert_eq!(
 			child_store
 				.lease_for_issue(&issue.id)
 				.expect("child lease lookup should succeed")
-				.is_none(),
-			"preacquired child runs should not mint a second local lease"
+				.expect("child should retain the adopted local lease")
+				.run_id(),
+			"planned-run",
+			"preacquired child runs should keep the adopted local lease so cleanup can release the handoff guard"
 		);
 	}
 

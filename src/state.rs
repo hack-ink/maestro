@@ -1,10 +1,11 @@
 //! Thin in-memory runtime state for active Maestro execution.
 
+#[cfg(unix)] use std::os::fd::{AsRawFd, FromRawFd};
 use std::{
 	cmp::Ordering,
 	collections::HashMap,
 	fs::{self, File, OpenOptions, TryLockError},
-	io::ErrorKind,
+	io::{Error, ErrorKind},
 	path::{Path, PathBuf},
 	process,
 	sync::{Mutex, MutexGuard},
@@ -147,6 +148,56 @@ impl StateStore {
 		if !state.leases.values().any(|active| active.project_id() == lease.project_id()) {
 			state.dispatch_slot_guards.remove(lease.project_id());
 		}
+
+		Ok(())
+	}
+
+	/// Drop the current process-local dispatch-slot guard while keeping the local lease record.
+	pub fn release_dispatch_slot(&self, project_id: &str) -> Result<()> {
+		let mut state = self.lock()?;
+
+		state.dispatch_slot_guards.remove(project_id);
+
+		Ok(())
+	}
+
+	/// Duplicate the held dispatch-slot lock so a spawned child can inherit it across exec.
+	#[cfg(unix)]
+	pub fn clone_dispatch_slot_for_child(&self, project_id: &str) -> Result<File> {
+		let state = self.lock()?;
+		let guard = state.dispatch_slot_guards.get(project_id).ok_or_else(|| {
+			eyre::eyre!("project `{project_id}` does not hold a dispatch-slot guard")
+		})?;
+		let child_lock = guard._lock_file.try_clone()?;
+
+		clear_close_on_exec(&child_lock)?;
+
+		Ok(child_lock)
+	}
+
+	/// Adopt an inherited dispatch-slot fd and local lease for a daemon child process.
+	#[cfg(unix)]
+	pub fn adopt_preacquired_lease(
+		&self,
+		project_id: &str,
+		issue_id: &str,
+		run_id: &str,
+		dispatch_slot_fd: i32,
+	) -> Result<()> {
+		let lock_file = unsafe { File::from_raw_fd(dispatch_slot_fd) };
+		let mut state = self.lock()?;
+
+		state
+			.dispatch_slot_guards
+			.insert(project_id.to_owned(), DispatchSlotGuard { _lock_file: lock_file });
+		state.leases.insert(
+			issue_id.to_owned(),
+			IssueLease {
+				project_id: project_id.to_owned(),
+				issue_id: issue_id.to_owned(),
+				run_id: run_id.to_owned(),
+			},
+		);
 
 		Ok(())
 	}
@@ -988,8 +1039,31 @@ fn compare_project_run_status(left: &ProjectRunStatus, right: &ProjectRunStatus)
 		.then_with(|| right.run_id.cmp(&left.run_id))
 }
 
+#[cfg(unix)]
+fn clear_close_on_exec(file: &File) -> Result<()> {
+	let fd = file.as_raw_fd();
+	let existing_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+
+	if existing_flags == -1 {
+		return Err(Error::last_os_error().into());
+	}
+
+	let new_flags = existing_flags & !libc::FD_CLOEXEC;
+
+	if new_flags != existing_flags {
+		let result = unsafe { libc::fcntl(fd, libc::F_SETFD, new_flags) };
+
+		if result == -1 {
+			return Err(Error::last_os_error().into());
+		}
+	}
+
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)] use std::os::fd::IntoRawFd;
 	use std::path::Path;
 
 	use tempfile::TempDir;
@@ -1072,6 +1146,56 @@ mod tests {
 			store_two
 				.try_acquire_lease("pubfi", "PUB-102", "run-2")
 				.expect("shared slot should reopen after the first lease clears")
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn adopted_dispatch_slot_blocks_after_parent_releases_local_guard() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let parent_store = StateStore::open_in_memory().expect("parent store should open");
+		let child_store = StateStore::open_in_memory().expect("child store should open");
+		let contender_store = StateStore::open_in_memory().expect("contender store should open");
+
+		parent_store
+			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.expect("parent store should configure dispatch slot root");
+		child_store
+			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.expect("child store should configure dispatch slot root");
+		contender_store
+			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.expect("contender store should configure dispatch slot root");
+
+		assert!(
+			parent_store
+				.try_acquire_lease("pubfi", "PUB-101", "run-1")
+				.expect("parent should acquire the shared slot")
+		);
+
+		let child_guard = parent_store
+			.clone_dispatch_slot_for_child("pubfi")
+			.expect("child should inherit the shared dispatch-slot fd");
+
+		child_store
+			.adopt_preacquired_lease("pubfi", "PUB-101", "run-1", child_guard.into_raw_fd())
+			.expect("child should adopt the inherited lease guard");
+		parent_store
+			.release_dispatch_slot("pubfi")
+			.expect("parent should release its local guard after handoff");
+
+		assert!(
+			!contender_store
+				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.expect("child-held guard should keep the slot busy")
+		);
+
+		child_store.clear_lease("PUB-101").expect("child lease should clear");
+
+		assert!(
+			contender_store
+				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.expect("slot should reopen once the child releases its guard")
 		);
 	}
 
