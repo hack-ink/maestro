@@ -65,6 +65,7 @@ struct PrepareIssueRunContext<'a, T> {
 	workspace_manager: &'a WorkspaceManager,
 	dry_run: bool,
 	dispatch_mode: IssueDispatchMode,
+	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 }
 
 #[derive(Debug)]
@@ -131,6 +132,12 @@ struct DaemonRunChild {
 #[derive(Clone, Copy)]
 struct ChildRunRef<'a> {
 	issue_id: &'a str,
+	run_id: &'a str,
+	attempt_number: i64,
+}
+
+#[derive(Clone, Copy)]
+struct PreferredRunIdentity<'a> {
 	run_id: &'a str,
 	attempt_number: i64,
 }
@@ -227,20 +234,20 @@ struct ChildExitRetryContext<'a, T> {
 	state_store: &'a StateStore,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetryKind {
-	Continuation,
-	Failure,
-}
-
-enum RetryDispatchDecision {
-	Blocked,
-	Dispatch(RunSummary),
-	Continue,
+#[derive(Clone, Copy)]
+struct TargetIssueRunContext<'a, T> {
+	tracker: &'a T,
+	project: &'a ServiceConfig,
+	workflow: &'a WorkflowDocument,
+	state_store: &'a StateStore,
+	issue_id: &'a str,
+	dry_run: bool,
+	dispatch_mode: IssueDispatchMode,
+	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 }
 
 #[derive(Clone, Copy)]
-enum IssueDispatchMode {
+pub(crate) enum IssueDispatchMode {
 	Normal,
 	Retry,
 }
@@ -260,6 +267,18 @@ impl IssueDispatchMode {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryKind {
+	Continuation,
+	Failure,
+}
+
+enum RetryDispatchDecision {
+	Blocked,
+	Dispatch(RunSummary),
+	Continue,
+}
+
 #[derive(Clone, Debug)]
 enum ActiveRunDisposition {
 	Terminal,
@@ -271,6 +290,9 @@ pub(crate) fn run_once(
 	config_path: Option<&Path>,
 	dry_run: bool,
 	preferred_issue_id: Option<&str>,
+	preferred_dispatch_mode: Option<IssueDispatchMode>,
+	preferred_run_id: Option<&str>,
+	preferred_attempt_number: Option<i64>,
 ) -> crate::prelude::Result<()> {
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		if dry_run {
@@ -286,10 +308,23 @@ pub(crate) fn run_once(
 	} else {
 		StateStore::open(default_state_store_path()?)?
 	};
+	let preferred_run_identity = match (preferred_run_id, preferred_attempt_number) {
+		(Some(run_id), Some(attempt_number)) =>
+			Some(PreferredRunIdentity { run_id, attempt_number }),
+		(None, None) => None,
+		_ => eyre::bail!(
+			"`run --once --issue-id` requires `--run-id` and `--attempt-number` together."
+		),
+	};
 
-	if let Some(summary) =
-		run_configured_cycle(&config_path, &state_store, dry_run, preferred_issue_id)?
-	{
+	if let Some(summary) = run_configured_cycle(
+		&config_path,
+		&state_store,
+		dry_run,
+		preferred_issue_id,
+		preferred_dispatch_mode,
+		preferred_run_identity,
+	)? {
 		if dry_run {
 			println!(
 				"dry run: project={} issue={} branch={} workspace={} attempt={}",
@@ -529,6 +564,15 @@ fn clear_orphaned_daemon_child_state(
 ) -> crate::prelude::Result<()> {
 	let resolved_run_attempt = resolve_child_exit_run_attempt(state_store, child)?;
 
+	if resolved_run_attempt.is_none() {
+		tracing::debug!(
+			issue_id = child.issue_id,
+			run_id = child.run_id,
+			attempt = child.attempt_number,
+			"Daemon child exited without a matching persisted run attempt; skipping orphan cleanup."
+		);
+	}
+
 	if let Some(run_attempt) = resolved_run_attempt.as_ref() {
 		mark_run_attempt_if_active(state_store, run_attempt.run_id(), "interrupted")?;
 	}
@@ -551,11 +595,7 @@ fn resolve_child_exit_run_attempt(
 	state_store: &StateStore,
 	child: ChildRunRef<'_>,
 ) -> crate::prelude::Result<Option<RunAttempt>> {
-	if let Some(run_attempt) = state_store.run_attempt(child.run_id)? {
-		return Ok(Some(run_attempt));
-	}
-
-	state_store.run_attempt_for_issue_attempt(child.issue_id, child.attempt_number)
+	state_store.run_attempt(child.run_id)
 }
 
 fn spawn_next_daemon_child<T>(
@@ -585,7 +625,10 @@ where
 
 			let child = spawn_run_once_child(
 				config_path,
-				from_retry_queue.then_some(summary.issue_id.as_str()),
+				summary.issue_id.as_str(),
+				if from_retry_queue { IssueDispatchMode::Retry } else { IssueDispatchMode::Normal },
+				summary.run_id.as_str(),
+				summary.attempt_number,
 			)?;
 
 			tracing::info!(
@@ -616,7 +659,10 @@ where
 
 fn spawn_run_once_child(
 	config_path: &Path,
-	preferred_issue_id: Option<&str>,
+	preferred_issue_id: &str,
+	dispatch_mode: IssueDispatchMode,
+	preferred_run_id: &str,
+	preferred_attempt_number: i64,
 ) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
 	let mut command = Command::new(executable);
@@ -626,11 +672,17 @@ fn spawn_run_once_child(
 		.arg(config_path)
 		.stdin(Stdio::null())
 		.stdout(Stdio::inherit())
-		.stderr(Stdio::inherit());
-
-	if let Some(issue_id) = preferred_issue_id {
-		command.args(["--issue-id", issue_id]);
-	}
+		.stderr(Stdio::inherit())
+		.args(["--issue-id", preferred_issue_id])
+		.args([
+			"--dispatch-mode",
+			match dispatch_mode {
+				IssueDispatchMode::Normal => "normal",
+				IssueDispatchMode::Retry => "retry",
+			},
+		])
+		.args(["--run-id", preferred_run_id])
+		.args(["--attempt-number", &preferred_attempt_number.to_string()]);
 
 	let child = command.spawn()?;
 
@@ -679,8 +731,16 @@ where
 		return Ok(RetryDispatchDecision::Blocked);
 	}
 
-	let Some(summary) =
-		run_retry_issue_once(tracker, project, workflow, state_store, &entry.issue_id, true)?
+	let Some(summary) = run_target_issue_once(TargetIssueRunContext {
+		tracker,
+		project,
+		workflow,
+		state_store,
+		issue_id: &entry.issue_id,
+		dry_run: true,
+		dispatch_mode: IssueDispatchMode::Retry,
+		preferred_run_identity: None,
+	})?
 	else {
 		if retry_entry_is_temporarily_blocked(
 			tracker,
@@ -735,6 +795,13 @@ where
 	T: IssueTracker,
 {
 	let Some(run_attempt) = resolve_child_exit_run_attempt(context.state_store, child)? else {
+		tracing::debug!(
+			issue_id = child.issue_id,
+			run_id = child.run_id,
+			attempt = child.attempt_number,
+			"Daemon child exited without a matching persisted run attempt; skipping retry scheduling."
+		);
+
 		return Ok(());
 	};
 	let issue_id = run_attempt.issue_id();
@@ -1100,6 +1167,8 @@ fn run_configured_cycle(
 	state_store: &StateStore,
 	dry_run: bool,
 	preferred_issue_id: Option<&str>,
+	preferred_dispatch_mode: Option<IssueDispatchMode>,
+	preferred_run_identity: Option<PreferredRunIdentity<'_>>,
 ) -> crate::prelude::Result<Option<RunSummary>> {
 	let config = ServiceConfig::from_path(config_path)?;
 	let workflow_path = config.repo_root().join(config.workflow_path());
@@ -1108,7 +1177,16 @@ fn run_configured_cycle(
 	let tracker = LinearClient::new(api_key)?;
 
 	if let Some(issue_id) = preferred_issue_id {
-		return run_retry_issue_once(&tracker, &config, &workflow, state_store, issue_id, dry_run);
+		return run_target_issue_once(TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store,
+			issue_id,
+			dry_run,
+			dispatch_mode: preferred_dispatch_mode.unwrap_or(IssueDispatchMode::Retry),
+			preferred_run_identity,
+		});
 	}
 
 	run_project_once(&tracker, &config, &workflow, state_store, dry_run)
@@ -1161,6 +1239,7 @@ where
 			workspace_manager: &workspace_manager,
 			dry_run,
 			dispatch_mode: IssueDispatchMode::Normal,
+			preferred_run_identity: None,
 		},
 		issue,
 	)?
@@ -1171,54 +1250,59 @@ where
 	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
 }
 
-fn run_retry_issue_once<T>(
-	tracker: &T,
-	project: &ServiceConfig,
-	workflow: &WorkflowDocument,
-	state_store: &StateStore,
-	issue_id: &str,
-	dry_run: bool,
+fn run_target_issue_once<T>(
+	context: TargetIssueRunContext<'_, T>,
 ) -> crate::prelude::Result<Option<RunSummary>>
 where
 	T: IssueTracker,
 {
-	let workspace_manager =
-		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
+	let workspace_manager = WorkspaceManager::new(
+		context.project.id(),
+		context.project.repo_root(),
+		context.project.workspace_root(),
+	);
 
-	if !dry_run {
-		reconcile_project_state(tracker, project, workflow, state_store, &workspace_manager)?;
+	if !context.dry_run {
+		reconcile_project_state(
+			context.tracker,
+			context.project,
+			context.workflow,
+			context.state_store,
+			&workspace_manager,
+		)?;
 	}
 
-	validate_project_contract(project, workflow)?;
-	validate_tracker_project(tracker, project.tracker().project_slug())?;
-	validate_review_handoff_runtime(dry_run)?;
+	validate_project_contract(context.project, context.workflow)?;
+	validate_tracker_project(context.tracker, context.project.tracker().project_slug())?;
+	validate_review_handoff_runtime(context.dry_run)?;
 
-	if !has_available_dispatch_slot(project.id(), state_store)? {
+	if !has_available_dispatch_slot(context.project.id(), context.state_store)? {
 		return Ok(None);
 	}
 
-	let Some(issue) = refresh_issue(tracker, issue_id)? else {
+	let Some(issue) = refresh_issue(context.tracker, context.issue_id)? else {
 		return Ok(None);
 	};
 
-	if !issue_passes_retry_dispatch_policy(
+	if !context.dispatch_mode.allows_issue(
 		&issue,
-		project.tracker().project_slug(),
-		workflow,
-		state_store,
+		context.project.tracker().project_slug(),
+		context.workflow,
+		context.state_store,
 	)? {
 		return Ok(None);
 	}
 
 	let Some(issue_run) = prepare_issue_run(
 		PrepareIssueRunContext {
-			tracker,
-			project,
-			workflow,
-			state_store,
+			tracker: context.tracker,
+			project: context.project,
+			workflow: context.workflow,
+			state_store: context.state_store,
 			workspace_manager: &workspace_manager,
-			dry_run,
-			dispatch_mode: IssueDispatchMode::Retry,
+			dry_run: context.dry_run,
+			dispatch_mode: context.dispatch_mode,
+			preferred_run_identity: context.preferred_run_identity,
 		},
 		issue,
 	)?
@@ -1226,7 +1310,14 @@ where
 		return Ok(None);
 	};
 
-	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+	complete_issue_run(
+		context.tracker,
+		context.project,
+		context.workflow,
+		context.state_store,
+		issue_run,
+		context.dry_run,
+	)
 }
 
 fn prepare_issue_run<T>(
@@ -1236,8 +1327,17 @@ fn prepare_issue_run<T>(
 where
 	T: IssueTracker,
 {
-	let attempt_number = context.state_store.next_attempt_number(&issue.id)?;
-	let run_id = build_run_id(&issue.identifier, attempt_number)?;
+	let next_attempt_number = context.state_store.next_attempt_number(&issue.id)?;
+	let (attempt_number, run_id) = match context.preferred_run_identity {
+		Some(preferred_run_identity) => {
+			if next_attempt_number != preferred_run_identity.attempt_number {
+				return Ok(None);
+			}
+
+			(preferred_run_identity.attempt_number, preferred_run_identity.run_id.to_owned())
+		},
+		None => (next_attempt_number, build_run_id(&issue.identifier, next_attempt_number)?),
+	};
 	let lease_issue_id = issue.id.clone();
 
 	if !context.dry_run
@@ -2827,17 +2927,43 @@ read_first = [{read_first}]
 			vec![vec![issue.clone()], vec![issue.clone()]],
 		);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let summary = orchestrator::run_retry_issue_once(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&issue.id,
-			true,
-		)
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+		})
 		.expect("retry run should succeed");
 
 		assert!(summary.is_some(), "active issue should remain dispatchable for retry");
+	}
+
+	#[test]
+	fn targeted_run_dry_run_accepts_startable_issue_with_normal_dispatch() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			preferred_run_identity: None,
+		})
+		.expect("targeted run should succeed");
+
+		assert!(summary.is_some(), "normal targeted dispatch should accept startable issues");
 	}
 
 	#[test]
@@ -2852,14 +2978,16 @@ read_first = [{read_first}]
 			vec![vec![issue.clone()], vec![issue.clone()]],
 		);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let summary = orchestrator::run_retry_issue_once(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&issue.id,
-			true,
-		)
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+		})
 		.expect("retry run should succeed");
 
 		assert!(summary.is_none(), "retry should reject issues outside the configured project");
@@ -2879,14 +3007,16 @@ read_first = [{read_first}]
 			.record_run_attempt("run-1", &issue.id, 1, orchestrator::TERMINAL_GUARDED_RUN_STATUS)
 			.expect("terminal guard attempt should record");
 
-		let summary = orchestrator::run_retry_issue_once(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&issue.id,
-			true,
-		)
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+		})
 		.expect("retry run should succeed");
 
 		assert!(
@@ -3062,7 +3192,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn schedule_retry_after_child_exit_uses_persisted_attempt_when_run_id_differs() {
+	fn schedule_retry_after_child_exit_requires_exact_run_id() {
 		let (_temp_dir, _config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
@@ -3070,8 +3200,8 @@ read_first = [{read_first}]
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 
 		state_store
-			.record_run_attempt("persisted-run", &issue.id, 1, "failed")
-			.expect("persisted run attempt should record");
+			.record_run_attempt("other-run", &issue.id, 1, "running")
+			.expect("other run attempt should record");
 
 		let exit_status =
 			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
@@ -3092,13 +3222,12 @@ read_first = [{read_first}]
 			},
 			exit_status,
 		)
-		.expect("retry scheduling should use the persisted run attempt");
+		.expect("retry scheduling should succeed");
 
-		let entry =
-			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
-
-		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
-		assert_eq!(entry.attempt, 1);
+		assert!(
+			!retry_queue.entries.contains_key(&issue.id),
+			"retry scheduling should ignore a different run that only matches the issue and attempt"
+		);
 	}
 
 	#[test]
@@ -3863,14 +3992,14 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn exited_child_cleanup_uses_persisted_attempt_when_run_id_differs() {
+	fn exited_child_cleanup_requires_exact_run_id() {
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("In Progress", &[]);
 
 		state_store
-			.record_run_attempt("persisted-run", &issue.id, 1, "running")
-			.expect("persisted run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "persisted-run").expect("lease should record");
+			.record_run_attempt("other-run", &issue.id, 1, "running")
+			.expect("other run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, "other-run").expect("lease should record");
 
 		orchestrator::clear_orphaned_daemon_child_state(
 			&state_store,
@@ -3882,16 +4011,21 @@ read_first = [{read_first}]
 		)
 		.expect("orphaned child cleanup should succeed");
 
-		assert!(
-			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		assert_eq!(
+			state_store
+				.lease_for_issue(&issue.id)
+				.expect("lease lookup should succeed")
+				.expect("lease should remain attached to the other run")
+				.run_id(),
+			"other-run"
 		);
 		assert_eq!(
 			state_store
-				.run_attempt("persisted-run")
+				.run_attempt("other-run")
 				.expect("run attempt lookup should succeed")
 				.expect("run attempt should exist")
 				.status(),
-			"interrupted"
+			"running"
 		);
 	}
 
@@ -3913,6 +4047,7 @@ read_first = [{read_first}]
 				workspace_manager: &workspace_manager,
 				dry_run: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+				preferred_run_identity: None,
 			},
 			issue.clone(),
 		)
@@ -3934,6 +4069,84 @@ read_first = [{read_first}]
 				.expect("lease should exist")
 				.run_id(),
 			issue_run.run_id
+		);
+	}
+
+	#[test]
+	fn prepare_issue_run_honors_preferred_identity_when_attempt_is_current() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
+					run_id: "planned-run",
+					attempt_number: 1,
+				}),
+			},
+			issue.clone(),
+		)
+		.expect("issue preparation should succeed")
+		.expect("targeted issue should prepare");
+
+		assert_eq!(issue_run.run_id, "planned-run");
+		assert_eq!(issue_run.attempt_number, 1);
+		assert_eq!(
+			state_store
+				.lease_for_issue(&issue.id)
+				.expect("lease lookup should succeed")
+				.expect("lease should exist")
+				.run_id(),
+			"planned-run"
+		);
+	}
+
+	#[test]
+	fn prepare_issue_run_rejects_stale_preferred_identity_after_attempt_advance() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+
+		state_store
+			.record_run_attempt("other-run", &issue.id, 1, "succeeded")
+			.expect("existing run attempt should record");
+
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
+					run_id: "planned-run",
+					attempt_number: 1,
+				}),
+			},
+			issue.clone(),
+		)
+		.expect("stale targeted issue preparation should not error");
+
+		assert!(issue_run.is_none(), "stale preferred identity should be rejected");
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
 		);
 	}
 

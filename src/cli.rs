@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::{
-	Args, Parser, Subcommand,
+	Args, Parser, Subcommand, ValueEnum,
 	builder::{
 		Styles,
 		styling::{AnsiColor, Effects},
@@ -9,7 +9,8 @@ use clap::{
 };
 
 use crate::{
-	agent, orchestrator,
+	agent,
+	orchestrator::{self, IssueDispatchMode},
 	prelude::{Result, eyre},
 };
 
@@ -56,6 +57,20 @@ enum Command {
 	Protocol(ProtocolCommand),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RunIssueDispatchMode {
+	Normal,
+	Retry,
+}
+impl From<RunIssueDispatchMode> for IssueDispatchMode {
+	fn from(value: RunIssueDispatchMode) -> Self {
+		match value {
+			RunIssueDispatchMode::Normal => Self::Normal,
+			RunIssueDispatchMode::Retry => Self::Retry,
+		}
+	}
+}
+
 #[derive(Debug, Args)]
 struct RunCommand {
 	/// Run only a single orchestration iteration.
@@ -67,6 +82,15 @@ struct RunCommand {
 	/// Run a specific leased or queued issue instead of normal candidate selection.
 	#[arg(long, value_name = "ISSUE_ID")]
 	issue_id: Option<String>,
+	/// Override the dispatch policy for an issue-targeted run.
+	#[arg(long, value_name = "MODE", value_enum, hide = true, requires = "issue_id")]
+	dispatch_mode: Option<RunIssueDispatchMode>,
+	/// Reuse a daemon-planned run identifier for an issue-targeted run.
+	#[arg(long, value_name = "RUN_ID", hide = true, requires = "issue_id")]
+	run_id: Option<String>,
+	/// Reuse a daemon-planned attempt number for an issue-targeted run.
+	#[arg(long, value_name = "ATTEMPT", hide = true, requires = "issue_id")]
+	attempt_number: Option<i64>,
 	/// Override the service config path.
 	#[arg(long, value_name = "PATH")]
 	config: Option<PathBuf>,
@@ -76,8 +100,20 @@ impl RunCommand {
 		if !self.once {
 			eyre::bail!("`run` currently requires `--once` for the MVP.");
 		}
+		if self.run_id.is_some() != self.attempt_number.is_some() {
+			eyre::bail!(
+				"`run --once --issue-id` requires `--run-id` and `--attempt-number` together."
+			);
+		}
 
-		orchestrator::run_once(self.config.as_deref(), self.dry_run, self.issue_id.as_deref())
+		orchestrator::run_once(
+			self.config.as_deref(),
+			self.dry_run,
+			self.issue_id.as_deref(),
+			self.dispatch_mode.map(Into::into),
+			self.run_id.as_deref(),
+			self.attempt_number,
+		)
 	}
 }
 
@@ -174,7 +210,7 @@ mod tests {
 
 	use crate::cli::{
 		Cli, Command, DaemonCommand, ProtocolCommand, ProtocolProbeCommand, ProtocolSubcommand,
-		RunCommand, StatusCommand,
+		RunCommand, RunIssueDispatchMode, StatusCommand,
 	};
 
 	#[test]
@@ -183,7 +219,15 @@ mod tests {
 
 		assert!(matches!(
 			cli.command,
-			Command::Run(RunCommand { once: true, dry_run: true, issue_id: None, config: None })
+			Command::Run(RunCommand {
+				once: true,
+				dry_run: true,
+				issue_id: None,
+				dispatch_mode: None,
+				run_id: None,
+				attempt_number: None,
+				config: None
+			})
 		));
 	}
 
@@ -197,6 +241,39 @@ mod tests {
 				once: true,
 				dry_run: false,
 				issue_id: Some(_),
+				dispatch_mode: None,
+				run_id: None,
+				attempt_number: None,
+				config: None
+			})
+		));
+	}
+
+	#[test]
+	fn parses_run_once_with_hidden_daemon_identity_override() {
+		let cli = Cli::parse_from([
+			"maestro",
+			"run",
+			"--once",
+			"--issue-id",
+			"issue-1",
+			"--dispatch-mode",
+			"normal",
+			"--run-id",
+			"mae-1-attempt-2-123",
+			"--attempt-number",
+			"2",
+		]);
+
+		assert!(matches!(
+			cli.command,
+			Command::Run(RunCommand {
+				once: true,
+				dry_run: false,
+				issue_id: Some(_),
+				dispatch_mode: Some(RunIssueDispatchMode::Normal),
+				run_id: Some(_),
+				attempt_number: Some(2),
 				config: None
 			})
 		));
