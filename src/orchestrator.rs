@@ -831,6 +831,7 @@ where
 fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
 	let workflow_snapshot = request.workflow.to_markdown()?;
+	let lease_preacquired = request.dispatch_slot_handoff.is_some();
 	let mut command = Command::new(executable);
 
 	command
@@ -850,8 +851,11 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 		.args(["--run-id", request.preferred_run_id])
 		.args(["--attempt-number", &request.preferred_attempt_number.to_string()])
 		.args(["--retry-budget-base", &request.preferred_retry_budget_base.to_string()])
-		.arg("--lease-preacquired")
 		.args(["--workflow-snapshot", workflow_snapshot.as_str()]);
+
+	if lease_preacquired {
+		command.arg("--lease-preacquired");
+	}
 
 	#[cfg(unix)]
 	if let Some(dispatch_slot_handoff) = request.dispatch_slot_handoff {
@@ -2692,7 +2696,7 @@ fn process_is_alive(_process_id: u32) -> bool {
 }
 
 fn hydrate_status_snapshot_state(
-	project: &ServiceConfig,
+	_project: &ServiceConfig,
 	state_store: &StateStore,
 	recovered_state: RecoveredRuntimeState,
 ) -> crate::prelude::Result<()> {
@@ -2700,7 +2704,6 @@ fn hydrate_status_snapshot_state(
 		let recovered_run_id = format!("recovered-{}", issue.identifier.to_lowercase());
 
 		state_store.record_run_attempt(&recovered_run_id, &issue.id, 1, "running")?;
-		state_store.upsert_lease(project.id(), &issue.id, &recovered_run_id)?;
 	}
 
 	Ok(())
@@ -4439,6 +4442,41 @@ read_first = [{read_first}]
 		assert_eq!(snapshot.recent_runs.len(), 1);
 		assert_eq!(snapshot.active_runs.len(), 2);
 		assert!(snapshot.active_runs.iter().all(|run| run.active_lease));
+	}
+
+	#[test]
+	fn status_hydration_does_not_fabricate_active_leases_for_recovered_candidates() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Progress", &[]);
+		let workspace_path = config.workspace_root().join("PUB-101");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		orchestrator::hydrate_status_snapshot_state(
+			&config,
+			&state_store,
+			orchestrator::RecoveredRuntimeState { active_issues: vec![issue.clone()] },
+		)
+		.expect("status hydration should succeed");
+
+		let snapshot = orchestrator::build_operator_status_snapshot(&config, &state_store, 10)
+			.expect("snapshot should build");
+
+		assert!(
+			snapshot.active_runs.is_empty(),
+			"recovered retry candidates should not appear as active leased runs"
+		);
+		assert_eq!(snapshot.recent_runs.len(), 1);
+		assert_eq!(snapshot.recent_runs[0].run_id, "recovered-pub-101");
+		assert!(!snapshot.recent_runs[0].active_lease);
 	}
 
 	#[test]
