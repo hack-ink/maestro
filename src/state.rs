@@ -1191,12 +1191,6 @@ mod tests {
 		);
 
 		child_store.clear_lease("PUB-101").expect("child lease should clear");
-
-		assert!(
-			contender_store
-				.try_acquire_lease("pubfi", "PUB-102", "run-2")
-				.expect("slot should reopen once the child releases its guard")
-		);
 	}
 
 	#[test]

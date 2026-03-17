@@ -2663,6 +2663,10 @@ fn workspace_activity_marker_is_fresh(marker: &RunActivityMarker, now_unix_epoch
 
 #[cfg(unix)]
 fn process_is_alive(process_id: u32) -> bool {
+	let Ok(process_id) = i32::try_from(process_id) else {
+		return false;
+	};
+
 	Command::new("kill")
 		.args(["-0", &process_id.to_string()])
 		.stdout(Stdio::null())
