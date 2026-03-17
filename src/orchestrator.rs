@@ -1267,9 +1267,6 @@ fn stalled_idle_duration(
 	if !matches!(run_attempt.status(), "starting" | "running") {
 		return Ok(None);
 	}
-	if state_store.event_count(run_attempt.run_id())? == 0 {
-		return Ok(None);
-	}
 
 	let Some(last_activity) = state_store.last_run_activity_unix_epoch(run_attempt.run_id())?
 	else {
@@ -4689,6 +4686,55 @@ read_first = [{read_first}]
 				action.disposition,
 				orchestrator::ActiveRunDisposition::Stalled { idle_for }
 					if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
+				)
+		}));
+	}
+
+	#[test]
+	fn active_run_reconciliation_detects_stalled_run_without_protocol_events() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let stalled_issue = sample_issue_with_sort_fields(
+			"issue-stalled-no-events",
+			"PUB-204",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![stalled_issue.clone()]);
+
+		state_store
+			.record_run_attempt(
+				&format!("run-{}", stalled_issue.identifier),
+				&stalled_issue.id,
+				1,
+				"running",
+			)
+			.expect("run attempt should record");
+		state_store
+			.upsert_lease("pubfi", &stalled_issue.id, &format!("run-{}", stalled_issue.identifier))
+			.expect("lease should record");
+
+		let now = OffsetDateTime::now_utc().unix_timestamp()
+			+ ACTIVE_RUN_IDLE_TIMEOUT.as_secs() as i64
+			+ 1;
+		let actions = orchestrator::inspect_active_run_reconciliation_at(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			None,
+			now,
+		)
+		.expect("active-run inspection should succeed");
+
+		assert!(actions.iter().any(|action| {
+			action.issue.id == stalled_issue.id
+				&& matches!(
+					action.disposition,
+					orchestrator::ActiveRunDisposition::Stalled { idle_for }
+						if idle_for >= ACTIVE_RUN_IDLE_TIMEOUT
 				)
 		}));
 	}
