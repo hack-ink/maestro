@@ -5,6 +5,7 @@ use std::{
 	error::Error,
 	fmt::{self, Display, Formatter},
 	fs,
+	io::ErrorKind,
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
 	slice, thread,
@@ -35,6 +36,7 @@ pub(crate) const DEFAULT_STATUS_RUN_LIMIT: usize = 10;
 const CONTINUATION_RETRY_DELAY_MS: u64 = 1_000;
 const FAILURE_RETRY_BASE_DELAY_MS: u64 = 10_000;
 const TERMINAL_GUARDED_RUN_STATUS: &str = "terminal_guarded";
+const TERMINAL_GUARD_MARKER_FILE: &str = ".maestro-terminal-guarded";
 
 /// One bounded `run --once` invocation and its optional daemon-planned overrides.
 pub(crate) struct RunOnceRequest<'a> {
@@ -279,14 +281,14 @@ impl IssueDispatchMode {
 	fn allows_issue(
 		self,
 		issue: &TrackerIssue,
-		project_slug: &str,
+		project: &ServiceConfig,
 		workflow: &WorkflowDocument,
 		state_store: &StateStore,
 	) -> crate::prelude::Result<bool> {
 		match self {
 			Self::Normal => Ok(issue_passes_dispatch_policy(issue, workflow)),
 			Self::Retry =>
-				issue_passes_retry_dispatch_policy(issue, project_slug, workflow, state_store),
+				issue_passes_retry_dispatch_policy(issue, project, workflow, state_store),
 		}
 	}
 }
@@ -294,7 +296,7 @@ impl IssueDispatchMode {
 struct ChildExitRetryContext<'a, T> {
 	retry_queue: &'a mut RetryQueue,
 	tracker: &'a T,
-	project_slug: &'a str,
+	project: &'a ServiceConfig,
 	workflow: &'a WorkflowDocument,
 	state_store: &'a StateStore,
 }
@@ -625,13 +627,7 @@ where
 
 			if let Some(exit_status) = child_exit_status {
 				schedule_retry_after_child_exit(
-					ChildExitRetryContext {
-						retry_queue,
-						tracker,
-						project_slug: project.tracker().project_slug(),
-						workflow,
-						state_store,
-					},
+					ChildExitRetryContext { retry_queue, tracker, project, workflow, state_store },
 					ChildRunRef {
 						issue_id: &daemon_child.issue_id,
 						run_id: &daemon_child.run_id,
@@ -844,12 +840,7 @@ where
 			return Ok(RetryDispatchDecision::Continue);
 		};
 
-		if !issue_passes_retry_dispatch_policy(
-			&issue,
-			project.tracker().project_slug(),
-			workflow,
-			state_store,
-		)? {
+		if !issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)? {
 			retry_queue.release(&entry.issue_id);
 
 			return Ok(RetryDispatchDecision::Continue);
@@ -913,12 +904,7 @@ where
 		return Ok(false);
 	};
 
-	issue_passes_retry_dispatch_policy(
-		&issue,
-		project.tracker().project_slug(),
-		workflow,
-		state_store,
-	)
+	issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)
 }
 
 fn schedule_retry_after_child_exit<T>(
@@ -948,7 +934,7 @@ where
 
 	if !issue_passes_retry_dispatch_policy(
 		&issue,
-		context.project_slug,
+		context.project,
 		context.workflow,
 		context.state_store,
 	)? {
@@ -1406,7 +1392,7 @@ where
 	if !has_available_dispatch_slot(project.id(), state_store)? {
 		return Ok(None);
 	}
-	if !dispatch_mode.allows_issue(&issue, project_slug, workflow, state_store)? {
+	if !dispatch_mode.allows_issue(&issue, project, workflow, state_store)? {
 		return Ok(None);
 	}
 
@@ -1474,7 +1460,7 @@ where
 
 	if !context.dispatch_mode.allows_issue(
 		&issue,
-		context.project.tracker().project_slug(),
+		context.project,
 		context.workflow,
 		context.state_store,
 	)? {
@@ -1559,7 +1545,7 @@ where
 		};
 		let dispatch_allowed = context.dispatch_mode.allows_issue(
 			&refreshed_issue,
-			context.project.tracker().project_slug(),
+			context.project,
 			context.workflow,
 			context.state_store,
 		)?;
@@ -1575,6 +1561,9 @@ where
 			}
 
 			return Ok(None);
+		}
+		if !context.dry_run {
+			clear_terminal_guard_marker(&workspace.path)?;
 		}
 
 		Ok(Some(IssueRunPlan {
@@ -1951,6 +1940,12 @@ where
 	)?;
 
 	if outcome.retry_guarded_by_state {
+		write_terminal_guard_marker(
+			&issue_run.workspace.path,
+			&issue_run.run_id,
+			issue_run.attempt_number,
+		)?;
+
 		state_store.update_run_status(&issue_run.run_id, TERMINAL_GUARDED_RUN_STATUS)?;
 	}
 
@@ -2121,26 +2116,55 @@ fn issue_passes_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocumen
 
 fn issue_passes_retry_dispatch_policy(
 	issue: &TrackerIssue,
-	project_slug: &str,
+	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 ) -> crate::prelude::Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
 
-	Ok(issue.project_slug.as_deref() == Some(project_slug)
+	Ok(issue.project_slug.as_deref() == Some(project.tracker().project_slug())
 		&& issue.state.name == tracker_policy.in_progress_state()
 		&& !issue.has_label(tracker_policy.opt_out_label())
 		&& !issue.has_label(tracker_policy.needs_attention_label())
-		&& !issue_is_terminal_retry_guarded(issue, state_store)?)
+		&& !issue_is_terminal_retry_guarded(issue, project, state_store)?)
 }
 
 fn issue_is_terminal_retry_guarded(
 	issue: &TrackerIssue,
+	project: &ServiceConfig,
 	state_store: &StateStore,
 ) -> crate::prelude::Result<bool> {
 	Ok(state_store
 		.latest_run_attempt_for_issue(&issue.id)?
-		.is_some_and(|attempt| attempt.status() == TERMINAL_GUARDED_RUN_STATUS))
+		.is_some_and(|attempt| attempt.status() == TERMINAL_GUARDED_RUN_STATUS)
+		|| terminal_guard_marker_path(project, &issue.identifier).exists())
+}
+
+fn terminal_guard_marker_path(project: &ServiceConfig, issue_identifier: &str) -> PathBuf {
+	project.workspace_root().join(issue_identifier).join(TERMINAL_GUARD_MARKER_FILE)
+}
+
+fn write_terminal_guard_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+) -> crate::prelude::Result<()> {
+	let marker_path = workspace_path.join(TERMINAL_GUARD_MARKER_FILE);
+	let marker_body = format!("run_id={run_id}\nattempt_number={attempt_number}\n");
+
+	fs::write(marker_path, marker_body)?;
+
+	Ok(())
+}
+
+fn clear_terminal_guard_marker(workspace_path: &Path) -> crate::prelude::Result<()> {
+	let marker_path = workspace_path.join(TERMINAL_GUARD_MARKER_FILE);
+
+	match fs::remove_file(&marker_path) {
+		Ok(()) => Ok(()),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error.into()),
+	}
 }
 
 fn is_issue_eligible(
@@ -2408,7 +2432,7 @@ where
 			&workspace.path.display().to_string(),
 		)?;
 
-		if issue_passes_retry_dispatch_policy(&issue, project_slug, workflow, state_store)? {
+		if issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)? {
 			active_issues.push(issue);
 		}
 	}
@@ -3414,7 +3438,7 @@ read_first = [{read_first}]
 
 	#[test]
 	fn schedule_retry_after_child_exit_records_failure_retry_for_active_issue() {
-		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -3433,7 +3457,7 @@ read_first = [{read_first}]
 			orchestrator::ChildExitRetryContext {
 				retry_queue: &mut retry_queue,
 				tracker: &tracker,
-				project_slug: "pubfi",
+				project: &config,
 				workflow: &workflow,
 				state_store: &state_store,
 			},
@@ -3451,7 +3475,7 @@ read_first = [{read_first}]
 
 	#[test]
 	fn failure_retry_budget_ignores_prior_continuation_attempts() {
-		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -3479,7 +3503,7 @@ read_first = [{read_first}]
 			orchestrator::ChildExitRetryContext {
 				retry_queue: &mut retry_queue,
 				tracker: &tracker,
-				project_slug: "pubfi",
+				project: &config,
 				workflow: &workflow,
 				state_store: &state_store,
 			},
@@ -3501,7 +3525,7 @@ read_first = [{read_first}]
 
 	#[test]
 	fn interrupted_exits_consume_retry_budget() {
-		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -3526,7 +3550,7 @@ read_first = [{read_first}]
 			orchestrator::ChildExitRetryContext {
 				retry_queue: &mut retry_queue,
 				tracker: &tracker,
-				project_slug: "pubfi",
+				project: &config,
 				workflow: &workflow,
 				state_store: &state_store,
 			},
@@ -3543,7 +3567,7 @@ read_first = [{read_first}]
 
 	#[test]
 	fn schedule_retry_after_child_exit_records_continuation_retry_for_clean_exit() {
-		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -3562,7 +3586,7 @@ read_first = [{read_first}]
 			orchestrator::ChildExitRetryContext {
 				retry_queue: &mut retry_queue,
 				tracker: &tracker,
-				project_slug: "pubfi",
+				project: &config,
 				workflow: &workflow,
 				state_store: &state_store,
 			},
@@ -3580,7 +3604,7 @@ read_first = [{read_first}]
 
 	#[test]
 	fn schedule_retry_after_child_exit_requires_exact_run_id() {
-		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -3598,7 +3622,7 @@ read_first = [{read_first}]
 			orchestrator::ChildExitRetryContext {
 				retry_queue: &mut retry_queue,
 				tracker: &tracker,
-				project_slug: "pubfi",
+				project: &config,
 				workflow: &workflow,
 				state_store: &state_store,
 			},
@@ -4919,6 +4943,8 @@ read_first = [{read_first}]
 			run_id: issue_run.run_id.clone(),
 		});
 
+		fs::create_dir_all(&issue_run.workspace.path).expect("workspace path should exist");
+
 		state_store
 			.record_run_attempt(&issue_run.run_id, &issue.id, issue_run.attempt_number, "failed")
 			.expect("run attempt should record");
@@ -4949,6 +4975,50 @@ read_first = [{read_first}]
 				.expect("run attempt should exist")
 				.status(),
 			orchestrator::TERMINAL_GUARDED_RUN_STATUS
+		);
+		assert!(
+			issue_run.workspace.path.join(orchestrator::TERMINAL_GUARD_MARKER_FILE).exists(),
+			"fallback guard should leave a durable workspace marker for restart recovery"
+		);
+	}
+
+	#[test]
+	fn prepare_issue_run_clears_terminal_guard_marker_when_new_attempt_starts() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(vec![], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist before retry guard clearing");
+		let marker_path = workspace.path.join(orchestrator::TERMINAL_GUARD_MARKER_FILE);
+
+		fs::write(&marker_path, "stale terminal guard\n")
+			.expect("terminal guard marker should write");
+
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_run_identity: None,
+				preferred_retry_budget_base: None,
+			},
+			issue,
+		)
+		.expect("issue preparation should succeed")
+		.expect("startable issue should produce a run plan");
+
+		assert_eq!(issue_run.workspace.path, workspace.path);
+		assert!(
+			!marker_path.exists(),
+			"starting a new attempt should clear stale terminal-guard markers"
 		);
 	}
 
@@ -5103,6 +5173,42 @@ read_first = [{read_first}]
 				.expect("workspace lookup should succeed")
 				.is_some(),
 			"workspace mapping should be reconstructed from the retained lane"
+		);
+	}
+
+	#[test]
+	fn run_project_once_skips_recovered_terminal_guarded_workspace_after_empty_state_startup() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue_without_needs_attention_team_label("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("recovered workspace should exist");
+
+		fs::write(
+			workspace.path.join(orchestrator::TERMINAL_GUARD_MARKER_FILE),
+			"run_id=pub-101-attempt-1-123\nattempt_number=1\n",
+		)
+		.expect("terminal guard marker should write");
+
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("recovery should succeed");
+
+		assert!(
+			summary.is_none(),
+			"restart recovery should not redispatch retained lanes guarded by a terminal marker"
+		);
+		assert!(
+			state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace lookup should succeed")
+				.is_some(),
+			"workspace mapping should still be reconstructed for guarded retained lanes"
 		);
 	}
 
