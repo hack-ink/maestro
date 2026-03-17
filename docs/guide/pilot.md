@@ -54,9 +54,9 @@ For the recommended first deployment, keep the live local config at `tmp/maestro
 2. `./tmp/maestro.toml`
 3. The platform default config path returned by `directories::ProjectDirs`
 
-The SQLite operational state is stored separately from the target repo and uses the filename `maestro.sqlite3` under the platform data directory.
+Runtime state now lives in process memory only. On restart, `maestro` rebuilds retained workspace knowledge and active-lane recovery intent from current Linear issue state plus deterministic `.workspaces/<ISSUE>` inspection.
 
-The local state is scoped by configured `id`, so reconciliation and cleanup operate within the single configured project lane for this `tmp/maestro.toml`.
+That recovery is still scoped by configured `id`, so reconciliation and cleanup operate within the single configured project lane for this `tmp/maestro.toml`.
 
 ## Sample service config
 
@@ -228,17 +228,15 @@ Use the human-readable view when you need the current leased run, retained works
 
 If you pass `--limit`, it only caps the recent-run section. Active runs remain uncapped in both the human-readable and JSON status views so the currently leased lanes stay visible.
 
-If you still need the thin storage internals for deep forensics, inspect the SQLite file directly as a fallback:
+There is no longer a supported SQLite fallback for normal recovery. If `status` is insufficient, use the tracker plus retained workspace lane directly:
 
 ```sh
-DB_PATH=/absolute/path/to/maestro.sqlite3
-sqlite3 "$DB_PATH" 'select project_id, issue_id, run_id from issue_leases;'
-sqlite3 "$DB_PATH" 'select run_id, issue_id, attempt_number, status, thread_id from run_attempts order by updated_at desc;'
-sqlite3 "$DB_PATH" 'select run_id, sequence_number, event_type from event_journal order by id desc limit 50;'
-sqlite3 "$DB_PATH" 'select project_id, issue_id, branch_name, workspace_path from workspace_mappings;'
+gh issue view XY-123 --comments
+git -C /absolute/path/to/hack-ink/maestro/.workspaces/XY-123 status --short
+git -C /absolute/path/to/hack-ink/maestro/.workspaces/XY-123 log --oneline --decorate -5
 ```
 
-Use the event journal when the failure happened inside `app-server` transport or thread lifecycle rather than during repo validation commands.
+Use tracker comments for run ids, attempts, and failure class; use the retained workspace when the failure happened inside `app-server` transport or thread lifecycle rather than during repo validation commands.
 
 ## Re-running after failure
 

@@ -2,7 +2,7 @@
 
 /// Service configuration types and loaders.
 pub mod config;
-/// Thin local persistence for active Maestro execution state.
+/// Thin local runtime state for active Maestro execution state.
 pub mod state;
 /// Downstream `WORKFLOW.md` parsing and validation.
 pub mod workflow;

@@ -95,7 +95,7 @@
       {
         "id": "place-xy-128",
         "title": "Place WORKFLOW reload semantics in the post-pilot sequence",
-        "status": "in_progress",
+        "status": "done",
         "objective": "Define whether XY-128 should land as a small standalone contract task or fold into adjacent runtime hardening without becoming implicit.",
         "inputs": [
           "XY-128",
@@ -116,20 +116,21 @@
       },
       {
         "id": "shape-xy-124",
-        "title": "Define the remove-SQLite transition boundary",
-        "status": "pending",
-        "objective": "Specify what evidence and runtime surfaces must already exist before SQLite durability can be removed safely.",
+        "title": "Execute the remove-SQLite transition boundary",
+        "status": "in_progress",
+        "objective": "Use a dedicated execution lane to replace durable SQLite with process-memory state plus tracker/filesystem recovery without regressing daemon supervision behavior.",
         "inputs": [
           "XY-124",
           "Current runtime and observability surfaces",
           "The shaped XY-126 and XY-128 outcomes"
         ],
         "outputs": [
-          "A clear transition boundary for remove-SQLite work",
-          "A decision on whether XY-124 also needs smaller child issues"
+          "A dedicated XY-124 execution plan",
+          "An active implementation lane for removing durable SQLite"
         ],
         "verification": [
-          "The remove-SQLite scope stays behind XY-125, XY-126, and XY-128 and does not jump ahead of unresolved observability or reconciliation gaps"
+          "The remove-SQLite scope stays behind XY-125, XY-126, and XY-128 and does not jump ahead of unresolved observability or reconciliation gaps",
+          "Execution authority points at a dedicated XY-124 plan before code changes start"
         ],
         "depends_on": [
           "place-xy-128"
@@ -147,8 +148,8 @@
   },
   "state": {
     "phase": "executing",
-    "current_task_id": "place-xy-128",
-    "next_task_id": "place-xy-128",
+    "current_task_id": "shape-xy-124",
+    "next_task_id": "shape-xy-124",
     "blockers": [],
     "evidence": [
       "2026-03-13: PUB-610 and PUB-608 were originally staged after PR-backed handoff and daemon supervision so structural work would not enter the critical path too early.",
@@ -157,15 +158,17 @@
       "2026-03-16: PR #7 merged XY-143, so loop readiness is now confirmed: the current self-supervision path is PR-backed, reconciled, operator-visible, and no longer depends on manual PR creation or ad hoc SQL.",
       "2026-03-17: XY-125 is now done after PR #8 fast-forwarded onto main, so claim/concurrency/blocker policy is no longer the active structural gap.",
       "2026-03-17: XY-126 is now done after PR #9 fast-forwarded onto main, so retry queue and backoff semantics are no longer the active structural gap.",
-      "2026-03-17: XY-128 is now the active structural execution lane via docs/plans/2026-03-17_maestro-xy-128-workflow-reload-last-known-good.md, with XY-124 still intentionally last.",
-      "2026-03-16: XY-141 should not block this plan because current `main` already uses clone-backed `.workspaces` lanes and the imported issue description is stale."
+      "2026-03-17: XY-128 is now done after PR #10 fast-forwarded onto main, so last-known-good WORKFLOW reload semantics are no longer the active structural gap.",
+      "2026-03-17: XY-124 is now the active structural execution lane via docs/plans/2026-03-17_maestro-xy-124-remove-sqlite-runtime-state.md, with XY-138 remaining downstream documentation hygiene.",
+      "2026-03-17: XY-141 should not block this plan because current `main` already uses clone-backed `.workspaces` lanes and the imported issue description is stale.",
+      "2026-03-17: XY-124 now has in-memory runtime state, tracker/filesystem recovery, updated runtime/operator docs, and passing local verification; delivery is the remaining step before the structural plan can advance."
     ],
-    "last_updated": "2026-03-17T03:20:00Z",
+    "last_updated": "2026-03-17T04:37:54Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "The next remaining runtime gap is XY-128 last-known-good WORKFLOW reload semantics; daemon supervision, XY-125, and XY-126 are complete.",
-      "ordering_rule": "XY-125 stays ahead of XY-126, XY-128 is placed explicitly before XY-124, and XY-124 stays last.",
-      "next_candidate_after_daemon_closeout": "XY-128"
+      "current_gap": "The active remaining runtime gap is XY-124 delivery and review closeout; daemon supervision, XY-125, XY-126, and XY-128 are complete locally.",
+      "ordering_rule": "XY-125 stays ahead of XY-126, XY-128 lands before XY-124, and XY-138 remains downstream hygiene after the runtime transition.",
+      "next_candidate_after_daemon_closeout": "XY-124"
     }
   }
 }

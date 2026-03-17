@@ -91,6 +91,9 @@ struct RunCommand {
 	/// Reuse a daemon-planned attempt number for an issue-targeted run.
 	#[arg(long, value_name = "ATTEMPT", hide = true, requires = "issue_id")]
 	attempt_number: Option<i64>,
+	/// Reuse the daemon-known retry-budget count before this issue-targeted run starts.
+	#[arg(long, value_name = "COUNT", hide = true, requires = "issue_id")]
+	retry_budget_base: Option<i64>,
 	/// Reuse a daemon-planned workflow snapshot for an issue-targeted run.
 	#[arg(long, value_name = "MARKDOWN", hide = true, requires = "issue_id")]
 	workflow_snapshot: Option<String>,
@@ -109,15 +112,16 @@ impl RunCommand {
 			);
 		}
 
-		orchestrator::run_once(
-			self.config.as_deref(),
-			self.dry_run,
-			self.issue_id.as_deref(),
-			self.dispatch_mode.map(Into::into),
-			self.run_id.as_deref(),
-			self.attempt_number,
-			self.workflow_snapshot.as_deref(),
-		)
+		orchestrator::run_once(orchestrator::RunOnceRequest {
+			config_path: self.config.as_deref(),
+			dry_run: self.dry_run,
+			preferred_issue_id: self.issue_id.as_deref(),
+			preferred_dispatch_mode: self.dispatch_mode.map(Into::into),
+			preferred_run_id: self.run_id.as_deref(),
+			preferred_attempt_number: self.attempt_number,
+			preferred_retry_budget_base: self.retry_budget_base,
+			preferred_workflow_snapshot: self.workflow_snapshot.as_deref(),
+		})
 	}
 }
 
@@ -230,6 +234,7 @@ mod tests {
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
+				retry_budget_base: None,
 				workflow_snapshot: None,
 				config: None
 			})
@@ -249,6 +254,7 @@ mod tests {
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
+				retry_budget_base: None,
 				workflow_snapshot: None,
 				config: None
 			})
@@ -269,6 +275,8 @@ mod tests {
 			"mae-1-attempt-2-123",
 			"--attempt-number",
 			"2",
+			"--retry-budget-base",
+			"1",
 			"--workflow-snapshot",
 			"workflow-snapshot",
 		]);
@@ -282,6 +290,7 @@ mod tests {
 				dispatch_mode: Some(RunIssueDispatchMode::Normal),
 				run_id: Some(_),
 				attempt_number: Some(2),
+				retry_budget_base: Some(1),
 				workflow_snapshot: Some(_),
 				config: None
 			})

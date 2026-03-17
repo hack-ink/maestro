@@ -220,7 +220,7 @@ Required failure comment fields:
 
 ## Local operational state
 
-The local persistence layer may store only the data needed to operate safely:
+The local runtime store may keep only the data needed to operate safely during the current process lifetime:
 
 - issue leases
 - run attempt identifiers
@@ -229,7 +229,8 @@ The local persistence layer may store only the data needed to operate safely:
 - workspace mappings
 - tracker-write fallback metadata when the service must repair state after an interrupted run
 
-The local persistence layer must not become the operator-facing source of workflow truth.
+This runtime state is process-memory only. `maestro` must not require a durable local database file for normal operation or restart recovery.
+The local runtime store must not become the operator-facing source of workflow truth.
 
 ## Supported operator visibility surface
 
@@ -240,25 +241,26 @@ The minimum supported surface is:
 - structured runtime logs with stable identifiers such as `project_id`, `issue_id`, `issue`, `run_id`, `attempt`, `branch`, and repository-relative `workspace_path`
 - a local status command that renders the current project-scoped snapshot in both human-readable and JSON forms
 
-The status surface should describe only current local execution state, for example:
+The status surface should describe only current local execution state, plus restart recovery synthesized from current tracker state and retained `.workspaces` lanes, for example:
 
 - active leased runs
-- recent run attempts with local status, thread id, and latest persisted protocol event
+- recent run attempts with local status, thread id, and latest recorded protocol event
 - retained workspace mappings
 
-It is acceptable for deeper historical forensics to continue using the retained local store directly, but that store is a fallback implementation detail rather than the supported first-line operator interface.
+After a process restart, recent-run history may be shallow because attempt and event journals are memory-only. Operators should rely on `status`, tracker comments, and retained workspaces rather than local SQL for first-line recovery.
 
 ## Retention and cleanup
 
 - Lease and session mappings: remove when the run closes.
-- Attempt and event journals: retain for 14 days.
+- Attempt and event journals: retain only for the current process lifetime.
 - Workspaces: retain while the issue is non-terminal.
 - Terminal issue cleanup: once the issue reaches a terminal tracker state, remove the workspace during reconciliation or startup cleanup.
 - If an issue becomes non-terminal but no longer eligible while `maestro` is still preparing the lane, keep the workspace and skip execution for that pass.
 
 ## Recovery rules
 
-- On service startup, `maestro` must reconcile local leases against current Linear state before starting new work.
+- On service startup, `maestro` must inspect the configured Linear project together with deterministic `.workspaces/<ISSUE>` paths to rebuild retained workspace mappings before starting new work.
+- If Linear still shows a non-terminal `In Progress` issue and its retained workspace exists locally, `maestro` must treat that lane as a retry-style recovery candidate before selecting fresh `Todo` work.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
 - While daemon mode is running an active lane, that child must keep the workflow snapshot it started with; repo-owned `WORKFLOW.md` reloads affect later decisions without restarting the in-flight child.
 - While daemon mode owns a queued retry entry, that queued claim must take priority over normal candidate selection in the current single-slot runtime.
@@ -267,11 +269,11 @@ It is acceptable for deeper historical forensics to continue using the retained 
 - If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the workspace.
 - If the leased issue becomes non-terminal and leaves both the `In Progress` lane state and any configured startable pre-claim state, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the workspace for inspection.
 - A leased issue that is still in a configured startable state during early daemon ticks must be treated as a lane that has not finished claiming tracker ownership yet, not as an immediate non-active interruption.
-- If a running attempt exceeds the app-server idle timeout with no persisted protocol activity, `maestro` must treat it as stalled, stop the active run, mark the attempt `stalled`, and converge the issue through the human-required failure path instead of silently retrying in this phase.
-- If the supervised child already exited before the next daemon tick, stalled reconciliation must still inspect the just-finished lane using persisted protocol activity rather than skipping directly to generic failure handling.
+- If a running attempt exceeds the app-server idle timeout with no recorded protocol activity, `maestro` must treat it as stalled, stop the active run, mark the attempt `stalled`, and converge the issue through the human-required failure path instead of silently retrying in this phase.
+- If the supervised child already exited before the next daemon tick, stalled reconciliation must still inspect the just-finished lane using recorded protocol activity rather than skipping directly to generic failure handling.
 - Reconciliation must mark locally active run attempts as `interrupted` when their stale lease is cleared, or `terminated` when the tracker issue is already terminal.
 - Reconciliation must clear stale leases before the next issue-selection pass.
 - When a queued retry becomes due, `maestro` must refresh that exact issue, redispatch it only if it is still active under retry policy, and otherwise release the queued claim.
 - Before a prepared lane starts `app-server`, `maestro` must refresh the selected issue once more and skip execution if the issue became terminal or otherwise ineligible.
-- If the local process crashed during a run, `maestro` may resume, retry, or mark the issue failed based on the retained lease, session, and attempt records.
-- If Linear shows a non-terminal state but no local lease exists, the issue may become eligible again after reconciliation.
+- If the local process crashed during a run, `maestro` must recover from current tracker state plus retained workspace inspection rather than assuming a durable lease/session database still exists.
+- If Linear shows a non-terminal state but no local lease exists, the issue may become eligible again after reconciliation or may be redispatched through the retained recovered workspace.

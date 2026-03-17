@@ -1,70 +1,44 @@
-//! Thin local persistence for active Maestro execution state.
+//! Thin in-memory runtime state for active Maestro execution.
 
 use std::{
-	fs,
+	cmp::Ordering,
+	collections::HashMap,
 	path::{Path, PathBuf},
-	time::Duration,
+	sync::{Mutex, MutexGuard},
 };
 
-use rusqlite::{self, Connection, OptionalExtension, Row};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
+use crate::prelude::{Result, eyre};
 
-/// Local state store for leases, attempts, workspaces, and protocol events.
+/// Local runtime store for leases, attempts, workspaces, and protocol events.
+#[derive(Default)]
 pub struct StateStore {
-	connection: Connection,
+	inner: Mutex<StateData>,
 }
 impl StateStore {
-	/// Open or create a SQLite-backed state store on disk.
-	pub fn open(path: impl AsRef<Path>) -> crate::prelude::Result<Self> {
-		let path = path.as_ref();
-
-		if let Some(parent) = path.parent() {
-			fs::create_dir_all(parent)?;
-		}
-
-		let connection = Connection::open(path)?;
-
-		connection.busy_timeout(Duration::from_secs(5))?;
-
-		let store = Self { connection };
-
-		store.initialize()?;
-
-		Ok(store)
+	/// Open a process-local runtime store.
+	pub fn open(_path: impl AsRef<Path>) -> Result<Self> {
+		Ok(Self::default())
 	}
 
-	/// Open an in-memory state store for tests and probes.
-	pub fn open_in_memory() -> crate::prelude::Result<Self> {
-		let connection = Connection::open_in_memory()?;
-
-		connection.busy_timeout(Duration::from_secs(5))?;
-
-		let store = Self { connection };
-
-		store.initialize()?;
-
-		Ok(store)
+	/// Open an in-memory runtime store for tests and probes.
+	pub fn open_in_memory() -> Result<Self> {
+		Ok(Self::default())
 	}
 
 	/// Create or replace the active lease for one issue.
-	pub fn upsert_lease(
-		&self,
-		project_id: &str,
-		issue_id: &str,
-		run_id: &str,
-	) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"
-			INSERT INTO issue_leases (project_id, issue_id, run_id)
-			VALUES (?1, ?2, ?3)
-			ON CONFLICT(issue_id) DO UPDATE SET
-				project_id = excluded.project_id,
-				run_id = excluded.run_id,
-				acquired_at = CURRENT_TIMESTAMP
-			",
-			rusqlite::params![project_id, issue_id, run_id],
-		)?;
+	pub fn upsert_lease(&self, project_id: &str, issue_id: &str, run_id: &str) -> Result<()> {
+		let mut state = self.lock()?;
+
+		state.leases.insert(
+			issue_id.to_owned(),
+			IssueLease {
+				project_id: project_id.to_owned(),
+				issue_id: issue_id.to_owned(),
+				run_id: run_id.to_owned(),
+			},
+		);
 
 		Ok(())
 	}
@@ -75,70 +49,56 @@ impl StateStore {
 		project_id: &str,
 		issue_id: &str,
 		run_id: &str,
-	) -> crate::prelude::Result<bool> {
-		let updated = self.connection.execute(
-			"
-			INSERT INTO issue_leases (project_id, issue_id, run_id)
-			SELECT ?1, ?2, ?3
-			WHERE NOT EXISTS (
-				SELECT 1
-				FROM issue_leases
-				WHERE project_id = ?1
-			)
-			AND NOT EXISTS (
-				SELECT 1
-				FROM issue_leases
-				WHERE issue_id = ?2
-			)
-			",
-			rusqlite::params![project_id, issue_id, run_id],
-		)?;
+	) -> Result<bool> {
+		let mut state = self.lock()?;
 
-		Ok(updated == 1)
+		if state
+			.leases
+			.values()
+			.any(|lease| lease.project_id == project_id || lease.issue_id == issue_id)
+		{
+			return Ok(false);
+		}
+
+		state.leases.insert(
+			issue_id.to_owned(),
+			IssueLease {
+				project_id: project_id.to_owned(),
+				issue_id: issue_id.to_owned(),
+				run_id: run_id.to_owned(),
+			},
+		);
+
+		Ok(true)
 	}
 
 	/// Read the active lease for one issue.
-	pub fn lease_for_issue(&self, issue_id: &str) -> crate::prelude::Result<Option<IssueLease>> {
-		let lease = self
-			.connection
-			.query_row(
-				"SELECT project_id, issue_id, run_id FROM issue_leases WHERE issue_id = ?1",
-				rusqlite::params![issue_id],
-				|row| {
-					Ok(IssueLease {
-						project_id: row.get(0)?,
-						issue_id: row.get(1)?,
-						run_id: row.get(2)?,
-					})
-				},
-			)
-			.optional()?;
+	pub fn lease_for_issue(&self, issue_id: &str) -> Result<Option<IssueLease>> {
+		let state = self.lock()?;
 
-		Ok(lease)
+		Ok(state.leases.get(issue_id).cloned())
 	}
 
 	/// List all active leases.
-	pub fn list_leases(&self, project_id: &str) -> crate::prelude::Result<Vec<IssueLease>> {
-		let mut statement = self.connection.prepare(
-			"
-			SELECT project_id, issue_id, run_id
-			FROM issue_leases
-			WHERE project_id = ?1
-			ORDER BY issue_id
-			",
-		)?;
-		let rows = statement.query_map(rusqlite::params![project_id], |row| {
-			Ok(IssueLease { project_id: row.get(0)?, issue_id: row.get(1)?, run_id: row.get(2)? })
-		})?;
-		let leases = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+	pub fn list_leases(&self, project_id: &str) -> Result<Vec<IssueLease>> {
+		let state = self.lock()?;
+		let mut leases = state
+			.leases
+			.values()
+			.filter(|lease| lease.project_id == project_id)
+			.cloned()
+			.collect::<Vec<_>>();
+
+		leases.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
 
 		Ok(leases)
 	}
 
 	/// Remove the active lease for one issue.
-	pub fn clear_lease(&self, issue_id: &str) -> crate::prelude::Result<()> {
-		self.connection
-			.execute("DELETE FROM issue_leases WHERE issue_id = ?1", rusqlite::params![issue_id])?;
+	pub fn clear_lease(&self, issue_id: &str) -> Result<()> {
+		let mut state = self.lock()?;
+
+		state.leases.remove(issue_id);
 
 		Ok(())
 	}
@@ -150,108 +110,103 @@ impl StateStore {
 		issue_id: &str,
 		attempt_number: i64,
 		status: &str,
-	) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"
-			INSERT INTO run_attempts (run_id, issue_id, attempt_number, status)
-			VALUES (?1, ?2, ?3, ?4)
-			ON CONFLICT(run_id) DO UPDATE SET
-				issue_id = excluded.issue_id,
-				attempt_number = excluded.attempt_number,
-				status = excluded.status,
-				updated_at = CURRENT_TIMESTAMP
-			",
-			rusqlite::params![run_id, issue_id, attempt_number, status],
-		)?;
+	) -> Result<()> {
+		let now = timestamp_parts();
+		let mut state = self.lock()?;
+
+		match state.run_attempts.get_mut(run_id) {
+			Some(existing) => {
+				existing.issue_id = issue_id.to_owned();
+				existing.attempt_number = attempt_number;
+				existing.status = status.to_owned();
+				existing.updated_at = now.text.clone();
+				existing.updated_at_unix = now.unix;
+			},
+			None => {
+				state.run_attempts.insert(
+					run_id.to_owned(),
+					RunAttemptRecord {
+						run_id: run_id.to_owned(),
+						issue_id: issue_id.to_owned(),
+						attempt_number,
+						status: status.to_owned(),
+						thread_id: None,
+						updated_at: now.text,
+						updated_at_unix: now.unix,
+					},
+				);
+			},
+		}
 
 		Ok(())
 	}
 
 	/// Compute the next attempt number for one issue.
-	pub fn next_attempt_number(&self, issue_id: &str) -> crate::prelude::Result<i64> {
-		let next_attempt = self.connection.query_row(
-			"
-			SELECT COALESCE(MAX(attempt_number), 0) + 1
-			FROM run_attempts
-			WHERE issue_id = ?1
-			",
-			rusqlite::params![issue_id],
-			|row| row.get(0),
-		)?;
+	pub fn next_attempt_number(&self, issue_id: &str) -> Result<i64> {
+		let state = self.lock()?;
+		let next_attempt = state
+			.run_attempts
+			.values()
+			.filter(|attempt| attempt.issue_id == issue_id)
+			.map(|attempt| attempt.attempt_number)
+			.max()
+			.unwrap_or(0)
+			+ 1;
 
 		Ok(next_attempt)
 	}
 
 	/// Count attempts that consume the retry budget for one issue.
-	pub fn retry_budget_attempt_count(&self, issue_id: &str) -> crate::prelude::Result<i64> {
-		let retry_budget_attempts = self.connection.query_row(
-			"
-			SELECT COUNT(*)
-			FROM run_attempts
-			WHERE issue_id = ?1
-				AND status IN ('failed', 'interrupted', 'terminal_guarded')
-			",
-			rusqlite::params![issue_id],
-			|row| row.get(0),
-		)?;
+	pub fn retry_budget_attempt_count(&self, issue_id: &str) -> Result<i64> {
+		let state = self.lock()?;
+		let retry_budget_attempts = state
+			.run_attempts
+			.values()
+			.filter(|attempt| {
+				attempt.issue_id == issue_id
+					&& matches!(
+						attempt.status.as_str(),
+						"failed" | "interrupted" | "terminal_guarded"
+					)
+			})
+			.count() as i64;
 
 		Ok(retry_budget_attempts)
 	}
 
 	/// Attach the active thread identifier to a run attempt.
-	pub fn update_run_thread(&self, run_id: &str, thread_id: &str) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"
-			UPDATE run_attempts
-			SET thread_id = ?2,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE run_id = ?1
-			",
-			rusqlite::params![run_id, thread_id],
-		)?;
+	pub fn update_run_thread(&self, run_id: &str, thread_id: &str) -> Result<()> {
+		let now = timestamp_parts();
+		let mut state = self.lock()?;
+
+		if let Some(attempt) = state.run_attempts.get_mut(run_id) {
+			attempt.thread_id = Some(thread_id.to_owned());
+			attempt.updated_at = now.text;
+			attempt.updated_at_unix = now.unix;
+		}
 
 		Ok(())
 	}
 
 	/// Update the status for one run attempt.
-	pub fn update_run_status(&self, run_id: &str, status: &str) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"
-			UPDATE run_attempts
-			SET status = ?2,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE run_id = ?1
-			",
-			rusqlite::params![run_id, status],
-		)?;
+	pub fn update_run_status(&self, run_id: &str, status: &str) -> Result<()> {
+		let now = timestamp_parts();
+		let mut state = self.lock()?;
+
+		if let Some(attempt) = state.run_attempts.get_mut(run_id) {
+			attempt.status = status.to_owned();
+			attempt.updated_at = now.text;
+			attempt.updated_at_unix = now.unix;
+		}
 
 		Ok(())
 	}
 
 	/// Read one run attempt.
-	pub fn run_attempt(&self, run_id: &str) -> crate::prelude::Result<Option<RunAttempt>> {
-		let attempt = self
-			.connection
-			.query_row(
-				"
-				SELECT run_id, issue_id, attempt_number, status, thread_id
-				FROM run_attempts
-				WHERE run_id = ?1
-				",
-				rusqlite::params![run_id],
-				|row| {
-					Ok(RunAttempt {
-						run_id: row.get(0)?,
-						issue_id: row.get(1)?,
-						attempt_number: row.get(2)?,
-						status: row.get(3)?,
-						thread_id: row.get(4)?,
-					})
-				},
-			)
-			.optional()?;
+	pub fn run_attempt(&self, run_id: &str) -> Result<Option<RunAttempt>> {
+		let state = self.lock()?;
 
-		Ok(attempt)
+		Ok(state.run_attempts.get(run_id).map(RunAttemptRecord::as_public))
 	}
 
 	/// Read one run attempt by issue and attempt number.
@@ -259,61 +214,29 @@ impl StateStore {
 		&self,
 		issue_id: &str,
 		attempt_number: i64,
-	) -> crate::prelude::Result<Option<RunAttempt>> {
-		let attempt = self
-			.connection
-			.query_row(
-				"
-				SELECT run_id, issue_id, attempt_number, status, thread_id
-				FROM run_attempts
-				WHERE issue_id = ?1
-					AND attempt_number = ?2
-				ORDER BY updated_at DESC, run_id DESC
-				LIMIT 1
-				",
-				rusqlite::params![issue_id, attempt_number],
-				|row| {
-					Ok(RunAttempt {
-						run_id: row.get(0)?,
-						issue_id: row.get(1)?,
-						attempt_number: row.get(2)?,
-						status: row.get(3)?,
-						thread_id: row.get(4)?,
-					})
-				},
-			)
-			.optional()?;
+	) -> Result<Option<RunAttempt>> {
+		let state = self.lock()?;
+		let attempt = state
+			.run_attempts
+			.values()
+			.filter(|attempt| {
+				attempt.issue_id == issue_id && attempt.attempt_number == attempt_number
+			})
+			.max_by(|left, right| compare_attempt_records(left, right))
+			.map(RunAttemptRecord::as_public);
 
 		Ok(attempt)
 	}
 
 	/// Read the latest run attempt for one issue.
-	pub fn latest_run_attempt_for_issue(
-		&self,
-		issue_id: &str,
-	) -> crate::prelude::Result<Option<RunAttempt>> {
-		let attempt = self
-			.connection
-			.query_row(
-				"
-				SELECT run_id, issue_id, attempt_number, status, thread_id
-				FROM run_attempts
-				WHERE issue_id = ?1
-				ORDER BY attempt_number DESC
-				LIMIT 1
-				",
-				rusqlite::params![issue_id],
-				|row| {
-					Ok(RunAttempt {
-						run_id: row.get(0)?,
-						issue_id: row.get(1)?,
-						attempt_number: row.get(2)?,
-						status: row.get(3)?,
-						thread_id: row.get(4)?,
-					})
-				},
-			)
-			.optional()?;
+	pub fn latest_run_attempt_for_issue(&self, issue_id: &str) -> Result<Option<RunAttempt>> {
+		let state = self.lock()?;
+		let attempt = state
+			.run_attempts
+			.values()
+			.filter(|attempt| attempt.issue_id == issue_id)
+			.max_by(|left, right| compare_attempt_records(left, right))
+			.map(RunAttemptRecord::as_public);
 
 		Ok(attempt)
 	}
@@ -323,52 +246,34 @@ impl StateStore {
 		&self,
 		project_id: &str,
 		limit: usize,
-	) -> crate::prelude::Result<Vec<ProjectRunStatus>> {
-		let mut statement = self.connection.prepare(&format!(
-			"
-			{}
-			WHERE m.project_id = ?1
-				OR EXISTS(
-					SELECT 1
-					FROM issue_leases l
-					WHERE l.project_id = ?1
-						AND l.issue_id = r.issue_id
-						AND l.run_id = r.run_id
-				)
-			ORDER BY active_lease DESC, r.updated_at DESC, r.attempt_number DESC, r.run_id DESC
-			LIMIT ?2
-			",
-			project_run_status_select_sql()
-		))?;
-		let rows = statement
-			.query_map(rusqlite::params![project_id, limit as i64], map_project_run_status_row)?;
-		let runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+	) -> Result<Vec<ProjectRunStatus>> {
+		let state = self.lock()?;
+		let mut runs = state
+			.run_attempts
+			.values()
+			.filter_map(|attempt| state.project_run_status(project_id, attempt))
+			.collect::<Vec<_>>();
+
+		runs.sort_by(compare_project_run_status);
+		runs.truncate(limit);
 
 		Ok(runs)
 	}
 
 	/// List all active leased runs for one project without applying the recent-run limit.
-	pub fn list_active_runs(
-		&self,
-		project_id: &str,
-	) -> crate::prelude::Result<Vec<ProjectRunStatus>> {
-		let mut statement = self.connection.prepare(&format!(
-			"
-			{}
-			WHERE EXISTS(
-				SELECT 1
-				FROM issue_leases l
-				WHERE l.project_id = ?1
-					AND l.issue_id = r.issue_id
-					AND l.run_id = r.run_id
-			)
-			ORDER BY r.updated_at DESC, r.attempt_number DESC, r.run_id DESC
-			",
-			project_run_status_select_sql()
-		))?;
-		let rows =
-			statement.query_map(rusqlite::params![project_id], map_project_run_status_row)?;
-		let runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+	pub fn list_active_runs(&self, project_id: &str) -> Result<Vec<ProjectRunStatus>> {
+		let state = self.lock()?;
+		let mut runs = state
+			.run_attempts
+			.values()
+			.filter_map(|attempt| {
+				let status = state.project_run_status(project_id, attempt)?;
+
+				status.active_lease.then_some(status)
+			})
+			.collect::<Vec<_>>();
+
+		runs.sort_by(compare_project_run_status);
 
 		Ok(runs)
 	}
@@ -379,71 +284,62 @@ impl StateStore {
 		run_id: &str,
 		sequence_number: i64,
 		event_type: &str,
-		payload: &str,
-	) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"
-			INSERT INTO event_journal (run_id, sequence_number, event_type, payload)
-			VALUES (?1, ?2, ?3, ?4)
-			",
-			rusqlite::params![run_id, sequence_number, event_type, payload],
-		)?;
+		_payload: &str,
+	) -> Result<()> {
+		let mut state = self.lock()?;
+		let events = state.events.entry(run_id.to_owned()).or_default();
+
+		if events.iter().any(|event| event.sequence_number == sequence_number) {
+			eyre::bail!(
+				"Protocol event `{run_id}` sequence `{sequence_number}` already exists in the in-memory journal."
+			);
+		}
+
+		let now = timestamp_parts();
+
+		events.push(ProtocolEventRecord {
+			sequence_number,
+			event_type: event_type.to_owned(),
+			created_at: now.text,
+			created_at_unix: now.unix,
+		});
+		events.sort_by(|left, right| left.sequence_number.cmp(&right.sequence_number));
 
 		Ok(())
 	}
 
 	/// Count protocol journal records for one run.
-	pub fn event_count(&self, run_id: &str) -> crate::prelude::Result<i64> {
-		let count = self.connection.query_row(
-			"SELECT COUNT(*) FROM event_journal WHERE run_id = ?1",
-			rusqlite::params![run_id],
-			|row| row.get(0),
-		)?;
+	pub fn event_count(&self, run_id: &str) -> Result<i64> {
+		let state = self.lock()?;
 
-		Ok(count)
+		Ok(state.events.get(run_id).map_or(0, |events| events.len() as i64))
 	}
 
-	/// Read the latest persisted activity timestamp for one run as a Unix epoch.
-	pub fn last_run_activity_unix_epoch(
-		&self,
-		run_id: &str,
-	) -> crate::prelude::Result<Option<i64>> {
-		let latest_activity = self.connection.query_row(
-			"
-			SELECT MAX(ts)
-			FROM (
-				SELECT CAST(strftime('%s', updated_at) AS INTEGER) AS ts
-				FROM run_attempts
-				WHERE run_id = ?1
-				UNION ALL
-				SELECT CAST(strftime('%s', created_at) AS INTEGER) AS ts
-				FROM event_journal
-				WHERE run_id = ?1
-			)
-			",
-			rusqlite::params![run_id],
-			|row| row.get(0),
-		)?;
+	/// Read the latest recorded activity timestamp for one run as a Unix epoch.
+	pub fn last_run_activity_unix_epoch(&self, run_id: &str) -> Result<Option<i64>> {
+		let state = self.lock()?;
+		let last_activity = state.run_attempts.get(run_id).map(|attempt| attempt.updated_at_unix);
+		let last_event = state
+			.events
+			.get(run_id)
+			.and_then(|events| events.iter().map(|event| event.created_at_unix).max());
 
-		Ok(latest_activity)
+		Ok(match (last_activity, last_event) {
+			(Some(run_activity), Some(event_activity)) => Some(run_activity.max(event_activity)),
+			(Some(run_activity), None) => Some(run_activity),
+			(None, Some(event_activity)) => Some(event_activity),
+			(None, None) => None,
+		})
 	}
 
-	/// Read the latest persisted protocol-event timestamp for one run as a Unix epoch.
-	pub fn last_protocol_activity_unix_epoch(
-		&self,
-		run_id: &str,
-	) -> crate::prelude::Result<Option<i64>> {
-		let latest_activity = self.connection.query_row(
-			"
-			SELECT MAX(CAST(strftime('%s', created_at) AS INTEGER))
-			FROM event_journal
-			WHERE run_id = ?1
-			",
-			rusqlite::params![run_id],
-			|row| row.get(0),
-		)?;
+	/// Read the latest recorded protocol-event timestamp for one run as a Unix epoch.
+	pub fn last_protocol_activity_unix_epoch(&self, run_id: &str) -> Result<Option<i64>> {
+		let state = self.lock()?;
 
-		Ok(latest_activity)
+		Ok(state
+			.events
+			.get(run_id)
+			.and_then(|events| events.iter().map(|event| event.created_at_unix).max()))
 	}
 
 	/// Create or replace the workspace mapping for one issue.
@@ -453,91 +349,55 @@ impl StateStore {
 		issue_id: &str,
 		branch_name: &str,
 		workspace_path: &str,
-	) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"
-			INSERT INTO workspace_mappings (project_id, issue_id, branch_name, workspace_path)
-			VALUES (?1, ?2, ?3, ?4)
-			ON CONFLICT(issue_id) DO UPDATE SET
-				project_id = excluded.project_id,
-				branch_name = excluded.branch_name,
-				workspace_path = excluded.workspace_path,
-				updated_at = CURRENT_TIMESTAMP
-			",
-			rusqlite::params![project_id, issue_id, branch_name, workspace_path],
-		)?;
+	) -> Result<()> {
+		let mut state = self.lock()?;
+
+		state.workspaces.insert(
+			issue_id.to_owned(),
+			WorkspaceMappingRecord {
+				project_id: project_id.to_owned(),
+				issue_id: issue_id.to_owned(),
+				branch_name: branch_name.to_owned(),
+				workspace_path: PathBuf::from(workspace_path),
+			},
+		);
 
 		Ok(())
 	}
 
 	/// Read the workspace mapping for one issue.
-	pub fn workspace_for_issue(
-		&self,
-		issue_id: &str,
-	) -> crate::prelude::Result<Option<WorkspaceMapping>> {
-		let mapping = self
-			.connection
-			.query_row(
-				"
-				SELECT project_id, issue_id, branch_name, workspace_path
-				FROM workspace_mappings
-				WHERE issue_id = ?1
-				",
-				rusqlite::params![issue_id],
-				|row| {
-					Ok(WorkspaceMapping {
-						project_id: row.get(0)?,
-						issue_id: row.get(1)?,
-						branch_name: row.get(2)?,
-						workspace_path: PathBuf::from(row.get::<_, String>(3)?),
-					})
-				},
-			)
-			.optional()?;
+	pub fn workspace_for_issue(&self, issue_id: &str) -> Result<Option<WorkspaceMapping>> {
+		let state = self.lock()?;
 
-		Ok(mapping)
+		Ok(state.workspaces.get(issue_id).map(WorkspaceMappingRecord::as_public))
 	}
 
 	/// List all known workspace mappings.
-	pub fn list_workspaces(
-		&self,
-		project_id: &str,
-	) -> crate::prelude::Result<Vec<WorkspaceMapping>> {
-		let mut statement = self.connection.prepare(
-			"
-			SELECT project_id, issue_id, branch_name, workspace_path
-			FROM workspace_mappings
-			WHERE project_id = ?1
-			ORDER BY issue_id
-			",
-		)?;
-		let rows = statement.query_map(rusqlite::params![project_id], |row| {
-			Ok(WorkspaceMapping {
-				project_id: row.get(0)?,
-				issue_id: row.get(1)?,
-				branch_name: row.get(2)?,
-				workspace_path: PathBuf::from(row.get::<_, String>(3)?),
-			})
-		})?;
-		let mappings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+	pub fn list_workspaces(&self, project_id: &str) -> Result<Vec<WorkspaceMapping>> {
+		let state = self.lock()?;
+		let mut mappings = state
+			.workspaces
+			.values()
+			.filter(|mapping| mapping.project_id == project_id)
+			.map(WorkspaceMappingRecord::as_public)
+			.collect::<Vec<_>>();
+
+		mappings.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
 
 		Ok(mappings)
 	}
 
 	/// Remove the workspace mapping for one issue.
-	pub fn clear_workspace(&self, issue_id: &str) -> crate::prelude::Result<()> {
-		self.connection.execute(
-			"DELETE FROM workspace_mappings WHERE issue_id = ?1",
-			rusqlite::params![issue_id],
-		)?;
+	pub fn clear_workspace(&self, issue_id: &str) -> Result<()> {
+		let mut state = self.lock()?;
+
+		state.workspaces.remove(issue_id);
 
 		Ok(())
 	}
 
-	fn initialize(&self) -> crate::prelude::Result<()> {
-		self.connection.execute_batch(INIT_SQL)?;
-
-		Ok(())
+	fn lock(&self) -> Result<MutexGuard<'_, StateData>> {
+		self.inner.lock().map_err(|_| eyre::eyre!("StateStore mutex is poisoned."))
 	}
 }
 
@@ -663,17 +523,17 @@ impl ProjectRunStatus {
 		self.active_lease
 	}
 
-	/// Number of persisted protocol events for the run.
+	/// Number of recorded protocol events for the run.
 	pub fn event_count(&self) -> i64 {
 		self.event_count
 	}
 
-	/// Latest persisted protocol event type, when one exists.
+	/// Latest recorded protocol event type, when one exists.
 	pub fn last_event_type(&self) -> Option<&str> {
 		self.last_event_type.as_deref()
 	}
 
-	/// Timestamp of the latest persisted protocol event, when one exists.
+	/// Timestamp of the latest recorded protocol event, when one exists.
 	pub fn last_event_at(&self) -> Option<&str> {
 		self.last_event_at.as_deref()
 	}
@@ -709,65 +569,139 @@ impl WorkspaceMapping {
 	}
 }
 
-fn project_run_status_select_sql() -> &'static str {
-	"
-	SELECT
-		r.run_id,
-		r.issue_id,
-		r.attempt_number,
-		r.status,
-		r.thread_id,
-		r.updated_at,
-		m.branch_name,
-		m.workspace_path,
-		EXISTS(
-			SELECT 1
-			FROM issue_leases l
-			WHERE l.project_id = ?1
-				AND l.issue_id = r.issue_id
-				AND l.run_id = r.run_id
-		) AS active_lease,
-		(
-			SELECT COUNT(*)
-			FROM event_journal e
-			WHERE e.run_id = r.run_id
-		) AS event_count,
-		(
-			SELECT e.event_type
-			FROM event_journal e
-			WHERE e.run_id = r.run_id
-			ORDER BY e.sequence_number DESC
-			LIMIT 1
-		) AS last_event_type,
-		(
-			SELECT e.created_at
-			FROM event_journal e
-			WHERE e.run_id = r.run_id
-			ORDER BY e.sequence_number DESC
-			LIMIT 1
-		) AS last_event_at
-	FROM run_attempts r
-	LEFT JOIN workspace_mappings m
-		ON m.issue_id = r.issue_id
-		AND m.project_id = ?1
-	"
+#[derive(Default)]
+struct StateData {
+	leases: HashMap<String, IssueLease>,
+	run_attempts: HashMap<String, RunAttemptRecord>,
+	events: HashMap<String, Vec<ProtocolEventRecord>>,
+	workspaces: HashMap<String, WorkspaceMappingRecord>,
+}
+impl StateData {
+	fn project_run_status(
+		&self,
+		project_id: &str,
+		attempt: &RunAttemptRecord,
+	) -> Option<ProjectRunStatus> {
+		let workspace = self.workspaces.get(&attempt.issue_id);
+		let active_lease = self
+			.leases
+			.get(&attempt.issue_id)
+			.is_some_and(|lease| lease.project_id == project_id && lease.run_id == attempt.run_id);
+		let in_project =
+			workspace.is_some_and(|mapping| mapping.project_id == project_id) || active_lease;
+
+		if !in_project {
+			return None;
+		}
+
+		let (event_count, last_event_type, last_event_at) = match self.events.get(&attempt.run_id) {
+			Some(events) => {
+				let last = events
+					.iter()
+					.max_by(|left, right| left.sequence_number.cmp(&right.sequence_number));
+
+				(
+					events.len() as i64,
+					last.map(|event| event.event_type.clone()),
+					last.map(|event| event.created_at.clone()),
+				)
+			},
+			None => (0, None, None),
+		};
+
+		Some(ProjectRunStatus {
+			run_id: attempt.run_id.clone(),
+			issue_id: attempt.issue_id.clone(),
+			attempt_number: attempt.attempt_number,
+			status: attempt.status.clone(),
+			thread_id: attempt.thread_id.clone(),
+			updated_at: attempt.updated_at.clone(),
+			branch_name: workspace.map(|mapping| mapping.branch_name.clone()),
+			workspace_path: workspace.map(|mapping| mapping.workspace_path.clone()),
+			active_lease,
+			event_count,
+			last_event_type,
+			last_event_at,
+		})
+	}
 }
 
-fn map_project_run_status_row(row: &Row<'_>) -> rusqlite::Result<ProjectRunStatus> {
-	Ok(ProjectRunStatus {
-		run_id: row.get(0)?,
-		issue_id: row.get(1)?,
-		attempt_number: row.get(2)?,
-		status: row.get(3)?,
-		thread_id: row.get(4)?,
-		updated_at: row.get(5)?,
-		branch_name: row.get(6)?,
-		workspace_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
-		active_lease: row.get::<_, i64>(8)? != 0,
-		event_count: row.get(9)?,
-		last_event_type: row.get(10)?,
-		last_event_at: row.get(11)?,
-	})
+struct TimestampParts {
+	text: String,
+	unix: i64,
+}
+
+#[derive(Clone, Debug)]
+struct RunAttemptRecord {
+	run_id: String,
+	issue_id: String,
+	attempt_number: i64,
+	status: String,
+	thread_id: Option<String>,
+	updated_at: String,
+	updated_at_unix: i64,
+}
+impl RunAttemptRecord {
+	fn as_public(&self) -> RunAttempt {
+		RunAttempt {
+			run_id: self.run_id.clone(),
+			issue_id: self.issue_id.clone(),
+			attempt_number: self.attempt_number,
+			status: self.status.clone(),
+			thread_id: self.thread_id.clone(),
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+struct ProtocolEventRecord {
+	sequence_number: i64,
+	event_type: String,
+	created_at: String,
+	created_at_unix: i64,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceMappingRecord {
+	project_id: String,
+	issue_id: String,
+	branch_name: String,
+	workspace_path: PathBuf,
+}
+impl WorkspaceMappingRecord {
+	fn as_public(&self) -> WorkspaceMapping {
+		WorkspaceMapping {
+			project_id: self.project_id.clone(),
+			issue_id: self.issue_id.clone(),
+			branch_name: self.branch_name.clone(),
+			workspace_path: self.workspace_path.clone(),
+		}
+	}
+}
+
+fn timestamp_parts() -> TimestampParts {
+	let now = OffsetDateTime::now_utc();
+
+	TimestampParts {
+		text: now.format(&Rfc3339).expect("timestamp formatting should succeed"),
+		unix: now.unix_timestamp(),
+	}
+}
+
+fn compare_attempt_records(left: &RunAttemptRecord, right: &RunAttemptRecord) -> Ordering {
+	left.attempt_number
+		.cmp(&right.attempt_number)
+		.then_with(|| left.updated_at_unix.cmp(&right.updated_at_unix))
+		.then_with(|| left.run_id.cmp(&right.run_id))
+}
+
+fn compare_project_run_status(left: &ProjectRunStatus, right: &ProjectRunStatus) -> Ordering {
+	right
+		.active_lease
+		.cmp(&left.active_lease)
+		.then_with(|| right.updated_at.cmp(&left.updated_at))
+		.then_with(|| right.attempt_number.cmp(&left.attempt_number))
+		.then_with(|| right.run_id.cmp(&left.run_id))
 }
 
 #[cfg(test)]
@@ -979,67 +913,44 @@ mod tests {
 			.append_event("run-1", 2, "turn/completed", "{\"turn\":\"1\"}")
 			.expect("second event should record");
 
-		let runs = store.list_recent_runs("pubfi", 10).expect("status query should succeed");
+		let runs = store.list_recent_runs("pubfi", 10).expect("recent project runs should load");
 
 		assert_eq!(runs.len(), 2);
 		assert_eq!(runs[0].run_id(), "run-1");
 		assert!(runs[0].active_lease());
-		assert_eq!(runs[0].branch_name(), Some("x/pubfi-pub-101"));
-		assert_eq!(runs[0].workspace_path(), Some(Path::new("/tmp/workspaces/pub-101")));
+		assert_eq!(runs[0].thread_id(), Some("thread-1"));
 		assert_eq!(runs[0].event_count(), 2);
 		assert_eq!(runs[0].last_event_type(), Some("turn/completed"));
-		assert_eq!(runs[0].thread_id(), Some("thread-1"));
+		assert_eq!(runs[0].branch_name(), Some("x/pubfi-pub-101"));
+		assert_eq!(runs[0].workspace_path(), Some(Path::new("/tmp/workspaces/pub-101")));
 		assert_eq!(runs[1].run_id(), "run-2");
 		assert!(!runs[1].active_lease());
-		assert_eq!(runs[1].branch_name(), Some("x/pubfi-pub-102"));
 		assert_eq!(runs[1].event_count(), 0);
-		assert_eq!(runs[1].last_event_type(), None);
 	}
 
 	#[test]
-	fn recent_project_runs_respect_limit() {
-		let store = StateStore::open_in_memory().expect("in-memory state store should open");
-
-		store.record_run_attempt("run-1", "PUB-101", 1, "failed").expect("first run should record");
-		store
-			.record_run_attempt("run-2", "PUB-102", 1, "failed")
-			.expect("second run should record");
-		store
-			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
-			.expect("first workspace should record");
-		store
-			.upsert_workspace("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/workspaces/pub-102")
-			.expect("second workspace should record");
-
-		let runs = store.list_recent_runs("pubfi", 1).expect("status query should succeed");
-
-		assert_eq!(runs.len(), 1);
-	}
-
-	#[test]
-	fn active_project_runs_are_not_capped_by_recent_limit() {
+	fn lists_active_project_runs_only() {
 		let store = StateStore::open_in_memory().expect("in-memory state store should open");
 
 		store
 			.record_run_attempt("run-1", "PUB-101", 1, "running")
-			.expect("first active run should record");
+			.expect("first run should record");
 		store
 			.record_run_attempt("run-2", "PUB-102", 1, "running")
-			.expect("second active run should record");
-		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("first lease should record");
-		store.upsert_lease("pubfi", "PUB-102", "run-2").expect("second lease should record");
+			.expect("second run should record");
+		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should record");
+		store.upsert_lease("other", "PUB-102", "run-2").expect("other-project lease should record");
 		store
 			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
 			.expect("first workspace should record");
 		store
-			.upsert_workspace("pubfi", "PUB-102", "x/pubfi-pub-102", "/tmp/workspaces/pub-102")
+			.upsert_workspace("other", "PUB-102", "x/other-pub-102", "/tmp/workspaces/pub-102")
 			.expect("second workspace should record");
 
-		let recent_runs = store.list_recent_runs("pubfi", 1).expect("recent runs should query");
-		let active_runs = store.list_active_runs("pubfi").expect("active runs should query");
+		let runs = store.list_active_runs("pubfi").expect("active project runs should load");
 
-		assert_eq!(recent_runs.len(), 1);
-		assert_eq!(active_runs.len(), 2);
-		assert!(active_runs.iter().all(|run| run.active_lease()));
+		assert_eq!(runs.len(), 1);
+		assert_eq!(runs[0].run_id(), "run-1");
+		assert!(runs[0].active_lease());
 	}
 }

@@ -162,10 +162,12 @@
         "2026-03-16: Fresh seed XY-142 was selected by Maestro, executed in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff; XY-136 is now Done, and the remaining daemon-supervision follow-up is XY-143.",
         "2026-03-16: PR #6 merged XY-142 and PR #7 merged XY-143; both Linear issues are now Done, so the daemon-supervision phase is complete and the next active phase is structural follow-ups.",
         "2026-03-17: PR #8 merged XY-125 onto `main`, so the structural-followups phase advanced from claim/concurrency policy into XY-126 retry queue and backoff work.",
-        "2026-03-17: PR #9 merged XY-126 onto `main`, so the next active structural lane is XY-128 for last-known-good WORKFLOW reload semantics ahead of XY-124.",
-        "2026-03-16: XY-141 still sits in the project as stale imported backlog context, but current `main` already uses clone-backed `.workspaces` lanes and does not require XY-141 as a prerequisite for XY-128."
+      "2026-03-17: PR #9 merged XY-126 onto `main`, so the structural-followups phase advanced from retry/backoff into XY-128 for last-known-good WORKFLOW reload semantics ahead of XY-124.",
+      "2026-03-17: PR #10 merged XY-128 onto `main`, so the next active structural lane is XY-124 for remove-SQLite runtime state and restart recovery.",
+      "2026-03-17: XY-141 remains stale imported backlog context only; current `main` already uses clone-backed `.workspaces` lanes and does not require XY-141 as a prerequisite for XY-124.",
+      "2026-03-17: XY-124 is now implemented on lane x/maestro-xy-124 with local verification complete, so the umbrella program remains in the structural-followups phase but is now waiting on XY-124 delivery."
       ],
-      "last_updated": "2026-03-17T03:20:00Z",
+      "last_updated": "2026-03-17T04:37:54Z",
     "replan_reason": null,
     "context_snapshot": {
       "first_subplan": "docs/plans/2026-03-13_maestro-pr-backed-handoff.md",
@@ -173,8 +175,8 @@
       "active_subplan": "docs/plans/2026-03-13_maestro-structural-runtime-followups.md",
       "blocking_review_pr": null,
       "blocking_followup_issue": null,
-      "next_validation_issue": "XY-128",
-      "active_lane": "x/maestro-xy-128",
+      "next_validation_issue": "XY-124",
+      "active_lane": "x/maestro-xy-124",
       "active_workspace": null,
       "tracker_project": "hackink/Maestro Pilot Ops Hardening",
       "imported_issue_map": {
@@ -185,9 +187,9 @@
         "stalled_run_followup": "XY-139"
       },
       "open_followups": [
-        "XY-141"
+        "XY-138"
       ],
-      "next_structural_issue_after_daemon_closeout": "XY-128"
+      "next_structural_issue_after_daemon_closeout": "XY-124"
     }
   }
 }

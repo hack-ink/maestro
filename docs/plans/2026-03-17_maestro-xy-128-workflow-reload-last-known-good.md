@@ -34,7 +34,7 @@
       {
         "id": "codify-reload-contract",
         "title": "Codify daemon WORKFLOW reload semantics",
-        "status": "in_progress",
+        "status": "done",
         "objective": "Make the reload contract explicit in plans, specs, and operator docs before changing runtime behavior.",
         "inputs": [
           "XY-128 issue scope",
@@ -54,7 +54,7 @@
       {
         "id": "implement-daemon-workflow-cache",
         "title": "Implement daemon-side last-known-good workflow caching",
-        "status": "pending",
+        "status": "done",
         "objective": "Teach daemon mode to reuse the last valid workflow document when same-path reloads fail and to swap in new valid documents on later ticks.",
         "inputs": [
           "Current load_daemon_tick_context flow",
@@ -76,7 +76,7 @@
       {
         "id": "preserve-active-lane-stability",
         "title": "Keep active child lanes stable across workflow edits",
-        "status": "pending",
+        "status": "done",
         "objective": "Ensure an already running child continues under the workflow snapshot it started with while future decisions use the latest valid document.",
         "inputs": [
           "Daemon child lifecycle",
@@ -98,7 +98,7 @@
       {
         "id": "verify-xy-128-delivery",
         "title": "Verify XY-128 end-to-end and prepare delivery",
-        "status": "pending",
+        "status": "done",
         "objective": "Finish the lane with repo-native verification, self-review, and delivery-ready evidence.",
         "inputs": [
           "Updated daemon reload behavior",
@@ -128,24 +128,25 @@
     }
   },
   "state": {
-    "phase": "executing",
-    "current_task_id": "codify-reload-contract",
-    "next_task_id": "codify-reload-contract",
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
     "blockers": [],
     "evidence": [
       "2026-03-17: XY-128 is the next structural runtime issue after XY-126 merged and closed.",
       "2026-03-17: Daemon mode currently reloads ServiceConfig and WORKFLOW.md on each tick through load_daemon_tick_context, but an invalid WORKFLOW.md parse aborts that tick instead of keeping the last known good workflow active.",
       "2026-03-17: run --once already reads WORKFLOW.md per invocation, so the missing behavior is daemon-side last-known-good fallback rather than one-shot workflow freshness.",
       "2026-03-17: Active-child reconciliation currently consumes the current tick workflow context, so mid-run repo-policy edits can affect an already running lane unless the child carries its own workflow snapshot.",
-      "2026-03-17: XY-128 acceptance requires future daemon decisions to pick up valid repo-owned workflow changes without restart while invalid reloads keep the last known good workflow active and in-flight runs remain stable."
+      "2026-03-17: XY-128 acceptance requires future daemon decisions to pick up valid repo-owned workflow changes without restart while invalid reloads keep the last known good workflow active and in-flight runs remain stable.",
+      "2026-03-17: PR #10 merged onto `main` at e3f83639f7d1448a675ae4a33388f16ee24c76ff and Linear issue XY-128 is now Done, so the next structural lane is XY-124."
     ],
-    "last_updated": "2026-03-17T03:20:00Z",
+    "last_updated": "2026-03-17T04:06:14Z",
     "replan_reason": null,
     "context_snapshot": {
       "active_structural_issue": "XY-128",
       "previous_structural_issue": "XY-126",
-      "current_reload_gap": "Daemon ticks drop the cycle on invalid WORKFLOW.md reloads and do not preserve a child-specific workflow snapshot for active-lane stability.",
-      "active_lane": "x/maestro-xy-128"
+      "current_reload_gap": "XY-128 is merged and closed; the next structural runtime gap is XY-124 remove-SQLite durability plus restart recovery without a local database.",
+      "active_lane": null
     }
   }
 }
