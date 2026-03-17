@@ -25,7 +25,7 @@ use crate::{
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
-	state::{self, ProjectRunStatus, RunAttempt, StateStore, WorkspaceMapping},
+	state::{self, ProjectRunStatus, RunActivityMarker, RunAttempt, StateStore, WorkspaceMapping},
 	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
 	workflow::WorkflowDocument,
 	workspace::{WorkspaceManager, WorkspaceSpec},
@@ -748,7 +748,7 @@ where
 				&summary.workspace_path.display().to_string(),
 			)?;
 
-			let child = spawn_run_once_child(
+			let mut child = spawn_run_once_child(
 				config_path,
 				summary.issue_id.as_str(),
 				summary.dispatch_mode,
@@ -761,6 +761,20 @@ where
 				let _ = state_store.update_run_status(&summary.run_id, "failed");
 				let _ = state_store.clear_lease(&summary.issue_id);
 			})?;
+
+			if let Err(error) = state::write_run_activity_marker_for_process(
+				&summary.workspace_path,
+				&summary.run_id,
+				summary.attempt_number,
+				child.id(),
+			) {
+				let _ = child.kill();
+				let _ = child.wait();
+				let _ = state_store.update_run_status(&summary.run_id, "failed");
+				let _ = state_store.clear_lease(&summary.issue_id);
+
+				return Err(error);
+			}
 
 			state_store.update_run_status(&summary.run_id, "running")?;
 
@@ -1230,6 +1244,20 @@ where
 					"interrupted",
 				)?;
 
+				let workspace_path = action.workspace_mapping.as_ref().map_or_else(
+					|| workspace_manager.plan_for_issue(&action.issue.identifier).path,
+					|mapping| mapping.workspace_path().to_path_buf(),
+				);
+
+				if workspace_path.exists() {
+					write_retry_budget_marker(
+						&workspace_path,
+						action.run_attempt.run_id(),
+						action.run_attempt.attempt_number(),
+						state_store.retry_budget_attempt_count(&action.issue.id)?,
+					)?;
+				}
+
 				state_store.clear_lease(&action.issue.id)?;
 			},
 			ActiveRunDisposition::Stalled { idle_for } => {
@@ -1583,6 +1611,7 @@ fn prepare_issue_run<T>(
 where
 	T: IssueTracker,
 {
+	let planned_workspace = context.workspace_manager.plan_for_issue(&issue.identifier);
 	let next_attempt_number = context.state_store.next_attempt_number(&issue.id)?;
 	let (attempt_number, run_id) = match context.preferred_run_identity {
 		Some(preferred_run_identity) => {
@@ -1594,9 +1623,14 @@ where
 		},
 		None => (next_attempt_number, build_run_id(&issue.identifier, next_attempt_number)?),
 	};
-	let retry_budget_base = context
-		.preferred_retry_budget_base
-		.unwrap_or(context.state_store.retry_budget_attempt_count(&issue.id)?);
+	let persisted_retry_budget_attempts =
+		state::read_run_retry_budget_attempt_count(&planned_workspace.path)?.unwrap_or(0);
+	let retry_budget_base = context.preferred_retry_budget_base.unwrap_or(
+		context
+			.state_store
+			.retry_budget_attempt_count(&issue.id)?
+			.max(persisted_retry_budget_attempts),
+	);
 	let lease_issue_id = issue.id.clone();
 
 	if !context.dry_run
@@ -2013,6 +2047,13 @@ where
 			),
 		)?;
 
+		write_retry_budget_marker(
+			&issue_run.workspace.path,
+			&issue_run.run_id,
+			issue_run.attempt_number,
+			retry_budget_attempts,
+		)?;
+
 		return Ok(());
 	}
 
@@ -2034,6 +2075,13 @@ where
 
 		state_store.update_run_status(&issue_run.run_id, TERMINAL_GUARDED_RUN_STATUS)?;
 	}
+
+	write_retry_budget_marker(
+		&issue_run.workspace.path,
+		&issue_run.run_id,
+		issue_run.attempt_number,
+		retry_budget_attempts,
+	)?;
 
 	tracing::warn!(
 		project_id = project.id(),
@@ -2241,6 +2289,20 @@ fn write_terminal_guard_marker(
 	fs::write(marker_path, marker_body)?;
 
 	Ok(())
+}
+
+fn write_retry_budget_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	retry_budget_attempt_count: i64,
+) -> crate::prelude::Result<()> {
+	state::write_run_retry_budget_attempt_count(
+		workspace_path,
+		run_id,
+		attempt_number,
+		retry_budget_attempt_count,
+	)
 }
 
 fn clear_terminal_guard_marker(workspace_path: &Path) -> crate::prelude::Result<()> {
@@ -2502,6 +2564,7 @@ where
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 	let project_slug = project.tracker().project_slug();
 	let issues = tracker.list_project_issues(project_slug)?;
+	let now_unix_epoch = OffsetDateTime::now_utc().unix_timestamp();
 	let mut active_issues = Vec::new();
 
 	for issue in issues {
@@ -2519,6 +2582,20 @@ where
 		)?;
 
 		if issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)? {
+			if let Some(marker) = state::read_run_activity_marker_snapshot(&workspace.path)?
+				&& workspace_activity_marker_is_fresh(&marker, now_unix_epoch)
+			{
+				state_store.record_run_attempt(
+					marker.run_id(),
+					&issue.id,
+					marker.attempt_number(),
+					"running",
+				)?;
+				state_store.upsert_lease(project.id(), &issue.id, marker.run_id())?;
+
+				continue;
+			}
+
 			active_issues.push(issue);
 		}
 	}
@@ -2526,6 +2603,29 @@ where
 	active_issues.sort_by(compare_issue_candidates);
 
 	Ok(RecoveredRuntimeState { active_issues })
+}
+
+fn workspace_activity_marker_is_fresh(marker: &RunActivityMarker, now_unix_epoch: i64) -> bool {
+	marker.process_id().is_some_and(process_is_alive)
+		&& marker
+			.last_activity_unix_epoch()
+			.and_then(|last_activity| observed_idle_duration(last_activity, now_unix_epoch))
+			.is_some_and(|idle_for| idle_for < ACTIVE_RUN_IDLE_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn process_is_alive(process_id: u32) -> bool {
+	Command::new("kill")
+		.args(["-0", &process_id.to_string()])
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+		.is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_process_id: u32) -> bool {
+	false
 }
 
 fn hydrate_status_snapshot_state(
@@ -4626,6 +4726,46 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn prepare_issue_run_uses_persisted_retry_budget_marker_after_restart() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+
+		state::write_run_retry_budget_attempt_count(&workspace.path, "older-run", 4, 2)
+			.expect("retry budget marker should write");
+
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				lease_preacquired: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_run_identity: None,
+				preferred_retry_budget_base: None,
+			},
+			issue,
+		)
+		.expect("issue preparation should succeed")
+		.expect("startable issue should prepare");
+
+		assert_eq!(
+			issue_run.retry_budget_base, 2,
+			"restart recovery should preserve retry budget from the retained workspace marker"
+		);
+	}
+
+	#[test]
 	fn prepare_issue_run_honors_preferred_identity_when_attempt_is_current() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
@@ -5457,6 +5597,83 @@ read_first = [{read_first}]
 				.expect("workspace lookup should succeed")
 				.is_some(),
 			"workspace mapping should be reconstructed from the retained lane"
+		);
+	}
+
+	#[test]
+	fn run_project_once_skips_recovered_workspace_with_fresh_activity_marker() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("recovered workspace should exist");
+
+		state::write_run_activity_marker(&workspace.path, "run-1", 1)
+			.expect("activity marker should write");
+
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("recovery should succeed");
+
+		assert!(
+			summary.is_none(),
+			"fresh child activity should recover as an active lane instead of redispatching"
+		);
+		assert_eq!(
+			state_store
+				.lease_for_issue(&issue.id)
+				.expect("lease lookup should succeed")
+				.expect("lease should be reconstructed")
+				.run_id(),
+			"run-1"
+		);
+		assert_eq!(
+			state_store
+				.run_attempt("run-1")
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should be reconstructed")
+				.status(),
+			"running"
+		);
+	}
+
+	#[test]
+	fn run_project_once_ignores_fresh_marker_for_exited_process() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("recovered workspace should exist");
+		let exited_process_id = u32::MAX;
+
+		state::write_run_activity_marker_for_process(
+			&workspace.path,
+			"run-1",
+			1,
+			exited_process_id,
+		)
+		.expect("activity marker should write");
+
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("recovery should succeed")
+				.expect("dead process marker should not block retry planning");
+
+		assert_eq!(summary.issue_id, issue.id);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none(),
+			"dead marker recovery should not reconstruct a live lease"
 		);
 	}
 

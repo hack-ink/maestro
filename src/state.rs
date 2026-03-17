@@ -6,6 +6,7 @@ use std::{
 	fs::{self, File, OpenOptions, TryLockError},
 	io::ErrorKind,
 	path::{Path, PathBuf},
+	process,
 	sync::{Mutex, MutexGuard},
 };
 
@@ -616,6 +617,33 @@ impl WorkspaceMapping {
 	}
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunActivityMarker {
+	run_id: String,
+	attempt_number: i64,
+	process_id: Option<u32>,
+	last_activity_unix_epoch: Option<i64>,
+	last_protocol_activity_unix_epoch: Option<i64>,
+	retry_budget_attempt_count: Option<i64>,
+}
+impl RunActivityMarker {
+	pub(crate) fn run_id(&self) -> &str {
+		&self.run_id
+	}
+
+	pub(crate) fn attempt_number(&self) -> i64 {
+		self.attempt_number
+	}
+
+	pub(crate) fn process_id(&self) -> Option<u32> {
+		self.process_id
+	}
+
+	pub(crate) fn last_activity_unix_epoch(&self) -> Option<i64> {
+		self.last_activity_unix_epoch
+	}
+}
+
 struct DispatchSlotGuard {
 	_lock_file: File,
 }
@@ -736,8 +764,10 @@ impl WorkspaceMappingRecord {
 struct RunActivityMarkerRecord {
 	run_id: Option<String>,
 	attempt_number: Option<i64>,
+	process_id: Option<u32>,
 	last_activity_unix_epoch: Option<i64>,
 	last_protocol_activity_unix_epoch: Option<i64>,
+	retry_budget_attempt_count: Option<i64>,
 }
 
 pub(crate) fn write_run_activity_marker(
@@ -745,10 +775,20 @@ pub(crate) fn write_run_activity_marker(
 	run_id: &str,
 	attempt_number: i64,
 ) -> Result<()> {
+	write_run_activity_marker_for_process(workspace_path, run_id, attempt_number, process::id())
+}
+
+pub(crate) fn write_run_activity_marker_for_process(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	process_id: u32,
+) -> Result<()> {
 	write_run_activity_marker_at(
 		workspace_path,
 		run_id,
 		attempt_number,
+		process_id,
 		OffsetDateTime::now_utc().unix_timestamp(),
 		None,
 	)
@@ -761,7 +801,14 @@ pub(crate) fn write_run_protocol_activity_marker(
 ) -> Result<()> {
 	let now = OffsetDateTime::now_utc().unix_timestamp();
 
-	write_run_activity_marker_at(workspace_path, run_id, attempt_number, now, Some(now))
+	write_run_activity_marker_at(
+		workspace_path,
+		run_id,
+		attempt_number,
+		process::id(),
+		now,
+		Some(now),
+	)
 }
 
 pub(crate) fn read_run_activity_marker(
@@ -788,10 +835,65 @@ pub(crate) fn read_run_protocol_activity_marker(
 	Ok(marker.and_then(|marker| marker.last_protocol_activity_unix_epoch))
 }
 
+pub(crate) fn write_run_retry_budget_attempt_count(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	retry_budget_attempt_count: i64,
+) -> Result<()> {
+	fs::create_dir_all(workspace_path)?;
+
+	let existing_marker = read_run_activity_marker_record(workspace_path)?;
+	let last_activity_unix_epoch =
+		existing_marker.as_ref().and_then(|marker| marker.last_activity_unix_epoch);
+	let last_protocol_activity_unix_epoch =
+		existing_marker.as_ref().and_then(|marker| marker.last_protocol_activity_unix_epoch);
+	let mut marker_body = format!(
+		"run_id={run_id}\nattempt_number={attempt_number}\nprocess_id={}\nretry_budget_attempt_count={retry_budget_attempt_count}\n",
+		existing_marker.as_ref().and_then(|marker| marker.process_id).unwrap_or_else(process::id)
+	);
+
+	if let Some(last_activity_unix_epoch) = last_activity_unix_epoch {
+		marker_body
+			.push_str(format!("last_activity_unix_epoch={last_activity_unix_epoch}\n").as_str());
+	}
+	if let Some(last_protocol_activity_unix_epoch) = last_protocol_activity_unix_epoch {
+		marker_body.push_str(
+			format!("last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n")
+				.as_str(),
+		);
+	}
+
+	fs::write(workspace_path.join(RUN_ACTIVITY_MARKER_FILE), marker_body)?;
+
+	Ok(())
+}
+
+pub(crate) fn read_run_retry_budget_attempt_count(workspace_path: &Path) -> Result<Option<i64>> {
+	Ok(read_run_activity_marker_record(workspace_path)?
+		.and_then(|marker| marker.retry_budget_attempt_count))
+}
+
+pub(crate) fn read_run_activity_marker_snapshot(
+	workspace_path: &Path,
+) -> Result<Option<RunActivityMarker>> {
+	Ok(read_run_activity_marker_record(workspace_path)?.and_then(|marker| {
+		Some(RunActivityMarker {
+			run_id: marker.run_id?,
+			attempt_number: marker.attempt_number?,
+			process_id: marker.process_id,
+			last_activity_unix_epoch: marker.last_activity_unix_epoch,
+			last_protocol_activity_unix_epoch: marker.last_protocol_activity_unix_epoch,
+			retry_budget_attempt_count: marker.retry_budget_attempt_count,
+		})
+	}))
+}
+
 fn write_run_activity_marker_at(
 	workspace_path: &Path,
 	run_id: &str,
 	attempt_number: i64,
+	process_id: u32,
 	last_activity_unix_epoch: i64,
 	last_protocol_activity_unix_epoch: Option<i64>,
 ) -> Result<()> {
@@ -803,16 +905,23 @@ fn write_run_activity_marker_at(
 			.then_some(marker.last_protocol_activity_unix_epoch)
 			.flatten()
 		});
+	let preserved_retry_budget_attempt_count = read_run_activity_marker_record(workspace_path)?
+		.and_then(|marker| marker.retry_budget_attempt_count);
 	let last_protocol_activity_unix_epoch =
 		last_protocol_activity_unix_epoch.or(preserved_protocol_activity);
 	let mut marker_body = format!(
-		"run_id={run_id}\nattempt_number={attempt_number}\nlast_activity_unix_epoch={last_activity_unix_epoch}\n"
+		"run_id={run_id}\nattempt_number={attempt_number}\nprocess_id={process_id}\nlast_activity_unix_epoch={last_activity_unix_epoch}\n"
 	);
 
 	if let Some(last_protocol_activity_unix_epoch) = last_protocol_activity_unix_epoch {
 		marker_body.push_str(
 			format!("last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n")
 				.as_str(),
+		);
+	}
+	if let Some(retry_budget_attempt_count) = preserved_retry_budget_attempt_count {
+		marker_body.push_str(
+			format!("retry_budget_attempt_count={retry_budget_attempt_count}\n").as_str(),
 		);
 	}
 
@@ -840,10 +949,13 @@ fn read_run_activity_marker_record(
 		match key {
 			"run_id" => marker.run_id = Some(value.to_owned()),
 			"attempt_number" => marker.attempt_number = value.parse::<i64>().ok(),
+			"process_id" => marker.process_id = value.parse::<u32>().ok(),
 			"last_activity_unix_epoch" =>
 				marker.last_activity_unix_epoch = value.parse::<i64>().ok(),
 			"last_protocol_activity_unix_epoch" =>
 				marker.last_protocol_activity_unix_epoch = value.parse::<i64>().ok(),
+			"retry_budget_attempt_count" =>
+				marker.retry_budget_attempt_count = value.parse::<i64>().ok(),
 			_ => {},
 		}
 	}
