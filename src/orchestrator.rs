@@ -1582,22 +1582,23 @@ where
 			eyre::bail!("daemon child lease handoff is only supported on unix targets");
 		}
 	}
-
-	recover_runtime_state_from_tracker_and_workspaces(
-		context.tracker,
-		context.project,
-		context.workflow,
-		context.state_store,
-	)?;
-
-	if !context.dry_run {
-		reconcile_project_state(
+	if !context.lease_preacquired {
+		recover_runtime_state_from_tracker_and_workspaces(
 			context.tracker,
 			context.project,
 			context.workflow,
 			context.state_store,
-			&workspace_manager,
 		)?;
+
+		if !context.dry_run {
+			reconcile_project_state(
+				context.tracker,
+				context.project,
+				context.workflow,
+				context.state_store,
+				&workspace_manager,
+			)?;
+		}
 	}
 
 	validate_project_contract(context.project, context.workflow)?;
@@ -5057,6 +5058,74 @@ read_first = [{read_first}]
 				.expect("child should retain the adopted local lease")
 				.run_id(),
 			"planned-run"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn run_target_issue_once_skips_reconciliation_for_preacquired_child_runs() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![Vec::new(), Vec::new()]);
+		let parent_store = StateStore::open_in_memory().expect("parent state store should open");
+		let child_store = StateStore::open_in_memory().expect("child state store should open");
+
+		parent_store
+			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.expect("parent dispatch-slot root should configure");
+		child_store
+			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.expect("child dispatch-slot root should configure");
+
+		assert!(
+			parent_store
+				.try_acquire_lease(config.id(), &issue.id, "planned-run")
+				.expect("parent should acquire the shared dispatch slot")
+		);
+
+		let child_guard = parent_store
+			.clone_dispatch_slot_for_child(config.id())
+			.expect("child should inherit the shared dispatch-slot fd");
+
+		child_store
+			.record_run_attempt("planned-run", &issue.id, 1, "running")
+			.expect("adopted run attempt should record");
+
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &child_store,
+			issue_id: &issue.id,
+			dry_run: false,
+			lease_preacquired: true,
+			preferred_dispatch_slot_fd: Some(child_guard.into_raw_fd()),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
+				run_id: "planned-run",
+				attempt_number: 1,
+			}),
+			preferred_retry_budget_base: None,
+		})
+		.expect("targeted child run should not error before refresh lookup");
+
+		assert!(summary.is_none(), "missing refreshed issue should stop before execution");
+		assert_eq!(
+			child_store
+				.lease_for_issue(&issue.id)
+				.expect("child lease lookup should succeed")
+				.expect("preacquired child lease should remain adopted")
+				.run_id(),
+			"planned-run"
+		);
+		assert_eq!(
+			child_store
+				.run_attempt("planned-run")
+				.expect("run lookup should succeed")
+				.expect("planned attempt should remain recorded")
+				.status(),
+			"running"
 		);
 	}
 
