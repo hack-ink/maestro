@@ -1664,7 +1664,17 @@ where
 	let (attempt_number, run_id) = match context.preferred_run_identity {
 		Some(preferred_run_identity) => {
 			if next_attempt_number > preferred_run_identity.attempt_number {
-				return Ok(None);
+				let Some(existing_attempt) =
+					context.state_store.run_attempt(preferred_run_identity.run_id)?
+				else {
+					return Ok(None);
+				};
+
+				if existing_attempt.issue_id() != issue.id
+					|| existing_attempt.attempt_number() != preferred_run_identity.attempt_number
+				{
+					return Ok(None);
+				}
 			}
 
 			(preferred_run_identity.attempt_number, preferred_run_identity.run_id.to_owned())
@@ -1673,7 +1683,7 @@ where
 	};
 	let persisted_retry_budget_attempts =
 		state::read_run_retry_budget_attempt_count(&planned_workspace.path)?.unwrap_or(0);
-	let retry_budget_base = context.preferred_retry_budget_base.unwrap_or(
+	let retry_budget_base = context.preferred_retry_budget_base.unwrap_or(0).max(
 		context
 			.state_store
 			.retry_budget_attempt_count(&issue.id)?
@@ -4824,6 +4834,46 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn prepare_issue_run_keeps_persisted_retry_budget_when_preferred_base_is_stale() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+
+		state::write_run_retry_budget_attempt_count(&workspace.path, "older-run", 4, 2)
+			.expect("retry budget marker should write");
+
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				lease_preacquired: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_run_identity: None,
+				preferred_retry_budget_base: Some(0),
+			},
+			issue,
+		)
+		.expect("issue preparation should succeed")
+		.expect("startable issue should prepare");
+
+		assert_eq!(
+			issue_run.retry_budget_base, 2,
+			"preferred retry-budget base should not hide retained workspace state"
+		);
+	}
+
+	#[test]
 	fn prepare_issue_run_honors_preferred_identity_when_attempt_is_current() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
@@ -4933,6 +4983,80 @@ read_first = [{read_first}]
 				.run_id(),
 			"planned-run",
 			"preacquired child runs should keep the adopted local lease so cleanup can release the handoff guard"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn prepare_issue_run_allows_preacquired_recovered_retry_attempt() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let parent_store = StateStore::open_in_memory().expect("parent state store should open");
+		let child_store = StateStore::open_in_memory().expect("child state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+
+		parent_store
+			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.expect("parent dispatch-slot root should configure");
+		child_store
+			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.expect("child dispatch-slot root should configure");
+
+		assert!(
+			parent_store
+				.try_acquire_lease(config.id(), &issue.id, "planned-run")
+				.expect("parent should acquire the shared dispatch slot")
+		);
+
+		let child_guard = parent_store
+			.clone_dispatch_slot_for_child(config.id())
+			.expect("child should inherit the shared dispatch-slot fd");
+
+		child_store
+			.adopt_preacquired_lease(
+				config.id(),
+				&issue.id,
+				"planned-run",
+				child_guard.into_raw_fd(),
+			)
+			.expect("child should adopt the inherited lease guard");
+		child_store
+			.record_run_attempt("planned-run", &issue.id, 1, "running")
+			.expect("recovered attempt should record before targeted execution");
+
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &child_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				lease_preacquired: true,
+				dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
+					run_id: "planned-run",
+					attempt_number: 1,
+				}),
+				preferred_retry_budget_base: None,
+			},
+			issue.clone(),
+		)
+		.expect("recovered retry preparation should succeed")
+		.expect("planned retry attempt should still execute");
+
+		assert_eq!(issue_run.run_id, "planned-run");
+		assert_eq!(issue_run.attempt_number, 1);
+		assert_eq!(
+			child_store
+				.lease_for_issue(&issue.id)
+				.expect("child lease lookup should succeed")
+				.expect("child should retain the adopted local lease")
+				.run_id(),
+			"planned-run"
 		);
 	}
 
