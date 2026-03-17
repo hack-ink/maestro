@@ -161,10 +161,11 @@
         "2026-03-16: Finished the imported authority cleanup on `main`: 8d299d0 realigned the split plans, 2e85cb7 fixed checked-in hackink pilot config/docs drift, 553cfac finished the carried-forward status docs seed, XY-137 was closed as a duplicate of XY-140, and XY-140 moved to Done.",
         "2026-03-16: Fresh seed XY-142 was selected by Maestro, executed in clone-backed lane `.workspaces/XY-142`, and reached PR-backed `In Review` on PR #4 after manual parent-environment handoff; XY-136 is now Done, and the remaining daemon-supervision follow-up is XY-143.",
         "2026-03-16: PR #6 merged XY-142 and PR #7 merged XY-143; both Linear issues are now Done, so the daemon-supervision phase is complete and the next active phase is structural follow-ups.",
-        "2026-03-17: PR #8 merged XY-125 onto `main`, so the structural-followups phase has advanced from claim/concurrency policy into XY-126 retry queue and backoff work.",
-        "2026-03-16: XY-141 still sits in the project as stale imported backlog context, but current `main` already uses clone-backed `.workspaces` lanes and does not require XY-141 as a prerequisite for XY-126."
+        "2026-03-17: PR #8 merged XY-125 onto `main`, so the structural-followups phase advanced from claim/concurrency policy into XY-126 retry queue and backoff work.",
+        "2026-03-17: PR #9 merged XY-126 onto `main`, so the next active structural lane is XY-128 for last-known-good WORKFLOW reload semantics ahead of XY-124.",
+        "2026-03-16: XY-141 still sits in the project as stale imported backlog context, but current `main` already uses clone-backed `.workspaces` lanes and does not require XY-141 as a prerequisite for XY-128."
       ],
-      "last_updated": "2026-03-16T16:45:00Z",
+      "last_updated": "2026-03-17T03:20:00Z",
     "replan_reason": null,
     "context_snapshot": {
       "first_subplan": "docs/plans/2026-03-13_maestro-pr-backed-handoff.md",
@@ -172,8 +173,8 @@
       "active_subplan": "docs/plans/2026-03-13_maestro-structural-runtime-followups.md",
       "blocking_review_pr": null,
       "blocking_followup_issue": null,
-      "next_validation_issue": "XY-126",
-      "active_lane": "x/maestro-xy-126",
+      "next_validation_issue": "XY-128",
+      "active_lane": "x/maestro-xy-128",
       "active_workspace": null,
       "tracker_project": "hackink/Maestro Pilot Ops Hardening",
       "imported_issue_map": {
@@ -186,7 +187,7 @@
       "open_followups": [
         "XY-141"
       ],
-      "next_structural_issue_after_daemon_closeout": "XY-126"
+      "next_structural_issue_after_daemon_closeout": "XY-128"
     }
   }
 }

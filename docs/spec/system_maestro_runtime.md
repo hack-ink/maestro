@@ -260,7 +260,10 @@ It is acceptable for deeper historical forensics to continue using the retained 
 
 - On service startup, `maestro` must reconcile local leases against current Linear state before starting new work.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
+- While daemon mode is running an active lane, that child must keep the workflow snapshot it started with; repo-owned `WORKFLOW.md` reloads affect later decisions without restarting the in-flight child.
 - While daemon mode owns a queued retry entry, that queued claim must take priority over normal candidate selection in the current single-slot runtime.
+- While daemon mode is idle between lanes, it may reload the configured repo-owned `WORKFLOW.md` on each tick and immediately apply a newly valid document to future dispatch, retry, post-exit reconciliation, and prompt generation.
+- If that same configured `WORKFLOW.md` path becomes invalid after a successful load, daemon mode must log the reload failure and keep the last known good document active instead of dropping the tick or clearing runtime policy.
 - If the leased issue becomes terminal during a daemon tick, `maestro` must stop the active run, mark the attempt `terminated`, clear the lease, and clean the workspace.
 - If the leased issue becomes non-terminal and leaves both the `In Progress` lane state and any configured startable pre-claim state, `maestro` must stop the active run, mark the attempt `interrupted`, clear the lease, and keep the workspace for inspection.
 - A leased issue that is still in a configured startable state during early daemon ticks must be treated as a lane that has not finished claiming tracker ownership yet, not as an immediate non-active interruption.

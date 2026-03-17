@@ -167,6 +167,8 @@ During daemon mode, each poll tick now does two distinct things:
 1. inspect any currently leased active lane
 2. reconcile stale or terminal local state before selecting new work
 
+Daemon mode also reloads the configured repo-owned `WORKFLOW.md` defensively on future ticks. A newly valid workflow document affects later dispatch, retry, post-exit reconciliation, and prompt generation without restarting the process. If the same configured path becomes invalid after a prior successful load, the daemon logs a warning and keeps the last known good workflow active; an already running child lane keeps the workflow snapshot it started with.
+
 The active-lane reconciliation rules are:
 
 - terminal issue: stop the lane, mark the run `terminated`, and remove the workspace

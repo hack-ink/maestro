@@ -18,6 +18,13 @@ Defines: The file location, parse model, supported frontmatter structure, and th
 - The Markdown body is human-readable policy text that `maestro` may append to developer instructions.
 - The frontmatter is the only machine-readable section of the file.
 
+## Daemon reload semantics
+
+- `maestro` daemon mode may defensively reload the configured repository-owned `WORKFLOW.md` on future poll ticks instead of relying on filesystem watchers.
+- When a reload of the currently configured `WORKFLOW.md` path succeeds, future dispatch, retry, reconciliation after child exit, and prompt generation may use the new document immediately.
+- When that same configured path fails to parse after at least one successful load, daemon mode must keep the last known good `WORKFLOW.md` active for future daemon decisions and log a warning instead of dropping the whole tick.
+- An already running child lane keeps the workflow snapshot it started with; reload semantics affect later decisions, not mid-run prompt or reconciliation behavior for that active child.
+
 ## Upstream divergences
 
 - Upstream Symphony examples use YAML frontmatter. `maestro` intentionally uses TOML frontmatter instead.

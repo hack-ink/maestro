@@ -127,6 +127,7 @@ struct DaemonRunChild {
 	run_id: String,
 	attempt_number: i64,
 	from_retry_queue: bool,
+	workflow: WorkflowDocument,
 }
 
 #[derive(Clone, Copy)]
@@ -179,6 +180,12 @@ struct DaemonTickContext {
 	workflow: WorkflowDocument,
 	tracker: LinearClient,
 	workspace_manager: WorkspaceManager,
+}
+
+#[derive(Clone)]
+struct CachedWorkflowDocument {
+	path: PathBuf,
+	document: WorkflowDocument,
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +373,7 @@ pub(crate) fn run_daemon(
 	let state_store = StateStore::open(default_state_store_path()?)?;
 	let mut active_child: Option<DaemonRunChild> = None;
 	let mut retry_queue = RetryQueue::default();
+	let mut workflow_cache: Option<CachedWorkflowDocument> = None;
 
 	tracing::info!(
 		config_path = %config_path.display(),
@@ -376,7 +384,7 @@ pub(crate) fn run_daemon(
 	loop {
 		let tick_started_at = Instant::now();
 
-		match load_daemon_tick_context(&config_path).and_then(|context| {
+		match load_daemon_tick_context(&config_path, &mut workflow_cache).and_then(|context| {
 			run_daemon_tick(
 				&config_path,
 				&state_store,
@@ -420,16 +428,57 @@ pub(crate) fn print_status(
 	Ok(())
 }
 
-fn load_daemon_tick_context(config_path: &Path) -> crate::prelude::Result<DaemonTickContext> {
+fn load_daemon_tick_context(
+	config_path: &Path,
+	workflow_cache: &mut Option<CachedWorkflowDocument>,
+) -> crate::prelude::Result<DaemonTickContext> {
 	let config = ServiceConfig::from_path(config_path)?;
-	let workflow_path = config.repo_root().join(config.workflow_path());
-	let workflow = WorkflowDocument::from_path(&workflow_path)?;
+	let workflow = load_daemon_tick_workflow(&config, workflow_cache)?;
 	let api_key = config.tracker().resolve_api_key()?;
 	let tracker = LinearClient::new(api_key)?;
 	let workspace_manager =
 		WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
 
 	Ok(DaemonTickContext { config, workflow, tracker, workspace_manager })
+}
+
+fn load_daemon_tick_workflow(
+	config: &ServiceConfig,
+	workflow_cache: &mut Option<CachedWorkflowDocument>,
+) -> crate::prelude::Result<WorkflowDocument> {
+	let workflow_path = config.repo_root().join(config.workflow_path());
+	let cached_same_path = workflow_cache
+		.as_ref()
+		.filter(|cached| cached.path == workflow_path)
+		.map(|cached| cached.document.clone());
+
+	match WorkflowDocument::from_path(&workflow_path) {
+		Ok(workflow) => {
+			if cached_same_path.as_ref().is_some_and(|cached| cached != &workflow) {
+				tracing::info!(
+					workflow_path = %workflow_path.display(),
+					"Reloaded repo-owned WORKFLOW.md for future daemon decisions."
+				);
+			}
+
+			*workflow_cache =
+				Some(CachedWorkflowDocument { path: workflow_path, document: workflow.clone() });
+
+			Ok(workflow)
+		},
+		Err(error) =>
+			if let Some(cached_workflow) = cached_same_path {
+				tracing::warn!(
+					workflow_path = %workflow_path.display(),
+					?error,
+					"Failed to reload WORKFLOW.md; keeping the last known good workflow active for daemon decisions."
+				);
+
+				Ok(cached_workflow)
+			} else {
+				Err(error)
+			},
+	}
 }
 
 fn run_daemon_tick(
@@ -490,17 +539,19 @@ where
 	};
 	let child_exit_status = daemon_child.child.try_wait()?;
 	let child_exited = child_exit_status.is_some();
+	let reconciliation_workflow =
+		reconciliation_workflow(workflow, Some(&daemon_child.workflow), child_exited);
 	let actions = if child_exited {
 		inspect_exited_daemon_child_reconciliation(
 			tracker,
 			project,
-			workflow,
+			reconciliation_workflow,
 			state_store,
 			&daemon_child.issue_id,
 			&daemon_child.run_id,
 		)?
 	} else {
-		inspect_active_run_reconciliation(tracker, project, workflow, state_store)?
+		inspect_active_run_reconciliation(tracker, project, reconciliation_workflow, state_store)?
 	};
 
 	if actions.is_empty() {
@@ -547,7 +598,7 @@ where
 	apply_active_run_reconciliation(
 		tracker,
 		project,
-		workflow,
+		reconciliation_workflow,
 		state_store,
 		workspace_manager,
 		actions,
@@ -556,6 +607,14 @@ where
 	active_child.take();
 
 	Ok(())
+}
+
+fn reconciliation_workflow<'a>(
+	current_workflow: &'a WorkflowDocument,
+	active_workflow: Option<&'a WorkflowDocument>,
+	child_exited: bool,
+) -> &'a WorkflowDocument {
+	if child_exited { current_workflow } else { active_workflow.unwrap_or(current_workflow) }
 }
 
 fn clear_orphaned_daemon_child_state(
@@ -644,6 +703,7 @@ where
 				run_id: summary.run_id,
 				attempt_number: summary.attempt_number,
 				from_retry_queue,
+				workflow: workflow.clone(),
 			});
 		},
 		None =>
@@ -2798,6 +2858,64 @@ read_first = [{read_first}]
 		)
 	}
 
+	#[test]
+	fn daemon_workflow_reload_keeps_last_known_good_on_same_path_failure() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let mut workflow_cache = None;
+		let initial = orchestrator::load_daemon_tick_workflow(&config, &mut workflow_cache)
+			.expect("initial workflow load should succeed");
+
+		assert_eq!(initial, workflow);
+
+		fs::write(config.repo_root().join("WORKFLOW.md"), "not valid workflow markdown")
+			.expect("invalid workflow should be written");
+
+		let fallback = orchestrator::load_daemon_tick_workflow(&config, &mut workflow_cache)
+			.expect("invalid reload should keep the cached workflow");
+
+		assert_eq!(fallback, workflow);
+	}
+
+	#[test]
+	fn daemon_workflow_reload_replaces_cached_document_after_valid_update() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let mut workflow_cache = None;
+
+		orchestrator::load_daemon_tick_workflow(&config, &mut workflow_cache)
+			.expect("initial workflow load should succeed");
+
+		let updated_workflow =
+			sample_workflow_markdown(&["AGENTS.md"], "Updated workflow policy.\n")
+				.replace("max_attempts = 3", "max_attempts = 5");
+
+		fs::write(config.repo_root().join("WORKFLOW.md"), updated_workflow)
+			.expect("updated workflow should be written");
+
+		let reloaded = orchestrator::load_daemon_tick_workflow(&config, &mut workflow_cache)
+			.expect("valid reload should replace the cached workflow");
+
+		assert_ne!(reloaded, workflow);
+		assert_eq!(reloaded.frontmatter().execution().max_attempts(), 5);
+		assert_eq!(reloaded.body(), "Updated workflow policy.");
+	}
+
+	#[test]
+	fn active_child_reconciliation_keeps_spawn_time_workflow_until_exit() {
+		let (_temp_dir, _config, current_workflow) = temp_project_layout();
+		let active_workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown(&["AGENTS.md"], "Spawn-time workflow policy.\n")
+				.replace("max_attempts = 3", "max_attempts = 5"),
+		)
+		.expect("workflow should parse");
+		let during_run =
+			orchestrator::reconciliation_workflow(&current_workflow, Some(&active_workflow), false);
+		let after_exit =
+			orchestrator::reconciliation_workflow(&current_workflow, Some(&active_workflow), true);
+
+		assert_eq!(during_run, &active_workflow);
+		assert_eq!(after_exit, &current_workflow);
+	}
+
 	fn expected_developer_instructions(
 		read_first_files: &[(&str, &str)],
 		workflow: &WorkflowDocument,
@@ -3256,6 +3374,7 @@ read_first = [{read_first}]
 			run_id: String::from("planned-run"),
 			attempt_number: 1,
 			from_retry_queue: true,
+			workflow: workflow.clone(),
 		});
 		let mut retry_queue = orchestrator::RetryQueue::default();
 

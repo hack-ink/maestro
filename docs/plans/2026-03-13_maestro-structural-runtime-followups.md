@@ -73,7 +73,7 @@
       {
         "id": "shape-xy-126",
         "title": "Shape retry queue and backoff work into an executable lane",
-        "status": "in_progress",
+        "status": "done",
         "objective": "Decide whether XY-126 can be executed as one bounded issue after XY-125 or must be split before live execution.",
         "inputs": [
           "XY-126",
@@ -95,7 +95,7 @@
       {
         "id": "place-xy-128",
         "title": "Place WORKFLOW reload semantics in the post-pilot sequence",
-        "status": "pending",
+        "status": "in_progress",
         "objective": "Define whether XY-128 should land as a small standalone contract task or fold into adjacent runtime hardening without becoming implicit.",
         "inputs": [
           "XY-128",
@@ -147,8 +147,8 @@
   },
   "state": {
     "phase": "executing",
-    "current_task_id": "shape-xy-126",
-    "next_task_id": "shape-xy-126",
+    "current_task_id": "place-xy-128",
+    "next_task_id": "place-xy-128",
     "blockers": [],
     "evidence": [
       "2026-03-13: PUB-610 and PUB-608 were originally staged after PR-backed handoff and daemon supervision so structural work would not enter the critical path too early.",
@@ -156,15 +156,16 @@
       "2026-03-16: Fresh daemon follow-up XY-143 originally kept this structural plan staged behind daemon supervision.",
       "2026-03-16: PR #7 merged XY-143, so loop readiness is now confirmed: the current self-supervision path is PR-backed, reconciled, operator-visible, and no longer depends on manual PR creation or ad hoc SQL.",
       "2026-03-17: XY-125 is now done after PR #8 fast-forwarded onto main, so claim/concurrency/blocker policy is no longer the active structural gap.",
-      "2026-03-17: XY-126 is now the active structural execution lane via docs/plans/2026-03-17_maestro-xy-126-retry-queue-backoff.md, with XY-128 still placed explicitly before durability removal and XY-124 still last.",
+      "2026-03-17: XY-126 is now done after PR #9 fast-forwarded onto main, so retry queue and backoff semantics are no longer the active structural gap.",
+      "2026-03-17: XY-128 is now the active structural execution lane via docs/plans/2026-03-17_maestro-xy-128-workflow-reload-last-known-good.md, with XY-124 still intentionally last.",
       "2026-03-16: XY-141 should not block this plan because current `main` already uses clone-backed `.workspaces` lanes and the imported issue description is stale."
     ],
-    "last_updated": "2026-03-16T16:45:00Z",
+    "last_updated": "2026-03-17T03:20:00Z",
     "replan_reason": null,
     "context_snapshot": {
-      "current_gap": "The next remaining runtime gap is XY-126 retry queue and backoff semantics; daemon supervision and XY-125 are complete.",
+      "current_gap": "The next remaining runtime gap is XY-128 last-known-good WORKFLOW reload semantics; daemon supervision, XY-125, and XY-126 are complete.",
       "ordering_rule": "XY-125 stays ahead of XY-126, XY-128 is placed explicitly before XY-124, and XY-124 stays last.",
-      "next_candidate_after_daemon_closeout": "XY-126"
+      "next_candidate_after_daemon_closeout": "XY-128"
     }
   }
 }

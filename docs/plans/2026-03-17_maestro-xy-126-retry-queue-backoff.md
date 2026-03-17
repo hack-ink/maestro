@@ -102,7 +102,7 @@
       {
         "id": "verify-xy-126-delivery",
         "title": "Verify XY-126 end-to-end and prepare delivery",
-        "status": "in_progress",
+        "status": "done",
         "objective": "Finish the lane with repo-native verification and updated execution evidence.",
         "inputs": [
           "Implemented retry queue and backoff semantics",
@@ -131,9 +131,9 @@
     }
   },
   "state": {
-    "phase": "executing",
-    "current_task_id": "verify-xy-126-delivery",
-    "next_task_id": "verify-xy-126-delivery",
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
     "blockers": [],
     "evidence": [
       "2026-03-17: XY-126 is the next structural runtime issue after XY-125 merged and closed.",
@@ -142,16 +142,18 @@
       "2026-03-17: Symphony SPEC sections 7.3 and 8.4 define the target semantics: clean worker exits schedule a short continuation retry, abnormal exits schedule exponential backoff, and retry firing revalidates the issue before redispatch or claim release.",
       "2026-03-17: Runtime implementation now owns an explicit in-memory RetryQueue plus retry dispatch helpers, run-once issue override support, and retry-policy revalidation for active `In Progress` issues.",
       "2026-03-17: Repo-owned contract docs now expose execution.max_retry_backoff_ms and describe continuation retry versus capped failure retry semantics in WORKFLOW.md, workflow spec, runtime spec, and pilot guide.",
-      "2026-03-17: Local verification passed for cargo make lint-fix/fmt/test/lint/fmt-rust-check/fmt-toml-check and git diff --check after adding retry-queue regression coverage for continuation scheduling, failure scheduling, queued-claim release, and queued-claim blocking before due time."
+      "2026-03-17: Local verification passed for cargo make lint-fix/fmt/test/lint/fmt-rust-check/fmt-toml-check and git diff --check after adding retry-queue regression coverage for continuation scheduling, failure scheduling, queued-claim release, and queued-claim blocking before due time.",
+      "2026-03-17: PR #9 merged onto `main` at 57dd6a76d4c90e1c6fef91e7e1230fcc130dcb99 and Linear issue XY-126 is now Done, so the next structural lane is XY-128."
     ],
-    "last_updated": "2026-03-16T18:08:15Z",
+    "last_updated": "2026-03-17T03:20:00Z",
     "replan_reason": null,
     "context_snapshot": {
       "active_structural_issue": "XY-126",
       "previous_structural_issue": "XY-125",
       "single_slot_runtime": true,
-      "current_retry_gap": "Local implementation and verification are complete; the remaining gap is delivery, review, and tracker closeout.",
-      "active_lane": "x/maestro-xy-126"
+      "current_retry_gap": "XY-126 is merged and closed; the next structural runtime gap is XY-128 last-known-good WORKFLOW reload semantics.",
+      "next_structural_issue": "XY-128",
+      "active_lane": null
     }
   }
 }
