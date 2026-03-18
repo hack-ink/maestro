@@ -77,6 +77,7 @@ struct MaterializedDaemonSpawnState {
 #[derive(Clone, Debug)]
 struct IssueRunPlan {
 	issue: TrackerIssue,
+	issue_state: String,
 	workspace: WorkspaceSpec,
 	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
@@ -237,6 +238,16 @@ impl RetryQueue {
 		self.entries.values().min_by(|left, right| {
 			left.ready_at.cmp(&right.ready_at).then_with(|| left.issue_id.cmp(&right.issue_id))
 		})
+	}
+
+	fn ordered_entries(&self) -> Vec<RetryEntry> {
+		let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
+
+		entries.sort_by(|left, right| {
+			left.ready_at.cmp(&right.ready_at).then_with(|| left.issue_id.cmp(&right.issue_id))
+		});
+
+		entries
 	}
 }
 
@@ -970,18 +981,32 @@ where
 {
 	match plan_due_retry_run(retry_queue, tracker, project, workflow, state_store)? {
 		RetryDispatchDecision::Dispatch(summary) => Ok(Some((summary, true))),
-		RetryDispatchDecision::Blocked { issue_id } => run_project_once_with_exclusions(
-			tracker,
-			project,
-			workflow,
-			state_store,
-			true,
-			&[issue_id.as_str()],
-		)
-		.map(|summary| summary.map(|summary| (summary, false))),
-		RetryDispatchDecision::Continue =>
-			Ok(run_project_once(tracker, project, workflow, state_store, true)?
-				.map(|summary| (summary, false))),
+		RetryDispatchDecision::Blocked { issue_id } => {
+			let issue_run = plan_project_issue_run_with_exclusions(
+				tracker,
+				project,
+				workflow,
+				state_store,
+				true,
+				&[issue_id.as_str()],
+			)?;
+
+			Ok(issue_run
+				.map(|issue_run| (run_summary_from_issue_run(project.id(), &issue_run), false)))
+		},
+		RetryDispatchDecision::Continue => {
+			let issue_run = plan_project_issue_run_with_exclusions(
+				tracker,
+				project,
+				workflow,
+				state_store,
+				true,
+				&[],
+			)?;
+
+			Ok(issue_run
+				.map(|issue_run| (run_summary_from_issue_run(project.id(), &issue_run), false)))
+		},
 	}
 }
 
@@ -1075,64 +1100,80 @@ fn plan_due_retry_run<T>(
 where
 	T: IssueTracker,
 {
-	let Some(entry) = retry_queue.next_entry().cloned() else {
+	let Some(first_entry) = retry_queue.next_entry().cloned() else {
 		return Ok(RetryDispatchDecision::Continue);
 	};
+	let now = Instant::now();
 
-	if Instant::now() < entry.ready_at {
-		let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
-			retry_queue.release(&entry.issue_id);
+	if now < first_entry.ready_at {
+		let Some(issue) = refresh_issue(tracker, &first_entry.issue_id)? else {
+			retry_queue.release(&first_entry.issue_id);
 
 			return Ok(RetryDispatchDecision::Continue);
 		};
 
 		if !issue_passes_retry_retention_policy(
 			&issue,
-			&entry.retry_project_slug,
+			&first_entry.retry_project_slug,
 			project,
 			workflow,
 			state_store,
 		)? {
-			retry_queue.release(&entry.issue_id);
+			retry_queue.release(&first_entry.issue_id);
 
 			return Ok(RetryDispatchDecision::Continue);
 		}
 
 		tracing::debug!(
-			issue_id = entry.issue_id,
-			retry_kind = ?entry.kind,
-			retry_attempt = entry.attempt,
+			issue_id = first_entry.issue_id,
+			retry_kind = ?first_entry.kind,
+			retry_attempt = first_entry.attempt,
 			"Retry queue is holding the project claim until the next retry is due."
 		);
 
-		return Ok(RetryDispatchDecision::Blocked { issue_id: entry.issue_id.clone() });
+		return Ok(RetryDispatchDecision::Blocked { issue_id: first_entry.issue_id.clone() });
 	}
 
-	let Some(summary) = run_target_issue_once(TargetIssueRunContext {
-		tracker,
-		project,
-		workflow,
-		state_store,
-		issue_id: &entry.issue_id,
-		preferred_issue_state: None,
-		dry_run: true,
-		lease_preacquired: false,
-		preferred_dispatch_slot_fd: None,
-		dispatch_mode: IssueDispatchMode::Retry,
-		preferred_run_identity: None,
-		preferred_retry_budget_base: None,
-	})?
-	else {
-		if retry_entry_is_temporarily_blocked(tracker, project, workflow, state_store, &entry)? {
-			return Ok(RetryDispatchDecision::Blocked { issue_id: entry.issue_id.clone() });
+	let mut blocked_issue_id = None;
+
+	for entry in retry_queue.ordered_entries() {
+		if now < entry.ready_at {
+			break;
 		}
 
-		retry_queue.release(&entry.issue_id);
+		let Some(summary) = run_target_issue_once(TargetIssueRunContext {
+			tracker,
+			project,
+			workflow,
+			state_store,
+			issue_id: &entry.issue_id,
+			preferred_issue_state: None,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
+			dispatch_mode: IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})?
+		else {
+			if retry_entry_is_temporarily_blocked(tracker, project, workflow, state_store, &entry)?
+			{
+				blocked_issue_id.get_or_insert_with(|| entry.issue_id.clone());
 
-		return Ok(RetryDispatchDecision::Continue);
-	};
+				continue;
+			}
 
-	Ok(RetryDispatchDecision::Dispatch(summary))
+			retry_queue.release(&entry.issue_id);
+
+			continue;
+		};
+
+		return Ok(RetryDispatchDecision::Dispatch(summary));
+	}
+
+	Ok(blocked_issue_id.map_or(RetryDispatchDecision::Continue, |issue_id| {
+		RetryDispatchDecision::Blocked { issue_id }
+	}))
 }
 
 fn retry_entry_is_temporarily_blocked<T>(
@@ -1424,7 +1465,7 @@ where
 	T: IssueTracker,
 {
 	for action in actions {
-		match action.disposition {
+		match &action.disposition {
 			ActiveRunDisposition::Terminal => {
 				tracing::info!(
 					project_id = project.id(),
@@ -1444,101 +1485,129 @@ where
 				}
 			},
 			ActiveRunDisposition::NonActive => {
-				tracing::info!(
-					project_id = project.id(),
-					issue_id = action.issue.id,
-					issue = action.issue.identifier,
-					run_id = action.run_attempt.run_id(),
-					disposition = "non_active",
-					"Reconciling non-active run."
-				);
-
-				mark_run_attempt_if_active(
-					state_store,
-					action.run_attempt.run_id(),
-					"interrupted",
-				)?;
-
-				let workspace_path = action.workspace_mapping.as_ref().map_or_else(
-					|| workspace_manager.plan_for_issue(&action.issue.identifier).path,
-					|mapping| mapping.workspace_path().to_path_buf(),
-				);
-
-				if workspace_path.exists() {
-					write_retry_budget_marker(
-						&workspace_path,
-						action.run_attempt.run_id(),
-						action.run_attempt.attempt_number(),
-						retry_budget_base_for_issue_workspace(
-							state_store,
-							&action.issue.id,
-							&workspace_path,
-						)?,
-					)?;
-				}
-
-				state_store.clear_lease(&action.issue.id)?;
+				reconcile_nonactive_active_run(project, state_store, workspace_manager, &action)?;
 			},
 			ActiveRunDisposition::Stalled { idle_for } => {
-				tracing::warn!(
-					project_id = project.id(),
-					issue_id = action.issue.id,
-					issue = action.issue.identifier,
-					run_id = action.run_attempt.run_id(),
-					disposition = "stalled",
-					idle_for_s = idle_for.as_secs(),
-					"Reconciling stalled run."
-				);
-
-				state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
-				state_store.clear_lease(&action.issue.id)?;
-
-				let workspace = action.workspace_mapping.as_ref().map_or_else(
-					|| workspace_manager.plan_for_issue(&action.issue.identifier),
-					|mapping| WorkspaceSpec {
-						branch_name: mapping.branch_name().to_owned(),
-						issue_identifier: action.issue.identifier.clone(),
-						path: mapping.workspace_path().to_path_buf(),
-						reused_existing: true,
-					},
-				);
-				let retry_budget_base = retry_budget_base_for_issue_workspace(
-					state_store,
-					&action.issue.id,
-					&workspace.path,
-				)?;
-				let issue_run = IssueRunPlan {
-					issue: action.issue.clone(),
-					workspace,
-					// Stalled reconciliation can refresh an issue by ID after it has already been
-					// removed from its Linear project. This path always converges via terminal
-					// failure writeback, so keep a stable fallback instead of panicking.
-					retry_project_slug: action
-						.issue
-						.project_slug
-						.clone()
-						.unwrap_or_else(|| project.tracker().project_slug().to_owned()),
-					dispatch_mode: IssueDispatchMode::Retry,
-					attempt_number: action.run_attempt.attempt_number(),
-					run_id: action.run_attempt.run_id().to_owned(),
-					retry_budget_base,
-				};
-
-				handle_failure(
+				reconcile_stalled_active_run(
 					tracker,
 					project,
-					&action.workflow,
 					state_store,
-					&issue_run,
-					&Report::new(StalledRunNeedsAttention {
-						issue_identifier: action.issue.identifier.clone(),
-						run_id: action.run_attempt.run_id().to_owned(),
-						idle_for,
-					}),
+					workspace_manager,
+					&action,
+					*idle_for,
 				)?;
 			},
 		}
 	}
+
+	Ok(())
+}
+
+fn reconcile_nonactive_active_run(
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	workspace_manager: &WorkspaceManager,
+	action: &ActiveRunReconciliation,
+) -> crate::prelude::Result<()> {
+	tracing::info!(
+		project_id = project.id(),
+		issue_id = action.issue.id,
+		issue = action.issue.identifier,
+		run_id = action.run_attempt.run_id(),
+		disposition = "non_active",
+		"Reconciling non-active run."
+	);
+
+	mark_run_attempt_if_active(state_store, action.run_attempt.run_id(), "interrupted")?;
+
+	let workspace_path = action.workspace_mapping.as_ref().map_or_else(
+		|| workspace_manager.plan_for_issue(&action.issue.identifier).path,
+		|mapping| mapping.workspace_path().to_path_buf(),
+	);
+
+	if workspace_path.exists() {
+		write_retry_budget_marker(
+			&workspace_path,
+			action.run_attempt.run_id(),
+			action.run_attempt.attempt_number(),
+			retry_budget_base_for_issue_workspace(state_store, &action.issue.id, &workspace_path)?,
+		)?;
+	}
+
+	state_store.clear_lease(&action.issue.id)?;
+
+	Ok(())
+}
+
+fn reconcile_stalled_active_run<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	workspace_manager: &WorkspaceManager,
+	action: &ActiveRunReconciliation,
+	idle_for: Duration,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	tracing::warn!(
+		project_id = project.id(),
+		issue_id = action.issue.id,
+		issue = action.issue.identifier,
+		run_id = action.run_attempt.run_id(),
+		disposition = "stalled",
+		idle_for_s = idle_for.as_secs(),
+		"Reconciling stalled run."
+	);
+
+	state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
+	state_store.clear_lease(&action.issue.id)?;
+
+	let workspace = action.workspace_mapping.as_ref().map_or_else(
+		|| workspace_manager.plan_for_issue(&action.issue.identifier),
+		|mapping| WorkspaceSpec {
+			branch_name: mapping.branch_name().to_owned(),
+			issue_identifier: action.issue.identifier.clone(),
+			path: mapping.workspace_path().to_path_buf(),
+			reused_existing: true,
+		},
+	);
+	let retry_budget_base =
+		retry_budget_base_for_issue_workspace(state_store, &action.issue.id, &workspace.path)?;
+	let issue_run = IssueRunPlan {
+		issue: action.issue.clone(),
+		issue_state: planned_issue_state_for_dispatch(
+			&action.workflow,
+			&action.issue,
+			IssueDispatchMode::Retry,
+		),
+		workspace,
+		// Stalled reconciliation can refresh an issue by ID after it has already been
+		// removed from its Linear project. This path always converges via terminal
+		// failure writeback, so keep a stable fallback instead of panicking.
+		retry_project_slug: action
+			.issue
+			.project_slug
+			.clone()
+			.unwrap_or_else(|| project.tracker().project_slug().to_owned()),
+		dispatch_mode: IssueDispatchMode::Retry,
+		attempt_number: action.run_attempt.attempt_number(),
+		run_id: action.run_attempt.run_id().to_owned(),
+		retry_budget_base,
+	};
+
+	handle_failure(
+		tracker,
+		project,
+		&action.workflow,
+		state_store,
+		&issue_run,
+		&Report::new(StalledRunNeedsAttention {
+			issue_identifier: action.issue.identifier.clone(),
+			run_id: action.run_attempt.run_id().to_owned(),
+			idle_for,
+		}),
+	)?;
 
 	Ok(())
 }
@@ -1707,6 +1776,32 @@ fn run_project_once_with_exclusions<T>(
 where
 	T: IssueTracker,
 {
+	let Some(issue_run) = plan_project_issue_run_with_exclusions(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		dry_run,
+		excluded_issue_ids,
+	)?
+	else {
+		return Ok(None);
+	};
+
+	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+}
+
+fn plan_project_issue_run_with_exclusions<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	dry_run: bool,
+	excluded_issue_ids: &[&str],
+) -> crate::prelude::Result<Option<IssueRunPlan>>
+where
+	T: IssueTracker,
+{
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 
@@ -1746,8 +1841,9 @@ where
 		return Ok(None);
 	};
 	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
+	let issue_state = planned_issue_state_for_dispatch(workflow, &issue, dispatch_mode);
 
-	if !concurrency.allows_state(workflow.frontmatter().execution(), &issue.state.name) {
+	if !concurrency.allows_state(workflow.frontmatter().execution(), &issue_state) {
 		return Ok(None);
 	}
 
@@ -1776,7 +1872,7 @@ where
 		return Ok(None);
 	};
 
-	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+	Ok(Some(issue_run))
 }
 
 fn run_target_issue_once<T>(
@@ -1851,7 +1947,8 @@ where
 	let Some(issue) = refresh_issue(context.tracker, context.issue_id)? else {
 		return Ok(None);
 	};
-	let issue_state = issue.state.name.clone();
+	let issue_state =
+		planned_issue_state_for_dispatch(context.workflow, &issue, context.dispatch_mode);
 
 	if !context.dispatch_mode.allows_issue(
 		&issue,
@@ -1936,6 +2033,8 @@ where
 		)?,
 	);
 	let lease_issue_id = issue.id.clone();
+	let issue_state =
+		planned_issue_state_for_dispatch(context.workflow, &issue, context.dispatch_mode);
 
 	if !context.dry_run
 		&& !context.lease_preacquired
@@ -1943,7 +2042,7 @@ where
 			context.project.id(),
 			&issue.id,
 			&run_id,
-			&issue.state.name,
+			&issue_state,
 		)? {
 		return Ok(None);
 	}
@@ -1995,6 +2094,7 @@ where
 
 		Ok(Some(IssueRunPlan {
 			issue: refreshed_issue,
+			issue_state: issue_state.clone(),
 			workspace,
 			retry_project_slug: tracker_project.slug.clone(),
 			dispatch_mode: context.dispatch_mode,
@@ -2033,18 +2133,7 @@ where
 	T: IssueTracker,
 {
 	if dry_run {
-		return Ok(Some(RunSummary {
-			project_id: project.id().to_owned(),
-			issue_id: issue_run.issue.id.clone(),
-			issue_identifier: issue_run.issue.identifier.clone(),
-			issue_state: issue_run.issue.state.name.clone(),
-			retry_project_slug: issue_run.retry_project_slug.clone(),
-			dispatch_mode: issue_run.dispatch_mode,
-			branch_name: issue_run.workspace.branch_name.clone(),
-			workspace_path: issue_run.workspace.path.clone(),
-			attempt_number: issue_run.attempt_number,
-			run_id: issue_run.run_id.clone(),
-		}));
+		return Ok(Some(run_summary_from_issue_run(project.id(), &issue_run)));
 	}
 
 	let summary = execute_issue_run(tracker, project, workflow, state_store, issue_run)?;
@@ -2323,7 +2412,7 @@ where
 		project_id: project.id().to_owned(),
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
-		issue_state: issue_run.issue.state.name.clone(),
+		issue_state: issue_run.issue_state.clone(),
 		retry_project_slug: issue_run.retry_project_slug.clone(),
 		dispatch_mode: issue_run.dispatch_mode,
 		branch_name: issue_run.workspace.branch_name.clone(),
@@ -2331,6 +2420,33 @@ where
 		attempt_number: issue_run.attempt_number,
 		run_id: issue_run.run_id.clone(),
 	})
+}
+
+fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> RunSummary {
+	RunSummary {
+		project_id: project_id.to_owned(),
+		issue_id: issue_run.issue.id.clone(),
+		issue_identifier: issue_run.issue.identifier.clone(),
+		issue_state: issue_run.issue_state.clone(),
+		retry_project_slug: issue_run.retry_project_slug.clone(),
+		dispatch_mode: issue_run.dispatch_mode,
+		branch_name: issue_run.workspace.branch_name.clone(),
+		workspace_path: issue_run.workspace.path.clone(),
+		attempt_number: issue_run.attempt_number,
+		run_id: issue_run.run_id.clone(),
+	}
+}
+
+fn planned_issue_state_for_dispatch(
+	workflow: &WorkflowDocument,
+	issue: &TrackerIssue,
+	dispatch_mode: IssueDispatchMode,
+) -> String {
+	match dispatch_mode {
+		IssueDispatchMode::Normal =>
+			workflow.frontmatter().tracker().in_progress_state().to_owned(),
+		IssueDispatchMode::Retry => issue.state.name.clone(),
+	}
 }
 
 fn preserve_manual_attention_request(
@@ -3173,7 +3289,10 @@ fn select_issue_candidate_with_exclusions(
 		if excluded_issue_ids.contains(&issue.id.as_str()) {
 			continue;
 		}
-		if !concurrency.allows_state(workflow.frontmatter().execution(), &issue.state.name) {
+		if !concurrency.allows_state(
+			workflow.frontmatter().execution(),
+			workflow.frontmatter().tracker().in_progress_state(),
+		) {
 			continue;
 		}
 		if is_issue_eligible(&issue, workflow, state_store)? {
@@ -4718,11 +4837,78 @@ read_first = [{read_first}]
 		assert!(!next_run.1, "alternate work should not consume the queued retry claim");
 		assert_eq!(next_run.0.issue_id, todo_issue.id);
 		assert_eq!(next_run.0.issue_identifier, todo_issue.identifier);
-		assert_eq!(next_run.0.issue_state, "Todo");
+		assert_eq!(next_run.0.issue_state, "In Progress");
 		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Normal);
 		assert!(
 			retry_queue.entries.contains_key(&retry_issue.id),
 			"the blocked retry claim should remain queued while another lane fills capacity"
+		);
+	}
+
+	#[test]
+	fn due_retry_releases_stale_entry_and_dispatches_next_due_retry() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let stale_issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"other-project",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let runnable_issue = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:17:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![stale_issue.clone(), runnable_issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: stale_issue.id.clone(),
+			retry_project_slug: String::from("pubfi"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now(),
+		});
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: runnable_issue.id.clone(),
+			retry_project_slug: runnable_issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now(),
+		});
+
+		let next_run = orchestrator::plan_next_daemon_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("daemon planning should succeed")
+		.expect("the later due retry should still be dispatched");
+
+		assert!(next_run.1, "selected work should still come from the retry queue");
+		assert_eq!(next_run.0.issue_id, runnable_issue.id);
+		assert_eq!(next_run.0.issue_identifier, runnable_issue.identifier);
+		assert_eq!(next_run.0.issue_state, "In Progress");
+		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+		assert!(
+			!retry_queue.entries.contains_key(&stale_issue.id),
+			"released stale retry entries should not remain queued"
+		);
+		assert!(
+			retry_queue.entries.contains_key(&runnable_issue.id),
+			"the dispatched retry remains queued until the daemon child is reconciled"
 		);
 	}
 
@@ -4924,7 +5110,7 @@ read_first = [{read_first}]
 				project_id: String::from("pubfi"),
 				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
-				issue_state: String::from("Todo"),
+				issue_state: String::from("In Progress"),
 				retry_project_slug: String::from("pubfi"),
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				branch_name: String::from("x/pubfi-pub-101"),
@@ -4954,6 +5140,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
+			issue_state: String::from("In Progress"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -4999,6 +5186,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
+			issue_state: String::from("In Progress"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -5198,21 +5386,22 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn candidate_selection_honors_per_state_concurrency_overrides_for_actual_issue_state() {
+	fn candidate_selection_honors_per_state_concurrency_overrides_for_projected_in_progress_state()
+	{
 		let workflow = WorkflowDocument::parse_markdown(
 			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "State-scoped workflow policy.\n")
 				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]")
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 3")
 				.replace(
 					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
-					r#"max_concurrent_agents_by_state = { "Backlog" = 1, "In Progress" = 2 }"#,
+					r#"max_concurrent_agents_by_state = { "Backlog" = 2, "In Progress" = 1 }"#,
 				),
 		)
 		.expect("workflow should parse");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 
 		state_store
-			.upsert_lease("pubfi", "issue-active", "run-1", "Backlog")
+			.upsert_lease("pubfi", "issue-active", "run-1", "In Progress")
 			.expect("existing lease should record");
 
 		let selected = orchestrator::select_issue_candidate(
@@ -5225,7 +5414,7 @@ read_first = [{read_first}]
 
 		assert!(
 			selected.is_none(),
-			"per-state admission should count the actual dispatched issue state, not only the configured in-progress state"
+			"per-state admission should count the projected in-progress state for normal dispatch"
 		);
 	}
 
@@ -5434,6 +5623,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("In Progress", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
+			issue_state: issue.state.name.clone(),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
@@ -6079,7 +6269,7 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &child_store,
 			issue_id: &issue.id,
-			preferred_issue_state: Some("Todo"),
+			preferred_issue_state: Some("In Progress"),
 			dry_run: false,
 			lease_preacquired: true,
 			preferred_dispatch_slot_fd: Some(child_guard.into_raw_fd()),
@@ -6740,6 +6930,7 @@ read_first = [{read_first}]
 		let issue = sample_issue_without_needs_attention_team_label("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
+			issue_state: String::from("In Progress"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
@@ -6849,6 +7040,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("In Progress", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
+			issue_state: issue.state.name.clone(),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
