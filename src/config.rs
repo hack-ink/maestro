@@ -80,6 +80,7 @@ impl ServiceConfig {
 
 /// Tracker-specific settings for a target project.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectTrackerConfig {
 	project_slug: String,
 	api_key: String,
@@ -233,7 +234,27 @@ mod tests {
 		);
 		let error = result.expect_err("legacy `project` key should be rejected");
 
-		assert!(error.to_string().contains("missing field `project_slug`"));
+		assert!(error.to_string().contains("unknown field `project`"));
+	}
+
+	#[test]
+	fn rejects_legacy_project_key_when_project_slug_is_present() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				project = "legacy-pubfi"
+				api_key = "lin_api_test"
+			"#,
+		);
+		let error =
+			result.expect_err("legacy `project` key should be rejected even with `project_slug`");
+
+		assert!(error.to_string().contains("unknown field `project`"));
 	}
 
 	#[test]

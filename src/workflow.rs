@@ -117,6 +117,7 @@ impl WorkflowFrontmatter {
 
 /// Tracker-facing repository policy.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowTracker {
 	provider: TrackerProvider,
 	project_slug: String,
@@ -472,7 +473,29 @@ Read `AGENTS.md` first.
 		);
 		let error = result.expect_err("legacy `project` key should be rejected");
 
-		assert!(error.to_string().contains("missing field `project_slug`"));
+		assert!(error.to_string().contains("unknown field `project`"));
+	}
+
+	#[test]
+	fn rejects_legacy_project_key_when_project_slug_is_present_in_frontmatter() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+project = "legacy-pubfi"
++++
+
+Read `AGENTS.md` first.
+			"#,
+		);
+		let error =
+			result.expect_err("legacy `project` key should be rejected even with `project_slug`");
+
+		assert!(error.to_string().contains("unknown field `project`"));
 	}
 
 	#[test]
