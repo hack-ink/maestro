@@ -5,7 +5,7 @@ workspace_root = "/absolute/path/to/hack-ink/maestro/.workspaces"
 
 [tracker]
 api_key      = "$LINEAR_API_KEY"
-project_slug = "maestro-pilot-ops-hardening-1a216b6d7100"
+project_slug = "1a216b6d7100"
 
 [agent]
 model     = "gpt-5-codex"

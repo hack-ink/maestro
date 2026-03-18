@@ -3951,14 +3951,14 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn retry_run_dry_run_accepts_issue_slug_id_variant_of_configured_project() {
-		let configured_project_slug = "maestro-pilot-ops-hardening-1a216b6d7100";
+	fn retry_run_dry_run_accepts_issue_in_configured_canonical_project() {
+		let configured_project_slug = "1a216b6d7100";
 		let (_temp_dir, config, workflow) =
 			temp_project_layout_with_tracker_project_slug(configured_project_slug);
 		let issue = sample_issue_with_project_slug_and_sort_fields(
 			"issue-1",
 			"PUB-101",
-			"1a216b6d7100",
+			configured_project_slug,
 			"In Progress",
 			&[],
 			Some(3),
@@ -3987,7 +3987,7 @@ read_first = [{read_first}]
 
 		assert!(
 			summary.is_some(),
-			"retry should accept Linear slugId variants for the same project"
+			"retry should accept issues that already report the configured canonical project slug"
 		);
 	}
 
@@ -6655,14 +6655,14 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn run_project_once_recovers_retained_workspace_for_issue_slug_id_variant() {
-		let configured_project_slug = "maestro-pilot-ops-hardening-1a216b6d7100";
+	fn run_project_once_recovers_retained_workspace_for_configured_canonical_project() {
+		let configured_project_slug = "1a216b6d7100";
 		let (_temp_dir, config, workflow) =
 			temp_project_layout_with_tracker_project_slug(configured_project_slug);
 		let issue = sample_issue_with_project_slug_and_sort_fields(
 			"issue-1",
 			"PUB-101",
-			"1a216b6d7100",
+			configured_project_slug,
 			"In Progress",
 			&[],
 			Some(3),
@@ -6670,8 +6670,8 @@ read_first = [{read_first}]
 		);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]])
-				.with_resolved_project_slug("1a216b6d7100")
-				.with_required_list_project_slug("1a216b6d7100");
+				.with_resolved_project_slug(configured_project_slug)
+				.with_required_list_project_slug(configured_project_slug);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let workspace_manager =
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
