@@ -267,6 +267,7 @@ After a process restart, recent-run history may be shallow because attempt and e
 
 - On service startup, `maestro` must inspect the configured Linear project together with deterministic `.workspaces/<ISSUE>` paths to rebuild retained workspace mappings before starting new work.
 - If Linear still shows a non-terminal `In Progress` issue and its retained workspace exists locally, `maestro` must treat that lane as a retry-style recovery candidate before selecting fresh `Todo` work.
+- Retry recovery must treat a retained issue as belonging to the configured project when the tracker payload reports either the configured `project_slug` exactly or the trailing Linear `slugId` variant of that configured value.
 - While daemon mode is running an active lane, every poll tick must refresh tracker state for the leased issue before considering any new selection.
 - While daemon mode is running an active lane, that child must keep the workflow snapshot it started with; repo-owned `WORKFLOW.md` reloads affect later decisions without restarting the in-flight child.
 - While daemon mode is supervising an active child process, stall detection must consult the child-updated `.maestro-run-activity` marker for the current `run_id` plus `attempt` instead of trusting only the daemon's process-local in-memory journal.

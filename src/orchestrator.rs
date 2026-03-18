@@ -7,6 +7,7 @@ use std::{
 	fmt::{self, Display, Formatter},
 	fs::{self, File},
 	io::ErrorKind,
+	iter,
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
 	slice, thread,
@@ -2417,11 +2418,30 @@ fn issue_passes_retry_dispatch_policy(
 ) -> crate::prelude::Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
 
-	Ok(issue.project_slug.as_deref() == Some(project.tracker().project_slug())
+	Ok(issue_matches_configured_project_slug(issue, project.tracker().project_slug())
 		&& issue.state.name == tracker_policy.in_progress_state()
 		&& !issue.has_label(tracker_policy.opt_out_label())
 		&& !issue.has_label(tracker_policy.needs_attention_label())
 		&& !issue_is_terminal_retry_guarded(issue, project, state_store)?)
+}
+
+fn issue_matches_configured_project_slug(
+	issue: &TrackerIssue,
+	configured_project_slug: &str,
+) -> bool {
+	issue.project_slug.as_deref().is_some_and(|issue_project_slug| {
+		configured_project_slug_variants(configured_project_slug)
+			.any(|candidate_slug| candidate_slug == issue_project_slug)
+	})
+}
+
+fn configured_project_slug_variants(project_slug: &str) -> impl Iterator<Item = &str> {
+	iter::once(project_slug).chain(
+		project_slug
+			.rsplit_once('-')
+			.map(|(_, trailing_slug_id)| trailing_slug_id)
+			.filter(|trailing_slug_id| *trailing_slug_id != project_slug),
+	)
 }
 
 fn issue_is_terminal_retry_guarded(
@@ -3241,9 +3261,10 @@ mod tests {
 	}
 
 	fn sample_issue(state_name: &str, labels: &[&str]) -> TrackerIssue {
-		sample_issue_with_sort_fields(
+		sample_issue_with_project_slug_and_sort_fields(
 			"issue-1",
 			"PUB-101",
+			"pubfi",
 			state_name,
 			labels,
 			Some(3),
@@ -3267,6 +3288,20 @@ mod tests {
 		priority: Option<i64>,
 		created_at: &str,
 	) -> TrackerIssue {
+		sample_issue_with_project_slug_and_sort_fields(
+			id, identifier, "pubfi", state_name, labels, priority, created_at,
+		)
+	}
+
+	fn sample_issue_with_project_slug_and_sort_fields(
+		id: &str,
+		identifier: &str,
+		project_slug: &str,
+		state_name: &str,
+		labels: &[&str],
+		priority: Option<i64>,
+		created_at: &str,
+	) -> TrackerIssue {
 		let team_labels = vec![
 			TrackerLabel {
 				id: String::from("label-manual"),
@@ -3281,7 +3316,7 @@ mod tests {
 		TrackerIssue {
 			id: id.to_owned(),
 			identifier: identifier.to_owned(),
-			project_slug: Some(String::from("pubfi")),
+			project_slug: Some(project_slug.to_owned()),
 			title: String::from("Implement orchestration"),
 			description: String::from("Body"),
 			priority,
@@ -3327,13 +3362,36 @@ mod tests {
 	}
 
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
-		temp_project_layout_with_read_first(
+		temp_project_layout_with_tracker_project_slug_and_read_first(
+			"pubfi",
+			&[("AGENTS.md", "Read me first.\n")],
+			"Follow the repository policy.\n",
+		)
+	}
+
+	fn temp_project_layout_with_tracker_project_slug(
+		project_slug: &str,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_tracker_project_slug_and_read_first(
+			project_slug,
 			&[("AGENTS.md", "Read me first.\n")],
 			"Follow the repository policy.\n",
 		)
 	}
 
 	fn temp_project_layout_with_read_first(
+		read_first_files: &[(&str, &str)],
+		workflow_body: &str,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_tracker_project_slug_and_read_first(
+			"pubfi",
+			read_first_files,
+			workflow_body,
+		)
+	}
+
+	fn temp_project_layout_with_tracker_project_slug_and_read_first(
+		project_slug: &str,
 		read_first_files: &[(&str, &str)],
 		workflow_body: &str,
 	) -> (TempDir, ServiceConfig, WorkflowDocument) {
@@ -3357,7 +3415,7 @@ mod tests {
 
 		fs::write(
 			repo_root.join("WORKFLOW.md"),
-			sample_workflow_markdown(&read_first_paths, workflow_body),
+			sample_workflow_markdown(project_slug, &read_first_paths, workflow_body),
 		)
 		.expect("workflow should exist");
 
@@ -3419,7 +3477,7 @@ mod tests {
 				workspace_root = "{}"
 
 				[tracker]
-				project_slug = "pubfi"
+				project_slug = "{project_slug}"
 				api_key = "lin_api_test"
 			"#,
 			repo_root.display(),
@@ -3432,7 +3490,11 @@ mod tests {
 		(temp_dir, config, workflow)
 	}
 
-	fn sample_workflow_markdown(read_first: &[&str], workflow_body: &str) -> String {
+	fn sample_workflow_markdown(
+		project_slug: &str,
+		read_first: &[&str],
+		workflow_body: &str,
+	) -> String {
 		let read_first =
 			read_first.iter().map(|path| format!("\"{path}\"")).collect::<Vec<_>>().join(", ");
 
@@ -3443,7 +3505,7 @@ version = 1
 
 [tracker]
 provider = "linear"
-project_slug = "pubfi"
+project_slug = "{project_slug}"
 startable_states = ["Todo"]
 
 [agent]
@@ -3490,7 +3552,7 @@ read_first = [{read_first}]
 			.expect("initial workflow load should succeed");
 
 		let updated_workflow =
-			sample_workflow_markdown(&["AGENTS.md"], "Updated workflow policy.\n")
+			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Updated workflow policy.\n")
 				.replace("max_attempts = 3", "max_attempts = 5");
 
 		fs::write(config.repo_root().join("WORKFLOW.md"), updated_workflow)
@@ -3546,12 +3608,12 @@ read_first = [{read_first}]
 	fn active_child_reconciliation_keeps_spawn_time_workflow_until_exit() {
 		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let active_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown(&["AGENTS.md"], "Spawn-time workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Spawn-time workflow policy.\n")
 				.replace("max_attempts = 3", "max_attempts = 5"),
 		)
 		.expect("workflow should parse");
 		let current_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown(&["AGENTS.md"], "Current workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Current workflow policy.\n")
 				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]"),
 		)
 		.expect("workflow should parse");
@@ -3810,6 +3872,46 @@ read_first = [{read_first}]
 		.expect("retry run should succeed");
 
 		assert!(summary.is_none(), "retry should reject issues outside the configured project");
+	}
+
+	#[test]
+	fn retry_run_dry_run_accepts_issue_slug_id_variant_of_configured_project() {
+		let configured_project_slug = "maestro-pilot-ops-hardening-1a216b6d7100";
+		let (_temp_dir, config, workflow) =
+			temp_project_layout_with_tracker_project_slug(configured_project_slug);
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"1a216b6d7100",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})
+		.expect("retry run should succeed");
+
+		assert!(
+			summary.is_some(),
+			"retry should accept Linear slugId variants for the same project"
+		);
 	}
 
 	#[test]
@@ -6146,6 +6248,39 @@ read_first = [{read_first}]
 				.is_some(),
 			"workspace mapping should be reconstructed from the retained lane"
 		);
+	}
+
+	#[test]
+	fn run_project_once_recovers_retained_workspace_for_issue_slug_id_variant() {
+		let configured_project_slug = "maestro-pilot-ops-hardening-1a216b6d7100";
+		let (_temp_dir, config, workflow) =
+			temp_project_layout_with_tracker_project_slug(configured_project_slug);
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"1a216b6d7100",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let expected_workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("recovered workspace should be created")
+			.path;
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("recovered dry run should succeed")
+				.expect("active recovered issue should be selected");
+
+		assert_eq!(summary.issue_id, issue.id);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+		assert_eq!(summary.workspace_path, expected_workspace);
 	}
 
 	#[test]

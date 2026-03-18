@@ -83,7 +83,9 @@ Notes:
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
 - `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
-- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear, whose current project slug is `maestro-pilot-ops-hardening-1a216b6d7100`.
+- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear.
+- The checked-in self-dogfood examples still use the historical full project slug `maestro-pilot-ops-hardening-1a216b6d7100`.
+- Linear issue payloads currently report the shorter `slugId` `1a216b6d7100`; `maestro` retry recovery normalizes both forms for the same project.
 
 ## Target repository contract
 
