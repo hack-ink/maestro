@@ -1391,11 +1391,14 @@ where
 				let issue_run = IssueRunPlan {
 					issue: action.issue.clone(),
 					workspace,
+					// Stalled reconciliation can refresh an issue by ID after it has already been
+					// removed from its Linear project. This path always converges via terminal
+					// failure writeback, so keep a stable fallback instead of panicking.
 					retry_project_slug: action
 						.issue
 						.project_slug
 						.clone()
-						.expect("active retry actions should carry a project slug"),
+						.unwrap_or_else(|| project.tracker().project_slug().to_owned()),
 					dispatch_mode: IssueDispatchMode::Retry,
 					attempt_number: action.run_attempt.attempt_number(),
 					run_id: action.run_attempt.run_id().to_owned(),
@@ -2806,10 +2809,10 @@ where
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 	let configured_project_slug = project.tracker().project_slug();
-	let issues = tracker.list_project_issues(configured_project_slug)?;
 	let retry_project_slug = tracker
 		.get_project_by_slug(configured_project_slug)?
 		.map_or_else(|| configured_project_slug.to_owned(), |tracker_project| tracker_project.slug);
+	let issues = tracker.list_project_issues(&retry_project_slug)?;
 	let now_unix_epoch = OffsetDateTime::now_utc().unix_timestamp();
 	let mut active_issues = Vec::new();
 
@@ -3200,6 +3203,7 @@ mod tests {
 		listed_issues: Vec<TrackerIssue>,
 		project_exists: bool,
 		resolved_project_slug: Option<String>,
+		required_list_project_slug: Option<String>,
 		project_lookup_error: RefCell<Option<String>>,
 		refresh_snapshots: RefCell<Vec<Vec<TrackerIssue>>>,
 		refresh_error: RefCell<Option<String>>,
@@ -3228,6 +3232,7 @@ mod tests {
 				listed_issues,
 				project_exists,
 				resolved_project_slug: None,
+				required_list_project_slug: None,
 				project_lookup_error: RefCell::new(None),
 				refresh_snapshots: RefCell::new(refresh_snapshots),
 				refresh_error: RefCell::new(None),
@@ -3255,6 +3260,12 @@ mod tests {
 			self
 		}
 
+		fn with_required_list_project_slug(mut self, project_slug: &str) -> Self {
+			self.required_list_project_slug = Some(project_slug.to_owned());
+
+			self
+		}
+
 		fn with_project_lookup_error(self, message: &str) -> Self {
 			*self.project_lookup_error.borrow_mut() = Some(message.to_owned());
 
@@ -3262,7 +3273,13 @@ mod tests {
 		}
 	}
 	impl IssueTracker for FakeTracker {
-		fn list_project_issues(&self, _project_slug: &str) -> Result<Vec<TrackerIssue>> {
+		fn list_project_issues(&self, project_slug: &str) -> Result<Vec<TrackerIssue>> {
+			if let Some(required_project_slug) = &self.required_list_project_slug
+				&& project_slug != required_project_slug
+			{
+				return Ok(Vec::new());
+			}
+
 			Ok(self.listed_issues.clone())
 		}
 
@@ -6225,6 +6242,75 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn stalled_run_reconciliation_tolerates_missing_project_slug() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager = crate::workspace::WorkspaceManager::new(
+			"pubfi",
+			config.repo_root(),
+			config.workspace_root(),
+		);
+		let run_id = "run-stalled-no-project";
+		let workspace_path = config.workspace_root().join("PUB-101");
+		let mut issue = sample_issue("In Progress", &[]);
+
+		issue.project_slug = None;
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace mapping should record");
+
+		let action = orchestrator::ActiveRunReconciliation {
+			issue: issue.clone(),
+			run_attempt: state_store
+				.run_attempt(run_id)
+				.expect("run attempt query should succeed")
+				.expect("run attempt should exist"),
+			workspace_mapping: state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace query should succeed"),
+			disposition: orchestrator::ActiveRunDisposition::Stalled {
+				idle_for: ACTIVE_RUN_IDLE_TIMEOUT + Duration::from_secs(1),
+			},
+			workflow: workflow.clone(),
+		};
+
+		orchestrator::apply_active_run_reconciliation(
+			&tracker,
+			&config,
+			&state_store,
+			&workspace_manager,
+			vec![action],
+		)
+		.expect("stalled reconciliation should still converge without a project slug");
+
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		);
+		assert_eq!(
+			state_store
+				.run_attempt(run_id)
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"stalled"
+		);
+		assert!(tracker.comments.borrow().iter().any(|comment| {
+			comment.contains("stalled_run_detected") && comment.contains("needs attention")
+		}));
+	}
+
+	#[test]
 	fn stalled_run_reconciliation_preserves_retry_budget_marker_from_retained_workspace() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![]);
@@ -6584,7 +6670,8 @@ read_first = [{read_first}]
 		);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]])
-				.with_resolved_project_slug("1a216b6d7100");
+				.with_resolved_project_slug("1a216b6d7100")
+				.with_required_list_project_slug("1a216b6d7100");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let workspace_manager =
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
