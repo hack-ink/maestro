@@ -929,7 +929,6 @@ struct ScopeArgs {
 struct TransitionArgs {
 	#[serde(flatten)]
 	scope: ScopeArgs,
-	#[serde(alias = "state_name")]
 	state: String,
 }
 
@@ -952,7 +951,6 @@ struct ReviewHandoffArgs {
 struct LabelArgs {
 	#[serde(flatten)]
 	scope: ScopeArgs,
-	#[serde(alias = "label_name")]
 	label: String,
 }
 
@@ -1436,6 +1434,28 @@ Use the tracker tools.
 	}
 
 	#[test]
+	fn rejects_legacy_state_name_argument() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state_name": "In Progress" }),
+		);
+
+		assert!(!response.success);
+		assert!(tracker.state_updates.borrow().is_empty());
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: String::from("Invalid `issue.transition` arguments: missing field `state`"),
+			}]
+		);
+	}
+
+	#[test]
 	fn rejects_success_transition_even_when_success_state_is_startable() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
@@ -1610,6 +1630,28 @@ Use the tracker tools.
 
 		assert!(response.success);
 		assert_eq!(tracker.label_updates.borrow().as_slice(), [vec![String::from("label-needs")]]);
+	}
+
+	#[test]
+	fn rejects_legacy_label_name_argument() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label_name": "maestro:needs-attention" }),
+		);
+
+		assert!(!response.success);
+		assert!(tracker.label_updates.borrow().is_empty());
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: String::from("Invalid `issue.label.add` arguments: missing field `label`"),
+			}]
+		);
 	}
 
 	#[test]

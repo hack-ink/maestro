@@ -81,7 +81,6 @@ impl ServiceConfig {
 /// Tracker-specific settings for a target project.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ProjectTrackerConfig {
-	#[serde(alias = "project")]
 	project_slug: String,
 	api_key: String,
 }
@@ -217,6 +216,24 @@ mod tests {
 
 		assert_eq!(config.workspace_root(), Path::new("/tmp/workspaces"));
 		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
+	}
+
+	#[test]
+	fn rejects_legacy_project_alias_in_service_config() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project = "pubfi"
+				api_key = "lin_api_test"
+			"#,
+		);
+		let error = result.expect_err("legacy `project` key should be rejected");
+
+		assert!(error.to_string().contains("missing field `project_slug`"));
 	}
 
 	#[test]

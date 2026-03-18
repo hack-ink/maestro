@@ -119,7 +119,6 @@ impl WorkflowFrontmatter {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowTracker {
 	provider: TrackerProvider,
-	#[serde(alias = "project")]
 	project_slug: String,
 	#[serde(default = "default_startable_states")]
 	startable_states: Vec<String>,
@@ -454,6 +453,26 @@ Read `AGENTS.md` first.
 			WorkflowDocument::from_path(file.path()).expect("workflow should load from path");
 
 		assert_eq!(document.frontmatter().tracker().project_slug(), "pubfi");
+	}
+
+	#[test]
+	fn rejects_legacy_project_alias_in_workflow_frontmatter() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project = "pubfi"
++++
+
+Read `AGENTS.md` first.
+			"#,
+		);
+		let error = result.expect_err("legacy `project` key should be rejected");
+
+		assert!(error.to_string().contains("missing field `project_slug`"));
 	}
 
 	#[test]
