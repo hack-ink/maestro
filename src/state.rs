@@ -3,7 +3,7 @@
 #[cfg(unix)] use std::os::fd::{AsRawFd, FromRawFd};
 use std::{
 	cmp::Ordering,
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	fs::{self, File, OpenOptions, TryLockError},
 	io::{Error, ErrorKind},
 	path::{Path, PathBuf},
@@ -17,7 +17,7 @@ use crate::prelude::{Result, eyre};
 
 pub(crate) const RUN_ACTIVITY_MARKER_FILE: &str = ".maestro-run-activity";
 
-const DISPATCH_SLOT_LOCK_FILE: &str = ".maestro-dispatch-slot.lock";
+const DISPATCH_SLOT_LOCK_FILE_PREFIX: &str = ".maestro-dispatch-slot";
 
 /// Local runtime store for leases, attempts, workspaces, and protocol events.
 #[derive(Default)]
@@ -40,12 +40,18 @@ impl StateStore {
 		&self,
 		project_id: &str,
 		workspace_root: impl AsRef<Path>,
+		slot_limit: u32,
 	) -> Result<()> {
 		let mut state = self.lock()?;
 
-		state
-			.dispatch_lock_roots
-			.insert(project_id.to_owned(), workspace_root.as_ref().to_path_buf());
+		state.dispatch_slot_configs.insert(
+			project_id.to_owned(),
+			DispatchSlotConfig {
+				root: workspace_root.as_ref().to_path_buf(),
+				slot_limit: usize::try_from(slot_limit)
+					.map_err(|_error| eyre::eyre!("dispatch slot limit overflowed usize"))?,
+			},
+		);
 
 		Ok(())
 	}
@@ -86,27 +92,50 @@ impl StateStore {
 		if state.leases.values().any(|lease| lease.issue_id == issue_id) {
 			return Ok(false);
 		}
-		if !state.dispatch_slot_guards.contains_key(project_id)
-			&& let Some(dispatch_lock_root) = state.dispatch_lock_roots.get(project_id)
-		{
-			fs::create_dir_all(dispatch_lock_root)?;
 
-			let lock_file = OpenOptions::new()
-				.read(true)
-				.write(true)
-				.create(true)
-				.truncate(false)
-				.open(dispatch_lock_root.join(DISPATCH_SLOT_LOCK_FILE))?;
+		if let Some(dispatch_slot_config) = state.dispatch_slot_configs.get(project_id).cloned() {
+			fs::create_dir_all(&dispatch_slot_config.root)?;
 
-			match lock_file.try_lock() {
-				Ok(()) => {
-					state
-						.dispatch_slot_guards
-						.insert(project_id.to_owned(), DispatchSlotGuard { _lock_file: lock_file });
-				},
-				Err(TryLockError::WouldBlock) => return Ok(false),
-				Err(TryLockError::Error(error)) => return Err(error.into()),
+			let held_slot_indexes = state
+				.dispatch_slot_guards
+				.values()
+				.filter(|guard| guard.project_id == project_id)
+				.map(|guard| guard.slot_index)
+				.collect::<HashSet<_>>();
+			let mut acquired_guard = None;
+
+			for slot_index in 0..dispatch_slot_config.slot_limit {
+				if held_slot_indexes.contains(&slot_index) {
+					continue;
+				}
+
+				let lock_file = OpenOptions::new()
+					.read(true)
+					.write(true)
+					.create(true)
+					.truncate(false)
+					.open(dispatch_slot_lock_path(&dispatch_slot_config.root, slot_index))?;
+
+				match lock_file.try_lock() {
+					Ok(()) => {
+						acquired_guard = Some(DispatchSlotGuard {
+							project_id: project_id.to_owned(),
+							slot_index,
+							lock_file,
+						});
+
+						break;
+					},
+					Err(TryLockError::WouldBlock) => continue,
+					Err(TryLockError::Error(error)) => return Err(error.into()),
+				}
 			}
+
+			let Some(dispatch_slot_guard) = acquired_guard else {
+				return Ok(false);
+			};
+
+			state.dispatch_slot_guards.insert(issue_id.to_owned(), dispatch_slot_guard);
 		}
 
 		state.leases.insert(
@@ -147,38 +176,38 @@ impl StateStore {
 	/// Remove the active lease for one issue.
 	pub fn clear_lease(&self, issue_id: &str) -> Result<()> {
 		let mut state = self.lock()?;
-		let Some(lease) = state.leases.remove(issue_id) else {
-			return Ok(());
-		};
 
-		if !state.leases.values().any(|active| active.project_id() == lease.project_id()) {
-			state.dispatch_slot_guards.remove(lease.project_id());
+		if state.leases.remove(issue_id).is_none() {
+			return Ok(());
 		}
+
+		state.dispatch_slot_guards.remove(issue_id);
 
 		Ok(())
 	}
 
 	/// Drop the current process-local dispatch-slot guard while keeping the local lease record.
-	pub fn release_dispatch_slot(&self, project_id: &str) -> Result<()> {
+	pub fn release_dispatch_slot(&self, issue_id: &str) -> Result<()> {
 		let mut state = self.lock()?;
 
-		state.dispatch_slot_guards.remove(project_id);
+		state.dispatch_slot_guards.remove(issue_id);
 
 		Ok(())
 	}
 
 	/// Duplicate the held dispatch-slot lock so a spawned child can inherit it across exec.
 	#[cfg(unix)]
-	pub fn clone_dispatch_slot_for_child(&self, project_id: &str) -> Result<File> {
+	pub fn clone_dispatch_slot_for_child(&self, issue_id: &str) -> Result<(File, usize)> {
 		let state = self.lock()?;
-		let guard = state.dispatch_slot_guards.get(project_id).ok_or_else(|| {
-			eyre::eyre!("project `{project_id}` does not hold a dispatch-slot guard")
-		})?;
-		let child_lock = guard._lock_file.try_clone()?;
+		let guard = state
+			.dispatch_slot_guards
+			.get(issue_id)
+			.ok_or_else(|| eyre::eyre!("issue `{issue_id}` does not hold a dispatch-slot guard"))?;
+		let child_lock = guard.lock_file.try_clone()?;
 
 		clear_close_on_exec(&child_lock)?;
 
-		Ok(child_lock)
+		Ok((child_lock, guard.slot_index))
 	}
 
 	/// Adopt an inherited dispatch-slot fd and local lease for a daemon child process.
@@ -190,13 +219,19 @@ impl StateStore {
 		run_id: &str,
 		issue_state: &str,
 		dispatch_slot_fd: i32,
+		dispatch_slot_index: usize,
 	) -> Result<()> {
 		let lock_file = unsafe { File::from_raw_fd(dispatch_slot_fd) };
 		let mut state = self.lock()?;
 
-		state
-			.dispatch_slot_guards
-			.insert(project_id.to_owned(), DispatchSlotGuard { _lock_file: lock_file });
+		state.dispatch_slot_guards.insert(
+			issue_id.to_owned(),
+			DispatchSlotGuard {
+				project_id: project_id.to_owned(),
+				slot_index: dispatch_slot_index,
+				lock_file,
+			},
+		);
 		state.leases.insert(
 			issue_id.to_owned(),
 			IssueLease {
@@ -709,8 +744,16 @@ impl RunActivityMarker {
 	}
 }
 
+#[derive(Clone)]
+struct DispatchSlotConfig {
+	root: PathBuf,
+	slot_limit: usize,
+}
+
 struct DispatchSlotGuard {
-	_lock_file: File,
+	project_id: String,
+	slot_index: usize,
+	lock_file: File,
 }
 
 #[derive(Default)]
@@ -719,7 +762,7 @@ struct StateData {
 	run_attempts: HashMap<String, RunAttemptRecord>,
 	events: HashMap<String, Vec<ProtocolEventRecord>>,
 	workspaces: HashMap<String, WorkspaceMappingRecord>,
-	dispatch_lock_roots: HashMap<String, PathBuf>,
+	dispatch_slot_configs: HashMap<String, DispatchSlotConfig>,
 	dispatch_slot_guards: HashMap<String, DispatchSlotGuard>,
 }
 impl StateData {
@@ -954,6 +997,10 @@ pub(crate) fn read_run_activity_marker_snapshot(
 	}))
 }
 
+fn dispatch_slot_lock_path(root: &Path, slot_index: usize) -> PathBuf {
+	root.join(format!("{DISPATCH_SLOT_LOCK_FILE_PREFIX}.{slot_index}.lock"))
+}
+
 fn write_run_activity_marker_at(
 	workspace_path: &Path,
 	run_id: &str,
@@ -1136,17 +1183,21 @@ mod tests {
 	}
 
 	#[test]
-	fn shared_dispatch_slot_blocks_across_process_local_stores() {
+	fn shared_dispatch_slots_honor_configured_limit_across_process_local_stores() {
 		let temp_dir = TempDir::new().expect("tempdir should create");
 		let store_one = StateStore::open_in_memory().expect("first store should open");
 		let store_two = StateStore::open_in_memory().expect("second store should open");
+		let store_three = StateStore::open_in_memory().expect("third store should open");
 
 		store_one
-			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
 			.expect("first store should configure dispatch slot root");
 		store_two
-			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
 			.expect("second store should configure dispatch slot root");
+		store_three
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
+			.expect("third store should configure dispatch slot root");
 
 		assert!(
 			store_one
@@ -1154,17 +1205,22 @@ mod tests {
 				.expect("first shared lease acquisition should succeed")
 		);
 		assert!(
-			!store_two
+			store_two
 				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
-				.expect("second store should observe the shared slot as busy")
+				.expect("second store should acquire the second shared slot")
+		);
+		assert!(
+			!store_three
+				.try_acquire_lease("pubfi", "PUB-103", "run-3", IN_PROGRESS_STATE)
+				.expect("third store should observe the configured shared slots as busy")
 		);
 
 		store_one.clear_lease("PUB-101").expect("shared lease should clear");
 
 		assert!(
-			store_two
-				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
-				.expect("shared slot should reopen after the first lease clears")
+			store_three
+				.try_acquire_lease("pubfi", "PUB-103", "run-3", IN_PROGRESS_STATE)
+				.expect("shared slot should reopen after one of the configured leases clears")
 		);
 	}
 
@@ -1177,13 +1233,13 @@ mod tests {
 		let contender_store = StateStore::open_in_memory().expect("contender store should open");
 
 		parent_store
-			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 1)
 			.expect("parent store should configure dispatch slot root");
 		child_store
-			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 1)
 			.expect("child store should configure dispatch slot root");
 		contender_store
-			.configure_dispatch_slot_root("pubfi", temp_dir.path())
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 1)
 			.expect("contender store should configure dispatch slot root");
 
 		assert!(
@@ -1192,8 +1248,8 @@ mod tests {
 				.expect("parent should acquire the shared slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child("pubfi")
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child("PUB-101")
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -1203,10 +1259,11 @@ mod tests {
 				"run-1",
 				IN_PROGRESS_STATE,
 				child_guard.into_raw_fd(),
+				child_slot_index,
 			)
 			.expect("child should adopt the inherited lease guard");
 		parent_store
-			.release_dispatch_slot("pubfi")
+			.release_dispatch_slot("PUB-101")
 			.expect("parent should release its local guard after handoff");
 
 		assert!(

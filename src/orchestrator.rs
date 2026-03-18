@@ -48,6 +48,7 @@ pub(crate) struct RunOnceRequest<'a> {
 	pub(crate) preferred_issue_state: Option<&'a str>,
 	pub(crate) preferred_lease_acquired: bool,
 	pub(crate) preferred_dispatch_slot_fd: Option<i32>,
+	pub(crate) preferred_dispatch_slot_index: Option<usize>,
 	pub(crate) preferred_dispatch_mode: Option<IssueDispatchMode>,
 	pub(crate) preferred_run_id: Option<&'a str>,
 	pub(crate) preferred_attempt_number: Option<i64>,
@@ -100,6 +101,7 @@ struct RunCycleRequest<'a> {
 	preferred_issue_state: Option<&'a str>,
 	preferred_lease_acquired: bool,
 	preferred_dispatch_slot_fd: Option<i32>,
+	preferred_dispatch_slot_index: Option<usize>,
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -116,6 +118,7 @@ struct SpawnRunOnceChildRequest<'a> {
 	preferred_retry_budget_base: i64,
 	workflow: &'a WorkflowDocument,
 	dispatch_slot_handoff: Option<&'a File>,
+	dispatch_slot_index_handoff: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -362,6 +365,7 @@ struct TargetIssueRunContext<'a, T> {
 	dry_run: bool,
 	lease_preacquired: bool,
 	preferred_dispatch_slot_fd: Option<i32>,
+	preferred_dispatch_slot_index: Option<usize>,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -374,7 +378,7 @@ enum RetryKind {
 }
 
 enum RetryDispatchDecision {
-	Blocked { issue_id: String },
+	Blocked { excluded_issue_ids: Vec<String> },
 	Dispatch(RunSummary),
 	Continue,
 }
@@ -452,6 +456,7 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		preferred_issue_state: request.preferred_issue_state,
 		preferred_lease_acquired: request.preferred_lease_acquired,
 		preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
+		preferred_dispatch_slot_index: request.preferred_dispatch_slot_index,
 		preferred_dispatch_mode: request.preferred_dispatch_mode,
 		preferred_run_identity,
 		preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -871,7 +876,11 @@ where
 
 	match next_run {
 		Some((summary, from_retry_queue)) => {
-			state_store.configure_dispatch_slot_root(project.id(), project.workspace_root())?;
+			state_store.configure_dispatch_slot_root(
+				project.id(),
+				project.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)?;
 
 			validate_review_handoff_runtime(false)?;
 
@@ -903,9 +912,16 @@ where
 			)?;
 
 			#[cfg(unix)]
-			let dispatch_slot_handoff = Some(state_store.clone_dispatch_slot_for_child(project.id())?);
+			let (dispatch_slot_handoff_file, dispatch_slot_index) =
+				state_store.clone_dispatch_slot_for_child(&summary.issue_id)?;
+			#[cfg(unix)]
+			let dispatch_slot_handoff = Some(dispatch_slot_handoff_file);
 			#[cfg(not(unix))]
 			let dispatch_slot_handoff: Option<File> = None;
+			#[cfg(unix)]
+			let dispatch_slot_index_handoff = Some(dispatch_slot_index);
+			#[cfg(not(unix))]
+			let dispatch_slot_index_handoff: Option<usize> = None;
 			let mut child = spawn_run_once_child(SpawnRunOnceChildRequest {
 				config_path,
 				preferred_issue_id: summary.issue_id.as_str(),
@@ -916,6 +932,7 @@ where
 				preferred_retry_budget_base: daemon_spawn_state.retry_budget_base,
 				workflow,
 				dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
+				dispatch_slot_index_handoff,
 			})
 			.inspect_err(|_error| {
 				let _ = state_store.update_run_status(&summary.run_id, "failed");
@@ -981,14 +998,16 @@ where
 {
 	match plan_due_retry_run(retry_queue, tracker, project, workflow, state_store)? {
 		RetryDispatchDecision::Dispatch(summary) => Ok(Some((summary, true))),
-		RetryDispatchDecision::Blocked { issue_id } => {
+		RetryDispatchDecision::Blocked { excluded_issue_ids } => {
+			let excluded_issue_ids =
+				excluded_issue_ids.iter().map(String::as_str).collect::<Vec<_>>();
 			let issue_run = plan_project_issue_run_with_exclusions(
 				tracker,
 				project,
 				workflow,
 				state_store,
 				true,
-				&[issue_id.as_str()],
+				&excluded_issue_ids,
 			)?;
 
 			Ok(issue_run
@@ -1084,6 +1103,9 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 	if let Some(dispatch_slot_handoff) = request.dispatch_slot_handoff {
 		command.args(["--dispatch-slot-fd", &dispatch_slot_handoff.as_raw_fd().to_string()]);
 	}
+	if let Some(dispatch_slot_index_handoff) = request.dispatch_slot_index_handoff {
+		command.args(["--dispatch-slot-index", &dispatch_slot_index_handoff.to_string()]);
+	}
 
 	let child = command.spawn()?;
 
@@ -1100,16 +1122,21 @@ fn plan_due_retry_run<T>(
 where
 	T: IssueTracker,
 {
-	let Some(first_entry) = retry_queue.next_entry().cloned() else {
-		return Ok(RetryDispatchDecision::Continue);
-	};
 	let now = Instant::now();
 
-	if now < first_entry.ready_at {
+	loop {
+		let Some(first_entry) = retry_queue.next_entry().cloned() else {
+			return Ok(RetryDispatchDecision::Continue);
+		};
+
+		if now >= first_entry.ready_at {
+			break;
+		}
+
 		let Some(issue) = refresh_issue(tracker, &first_entry.issue_id)? else {
 			retry_queue.release(&first_entry.issue_id);
 
-			return Ok(RetryDispatchDecision::Continue);
+			continue;
 		};
 
 		if !issue_passes_retry_retention_policy(
@@ -1121,7 +1148,7 @@ where
 		)? {
 			retry_queue.release(&first_entry.issue_id);
 
-			return Ok(RetryDispatchDecision::Continue);
+			continue;
 		}
 
 		tracing::debug!(
@@ -1131,7 +1158,9 @@ where
 			"Retry queue is holding the project claim until the next retry is due."
 		);
 
-		return Ok(RetryDispatchDecision::Blocked { issue_id: first_entry.issue_id.clone() });
+		return Ok(RetryDispatchDecision::Blocked {
+			excluded_issue_ids: queued_retry_issue_ids(retry_queue),
+		});
 	}
 
 	let mut blocked_issue_id = None;
@@ -1151,6 +1180,7 @@ where
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -1171,9 +1201,13 @@ where
 		return Ok(RetryDispatchDecision::Dispatch(summary));
 	}
 
-	Ok(blocked_issue_id.map_or(RetryDispatchDecision::Continue, |issue_id| {
-		RetryDispatchDecision::Blocked { issue_id }
+	Ok(blocked_issue_id.map_or(RetryDispatchDecision::Continue, |_issue_id| {
+		RetryDispatchDecision::Blocked { excluded_issue_ids: queued_retry_issue_ids(retry_queue) }
 	}))
+}
+
+fn queued_retry_issue_ids(retry_queue: &RetryQueue) -> Vec<String> {
+	retry_queue.ordered_entries().into_iter().map(|entry| entry.issue_id).collect()
 }
 
 fn retry_entry_is_temporarily_blocked<T>(
@@ -1731,6 +1765,7 @@ fn run_configured_cycle(
 			dry_run: request.dry_run,
 			lease_preacquired: request.preferred_lease_acquired,
 			preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
+			preferred_dispatch_slot_index: request.preferred_dispatch_slot_index,
 			dispatch_mode: request.preferred_dispatch_mode.unwrap_or(IssueDispatchMode::Retry),
 			preferred_run_identity: request.preferred_run_identity,
 			preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -1805,7 +1840,11 @@ where
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 
-	state_store.configure_dispatch_slot_root(project.id(), project.workspace_root())?;
+	state_store.configure_dispatch_slot_root(
+		project.id(),
+		project.workspace_root(),
+		workflow.frontmatter().execution().max_concurrent_agents(),
+	)?;
 
 	let recovered_state =
 		recover_runtime_state_from_tracker_and_workspaces(tracker, project, workflow, state_store)?;
@@ -1887,36 +1926,14 @@ where
 		context.project.workspace_root(),
 	);
 
-	context
-		.state_store
-		.configure_dispatch_slot_root(context.project.id(), context.project.workspace_root())?;
+	context.state_store.configure_dispatch_slot_root(
+		context.project.id(),
+		context.project.workspace_root(),
+		context.workflow.frontmatter().execution().max_concurrent_agents(),
+	)?;
 
 	if context.lease_preacquired && !context.dry_run {
-		let preferred_run_identity = context.preferred_run_identity.ok_or_else(|| {
-			eyre::eyre!("daemon child lease handoff requires a planned run identifier")
-		})?;
-		let preferred_issue_state = context.preferred_issue_state.ok_or_else(|| {
-			eyre::eyre!("daemon child lease handoff requires a planned issue state")
-		})?;
-		let dispatch_slot_fd = context.preferred_dispatch_slot_fd.ok_or_else(|| {
-			eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot fd")
-		})?;
-
-		#[cfg(unix)]
-		{
-			context.state_store.adopt_preacquired_lease(
-				context.project.id(),
-				context.issue_id,
-				preferred_run_identity.run_id,
-				preferred_issue_state,
-				dispatch_slot_fd,
-			)?;
-		}
-
-		#[cfg(not(unix))]
-		{
-			eyre::bail!("daemon child lease handoff is only supported on unix targets");
-		}
+		adopt_preacquired_target_issue_lease(&context)?;
 	}
 	if !context.lease_preacquired {
 		recover_runtime_state_from_tracker_and_workspaces(
@@ -1994,6 +2011,45 @@ where
 		issue_run,
 		context.dry_run,
 	)
+}
+
+fn adopt_preacquired_target_issue_lease<T>(
+	context: &TargetIssueRunContext<'_, T>,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	let preferred_run_identity = context.preferred_run_identity.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires a planned run identifier")
+	})?;
+	let preferred_issue_state = context
+		.preferred_issue_state
+		.ok_or_else(|| eyre::eyre!("daemon child lease handoff requires a planned issue state"))?;
+	let dispatch_slot_fd = context.preferred_dispatch_slot_fd.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot fd")
+	})?;
+	let dispatch_slot_index = context.preferred_dispatch_slot_index.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot index")
+	})?;
+
+	#[cfg(unix)]
+	{
+		context.state_store.adopt_preacquired_lease(
+			context.project.id(),
+			context.issue_id,
+			preferred_run_identity.run_id,
+			preferred_issue_state,
+			dispatch_slot_fd,
+			dispatch_slot_index,
+		)?;
+	}
+
+	#[cfg(not(unix))]
+	{
+		eyre::bail!("daemon child lease handoff is only supported on unix targets");
+	}
+
+	Ok(())
 }
 
 fn prepare_issue_run<T>(
@@ -3954,6 +4010,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4170,6 +4227,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4198,6 +4256,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4229,6 +4288,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4268,6 +4328,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4309,6 +4370,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4345,6 +4407,7 @@ read_first = [{read_first}]
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4744,7 +4807,8 @@ read_first = [{read_first}]
 
 		assert!(matches!(
 			decision,
-			orchestrator::RetryDispatchDecision::Blocked { issue_id } if issue_id == issue.id
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
 		));
 		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
 	}
@@ -4781,7 +4845,8 @@ read_first = [{read_first}]
 
 		assert!(matches!(
 			decision,
-			orchestrator::RetryDispatchDecision::Blocked { issue_id } if issue_id == issue.id
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
 		));
 		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
 	}
@@ -4842,6 +4907,97 @@ read_first = [{read_first}]
 		assert!(
 			retry_queue.entries.contains_key(&retry_issue.id),
 			"the blocked retry claim should remain queued while another lane fills capacity"
+		);
+	}
+
+	#[test]
+	fn blocked_future_retry_excludes_all_queued_retries_before_normal_fallback() {
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
+		)
+		.expect("workflow should parse");
+		let first_future_retry = sample_issue_with_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let second_future_retry = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"In Progress",
+			&[],
+			Some(2),
+			"2026-03-13T04:17:17.133Z",
+		);
+		let todo_issue = sample_issue_with_sort_fields(
+			"issue-3",
+			"PUB-103",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:18:17.133Z",
+		);
+		let listed_issues =
+			vec![first_future_retry.clone(), second_future_retry.clone(), todo_issue.clone()];
+		let tracker = FakeTracker::with_refresh_snapshots(
+			listed_issues.clone(),
+			vec![listed_issues.clone(), listed_issues.clone(), listed_issues],
+		);
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let retained_workspace = workspace_manager.plan_for_issue(&second_future_retry.identifier);
+
+		fs::create_dir_all(&retained_workspace.path)
+			.expect("retained future retry workspace should exist for recovery");
+
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: first_future_retry.id.clone(),
+			retry_project_slug: first_future_retry
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: second_future_retry.id.clone(),
+			retry_project_slug: second_future_retry
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(120),
+		});
+
+		let next_run = orchestrator::plan_next_daemon_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("daemon planning should succeed")
+		.expect("normal work should still fill open capacity");
+
+		assert!(!next_run.1, "alternate work should not dispatch from the retry queue");
+		assert_eq!(next_run.0.issue_id, todo_issue.id);
+		assert_eq!(next_run.0.issue_identifier, todo_issue.identifier);
+		assert_eq!(next_run.0.issue_state, "In Progress");
+		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Normal);
+		assert!(
+			retry_queue.entries.contains_key(&first_future_retry.id)
+				&& retry_queue.entries.contains_key(&second_future_retry.id),
+			"all queued retries should stay queued instead of bypassing their ready_at through retained recovery"
 		);
 	}
 
@@ -5086,7 +5242,8 @@ read_first = [{read_first}]
 
 		assert!(matches!(
 			decision,
-			orchestrator::RetryDispatchDecision::Blocked { issue_id } if issue_id == issue.id
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
 		));
 		assert!(
 			retry_queue.entries.contains_key(&issue.id),
@@ -6098,10 +6255,18 @@ read_first = [{read_first}]
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
 
 		parent_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("parent dispatch-slot root should configure");
 		child_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("child dispatch-slot root should configure");
 
 		assert!(
@@ -6110,8 +6275,8 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child(config.id())
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -6121,6 +6286,7 @@ read_first = [{read_first}]
 				"planned-run",
 				"In Progress",
 				child_guard.into_raw_fd(),
+				child_slot_index,
 			)
 			.expect("child should adopt the inherited lease guard");
 
@@ -6170,10 +6336,18 @@ read_first = [{read_first}]
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
 
 		parent_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("parent dispatch-slot root should configure");
 		child_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("child dispatch-slot root should configure");
 
 		assert!(
@@ -6182,8 +6356,8 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child(config.id())
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -6193,6 +6367,7 @@ read_first = [{read_first}]
 				"planned-run",
 				"In Progress",
 				child_guard.into_raw_fd(),
+				child_slot_index,
 			)
 			.expect("child should adopt the inherited lease guard");
 		child_store
@@ -6243,10 +6418,18 @@ read_first = [{read_first}]
 		let child_store = StateStore::open_in_memory().expect("child state store should open");
 
 		parent_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("parent dispatch-slot root should configure");
 		child_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("child dispatch-slot root should configure");
 
 		assert!(
@@ -6255,8 +6438,8 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child(config.id())
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -6273,6 +6456,7 @@ read_first = [{read_first}]
 			dry_run: false,
 			lease_preacquired: true,
 			preferred_dispatch_slot_fd: Some(child_guard.into_raw_fd()),
+			preferred_dispatch_slot_index: Some(child_slot_index),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 				run_id: "planned-run",

@@ -94,6 +94,9 @@ struct RunCommand {
 	/// Reuse the daemon-held dispatch-slot fd for an issue-targeted child run.
 	#[arg(long, value_name = "FD", hide = true, requires = "issue_id")]
 	dispatch_slot_fd: Option<i32>,
+	/// Reuse the daemon-held dispatch-slot index for an issue-targeted child run.
+	#[arg(long, value_name = "INDEX", hide = true, requires = "issue_id")]
+	dispatch_slot_index: Option<usize>,
 	/// Reuse a daemon-planned run identifier for an issue-targeted run.
 	#[arg(long, value_name = "RUN_ID", hide = true, requires = "issue_id")]
 	run_id: Option<String>,
@@ -128,6 +131,7 @@ impl RunCommand {
 			preferred_issue_state: self.issue_state.as_deref(),
 			preferred_lease_acquired: self.lease_preacquired,
 			preferred_dispatch_slot_fd: self.dispatch_slot_fd,
+			preferred_dispatch_slot_index: self.dispatch_slot_index,
 			preferred_dispatch_mode: self.dispatch_mode.map(Into::into),
 			preferred_run_id: self.run_id.as_deref(),
 			preferred_attempt_number: self.attempt_number,
@@ -246,6 +250,7 @@ mod tests {
 				issue_state: None,
 				lease_preacquired: false,
 				dispatch_slot_fd: None,
+				dispatch_slot_index: None,
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
@@ -269,6 +274,7 @@ mod tests {
 				issue_state: None,
 				lease_preacquired: false,
 				dispatch_slot_fd: None,
+				dispatch_slot_index: None,
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
@@ -310,6 +316,7 @@ mod tests {
 				issue_state: Some(_),
 				lease_preacquired: false,
 				dispatch_slot_fd: None,
+				dispatch_slot_index: None,
 				dispatch_mode: Some(RunIssueDispatchMode::Normal),
 				run_id: Some(_),
 				attempt_number: Some(2),
