@@ -111,7 +111,7 @@
     "blockers": [],
     "evidence": [
       "2026-03-18: Retained retry recovery was skipping XY-156 because the configured self-dogfood project slug used the historical full slug while refreshed Linear issue payloads reported only the trailing slugId variant for the same project.",
-      "2026-03-18: src/orchestrator.rs now normalizes the configured full project slug against the trailing Linear slugId when matching retained retry issues, while still rejecting unrelated projects.",
+      "2026-03-18: src/orchestrator.rs now resolves the configured tracker project first and matches retained retry issues against the canonical returned Linear slugId, while still rejecting unrelated projects.",
       "2026-03-18: Regression coverage now includes retry_run_dry_run_accepts_issue_slug_id_variant_of_configured_project and run_project_once_recovers_retained_workspace_for_issue_slug_id_variant alongside the existing different-project rejection test.",
       "2026-03-18: docs/guide/pilot.md, docs/spec/system_workflow_contract.md, and docs/spec/system_maestro_runtime.md now describe the same full-slug versus slugId compatibility rule.",
       "2026-03-18: Local verification passed for cargo make fmt-check, cargo make lint, and cargo make test."
@@ -122,7 +122,7 @@
       "authority_issue": "XY-165",
       "blocking_issue": "XY-156",
       "workspace_branch": "x/maestro-xy-165",
-      "resolved_gap": "Retained retry recovery must accept the historical full self-dogfood slug and the trailing Linear slugId as the same project."
+      "resolved_gap": "Retained retry recovery must resolve the configured self-dogfood project to its canonical Linear slugId before matching retained issues."
     }
   }
 }
