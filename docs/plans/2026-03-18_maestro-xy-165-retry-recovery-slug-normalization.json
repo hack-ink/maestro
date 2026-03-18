@@ -1,0 +1,128 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-165-retry-recovery-slug-normalization-2026-03-18",
+    "goal": "Implement XY-165 by standardizing Maestro self-dogfood project identity on the canonical Linear slugId and keeping retained retry recovery aligned with that canonical project when rebuilding retained lanes.",
+    "success_criteria": [
+      "Checked-in self-dogfood config surfaces use the canonical Linear slugId for the pilot project.",
+      "Retained retry dispatch accepts an In Progress issue when the configured tracker project and the refreshed issue payload report the same canonical Linear slugId.",
+      "Retry dispatch still rejects issues that belong to a genuinely different project.",
+      "Recovery and operator guidance describe the same canonical project-slug requirement.",
+      "Repo-native verification passes after the recovery normalization change."
+    ],
+    "constraints": [
+      "Keep config-versus-WORKFLOW contract validation strict and use exact canonical project matching for retained retry recovery.",
+      "Do not preserve historical full-slug aliases in checked-in repo config, docs, or regression tests.",
+      "Preserve rejection of unrelated projects and existing retry guard behavior."
+    ],
+    "defaults": {
+      "authority_issue": "XY-165",
+      "blocking_issue": "XY-156",
+      "config_path": "./tmp/maestro.toml",
+      "configured_project_slug": "1a216b6d7100",
+      "verification_commands": [
+        "cargo make fmt-check",
+        "cargo make lint",
+        "cargo make test"
+      ]
+    },
+    "tasks": [
+      {
+        "id": "define-canonical-project-identity-boundary",
+        "title": "Define the canonical retained-retry project identity boundary",
+        "status": "done",
+        "objective": "Constrain the fix to exact canonical project matching so Maestro uses the checked-in Linear slugId consistently without weakening unrelated-project rejection.",
+        "inputs": [
+          "XY-165 issue scope",
+          "Recovered XY-156 failure evidence",
+          "Current retry dispatch and recovery code in src/orchestrator.rs"
+        ],
+        "outputs": [
+          "A concrete canonical-slug rule for retained retry recovery and startup config surfaces",
+          "A clear non-goal boundary for unrelated project rejection and broader tracker identity routing"
+        ],
+        "verification": [
+          "The chosen rule removes reliance on historical full-slug aliases in checked-in repo content",
+          "The rule leaves config-versus-WORKFLOW equality and unrelated-project rejection intact"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "implement-canonical-project-routing-and-regressions",
+        "title": "Implement canonical retry recovery routing and regression coverage",
+        "status": "done",
+        "objective": "Patch the retry recovery path and tests so retained workspaces recover correctly with the canonical project slug while still rejecting other projects.",
+        "inputs": [
+          "Canonical project identity decision from define-canonical-project-identity-boundary",
+          "src/orchestrator.rs",
+          "Retained recovery and targeted retry tests"
+        ],
+        "outputs": [
+          "Runtime code that recovers retained retries through the canonical tracker project slug",
+          "Regression tests for both acceptance of the canonical project and rejection of a different project"
+        ],
+        "verification": [
+          "Targeted retry dry-run coverage accepts the canonical project slug",
+          "Recovered workspace selection coverage accepts the canonical project slug",
+          "Existing unrelated-project retry rejection still passes"
+        ],
+        "depends_on": [
+          "define-canonical-project-identity-boundary"
+        ]
+      },
+      {
+        "id": "align-docs-and-verify-xy-165",
+        "title": "Align canonical project docs and verify the recovery fix",
+        "status": "done",
+        "objective": "Update the operator/spec docs for the canonical project-slug rule and verify the repo stays green under the standard Maestro checks.",
+        "inputs": [
+          "Implemented runtime behavior",
+          "docs/guide/pilot.md",
+          "docs/spec/system_workflow_contract.md",
+          "docs/spec/system_maestro_runtime.md",
+          "Repo-native verification commands"
+        ],
+        "outputs": [
+          "Docs and checked-in config examples that use the canonical project slug consistently",
+          "Verification evidence for fmt, lint, and test gates"
+        ],
+        "verification": [
+          "Docs use the same canonical project-slug rule as the runtime change",
+          "Run the full defaults.verification_commands set successfully"
+        ],
+        "depends_on": [
+          "implement-canonical-project-routing-and-regressions"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "The fix requires reintroducing historical full-slug alias handling in checked-in repo content",
+        "Linear project identity proves inconsistent across more than the canonical slugId surfaces captured here",
+        "Recovery correctness depends on a broader orchestrator redesign outside retained retry matching"
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-18: Retained retry recovery was skipping XY-156 while the repo still mixed historical full-slug examples with canonical Linear slugId payloads for the same pilot project.",
+      "2026-03-18: src/orchestrator.rs now resolves the configured tracker project first and matches retained retry issues against the canonical returned Linear slugId, while still rejecting unrelated projects.",
+      "2026-03-18: Regression coverage now includes retry_run_dry_run_accepts_issue_in_configured_canonical_project and run_project_once_recovers_retained_workspace_for_configured_canonical_project alongside the existing different-project rejection test.",
+      "2026-03-18: Checked-in self-dogfood config surfaces now use the canonical project slugId `1a216b6d7100`, and docs/guide/pilot.md describes the same canonical-slug requirement.",
+      "2026-03-18: Local verification passed for cargo make fmt-check, cargo make lint, and cargo make test."
+    ],
+    "last_updated": "2026-03-18T08:37:45Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "authority_issue": "XY-165",
+      "blocking_issue": "XY-156",
+      "workspace_branch": "x/maestro-xy-165",
+      "resolved_gap": "Retained retry recovery and checked-in self-dogfood config must align on the canonical Linear slugId before matching retained issues."
+    }
+  }
+}

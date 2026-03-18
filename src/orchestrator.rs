@@ -28,7 +28,7 @@ use crate::{
 	config::{self, ServiceConfig},
 	prelude::eyre,
 	state::{self, ProjectRunStatus, RunActivityMarker, RunAttempt, StateStore, WorkspaceMapping},
-	tracker::{IssueTracker, TrackerIssue, linear::LinearClient},
+	tracker::{IssueTracker, TrackerIssue, TrackerProject, linear::LinearClient},
 	workflow::WorkflowDocument,
 	workspace::{WorkspaceManager, WorkspaceSpec},
 };
@@ -59,6 +59,7 @@ struct RunSummary {
 	project_id: String,
 	issue_id: String,
 	issue_identifier: String,
+	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
 	branch_name: String,
 	workspace_path: PathBuf,
@@ -75,6 +76,7 @@ struct MaterializedDaemonSpawnState {
 struct IssueRunPlan {
 	issue: TrackerIssue,
 	workspace: WorkspaceSpec,
+	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
 	attempt_number: i64,
 	run_id: String,
@@ -183,6 +185,7 @@ struct DaemonRunChild {
 	issue_id: String,
 	run_id: String,
 	attempt_number: i64,
+	retry_project_slug: String,
 	from_retry_queue: bool,
 	workflow: WorkflowDocument,
 }
@@ -203,6 +206,7 @@ struct PreferredRunIdentity<'a> {
 #[derive(Clone, Debug)]
 struct RetryEntry {
 	issue_id: String,
+	retry_project_slug: String,
 	kind: RetryKind,
 	attempt: u32,
 	ready_at: Instant,
@@ -306,14 +310,20 @@ impl IssueDispatchMode {
 	fn allows_issue(
 		self,
 		issue: &TrackerIssue,
+		retry_project_slug: &str,
 		project: &ServiceConfig,
 		workflow: &WorkflowDocument,
 		state_store: &StateStore,
 	) -> crate::prelude::Result<bool> {
 		match self {
 			Self::Normal => Ok(issue_passes_dispatch_policy(issue, workflow)),
-			Self::Retry =>
-				issue_passes_retry_dispatch_policy(issue, project, workflow, state_store),
+			Self::Retry => issue_passes_retry_dispatch_policy(
+				issue,
+				retry_project_slug,
+				project,
+				workflow,
+				state_store,
+			),
 		}
 	}
 }
@@ -581,7 +591,6 @@ fn run_daemon_tick(
 			&context.workspace_manager,
 		)?;
 		validate_project_contract(&context.config, &context.workflow)?;
-		validate_tracker_project(&context.tracker, context.config.tracker().project_slug())?;
 		spawn_next_daemon_child(
 			config_path,
 			state_store,
@@ -664,6 +673,7 @@ where
 						run_id: &daemon_child.run_id,
 						attempt_number: daemon_child.attempt_number,
 					},
+					&daemon_child.retry_project_slug,
 					exit_status,
 				)?;
 			}
@@ -824,6 +834,7 @@ where
 				issue_id: summary.issue_id,
 				run_id: summary.run_id,
 				attempt_number: summary.attempt_number,
+				retry_project_slug: summary.retry_project_slug,
 				from_retry_queue,
 				workflow: workflow.clone(),
 			});
@@ -939,7 +950,13 @@ where
 			return Ok(RetryDispatchDecision::Continue);
 		};
 
-		if !issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)? {
+		if !issue_passes_retry_retention_policy(
+			&issue,
+			&entry.retry_project_slug,
+			project,
+			workflow,
+			state_store,
+		)? {
 			retry_queue.release(&entry.issue_id);
 
 			return Ok(RetryDispatchDecision::Continue);
@@ -969,13 +986,7 @@ where
 		preferred_retry_budget_base: None,
 	})?
 	else {
-		if retry_entry_is_temporarily_blocked(
-			tracker,
-			project,
-			workflow,
-			state_store,
-			&entry.issue_id,
-		)? {
+		if retry_entry_is_temporarily_blocked(tracker, project, workflow, state_store, &entry)? {
 			return Ok(RetryDispatchDecision::Blocked);
 		}
 
@@ -992,7 +1003,7 @@ fn retry_entry_is_temporarily_blocked<T>(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
-	issue_id: &str,
+	entry: &RetryEntry,
 ) -> crate::prelude::Result<bool>
 where
 	T: IssueTracker,
@@ -1001,16 +1012,23 @@ where
 		return Ok(false);
 	}
 
-	let Some(issue) = refresh_issue(tracker, issue_id)? else {
+	let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
 		return Ok(false);
 	};
 
-	issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)
+	issue_passes_retry_retention_policy(
+		&issue,
+		&entry.retry_project_slug,
+		project,
+		workflow,
+		state_store,
+	)
 }
 
 fn schedule_retry_after_child_exit<T>(
 	context: ChildExitRetryContext<'_, T>,
 	child: ChildRunRef<'_>,
+	retry_project_slug: &str,
 	exit_status: ExitStatus,
 ) -> crate::prelude::Result<()>
 where
@@ -1033,8 +1051,9 @@ where
 		return Ok(());
 	};
 
-	if !issue_passes_retry_dispatch_policy(
+	if !issue_passes_retry_retention_policy(
 		&issue,
+		retry_project_slug,
 		context.project,
 		context.workflow,
 		context.state_store,
@@ -1075,6 +1094,7 @@ where
 
 	context.retry_queue.upsert(RetryEntry {
 		issue_id: issue_id.to_owned(),
+		retry_project_slug: retry_project_slug.to_owned(),
 		kind,
 		attempt: attempt.max(1),
 		ready_at: Instant::now() + delay,
@@ -1371,6 +1391,14 @@ where
 				let issue_run = IssueRunPlan {
 					issue: action.issue.clone(),
 					workspace,
+					// Stalled reconciliation can refresh an issue by ID after it has already been
+					// removed from its Linear project. This path always converges via terminal
+					// failure writeback, so keep a stable fallback instead of panicking.
+					retry_project_slug: action
+						.issue
+						.project_slug
+						.clone()
+						.unwrap_or_else(|| project.tracker().project_slug().to_owned()),
 					dispatch_mode: IssueDispatchMode::Retry,
 					attempt_number: action.run_attempt.attempt_number(),
 					run_id: action.run_attempt.run_id().to_owned(),
@@ -1558,11 +1586,9 @@ where
 	}
 
 	validate_project_contract(project, workflow)?;
-	validate_tracker_project(tracker, project.tracker().project_slug())?;
 	validate_review_handoff_runtime(dry_run)?;
 
-	let project_slug = project.tracker().project_slug();
-	let issues = tracker.list_project_issues(project_slug)?;
+	let issues = tracker.list_project_issues(project.tracker().project_slug())?;
 	let selected_issue = recovered_state
 		.active_issues
 		.into_iter()
@@ -1571,6 +1597,8 @@ where
 		.or(select_issue_candidate(issues, workflow, state_store, project.id())?
 			.map(|issue| (issue, IssueDispatchMode::Normal)));
 	let Some((issue, dispatch_mode)) = selected_issue else {
+		let _ = resolve_tracker_project(tracker, project.tracker().project_slug())?;
+
 		return Ok(None);
 	};
 	let mut refreshed_issues = tracker.refresh_issues(slice::from_ref(&issue.id))?;
@@ -1581,7 +1609,10 @@ where
 	if !has_available_dispatch_slot(project.id(), state_store)? {
 		return Ok(None);
 	}
-	if !dispatch_mode.allows_issue(&issue, project, workflow, state_store)? {
+
+	let tracker_project = resolve_tracker_project(tracker, project.tracker().project_slug())?;
+
+	if !dispatch_mode.allows_issue(&issue, &tracker_project.slug, project, workflow, state_store)? {
 		return Ok(None);
 	}
 
@@ -1666,8 +1697,6 @@ where
 	}
 
 	validate_project_contract(context.project, context.workflow)?;
-	validate_tracker_project(context.tracker, context.project.tracker().project_slug())?;
-	validate_review_handoff_runtime(context.dry_run)?;
 
 	if !context.lease_preacquired
 		&& !has_available_dispatch_slot(context.project.id(), context.state_store)?
@@ -1675,12 +1704,18 @@ where
 		return Ok(None);
 	}
 
+	let tracker_project =
+		resolve_tracker_project(context.tracker, context.project.tracker().project_slug())?;
+
+	validate_review_handoff_runtime(context.dry_run)?;
+
 	let Some(issue) = refresh_issue(context.tracker, context.issue_id)? else {
 		return Ok(None);
 	};
 
 	if !context.dispatch_mode.allows_issue(
 		&issue,
+		&tracker_project.slug,
 		context.project,
 		context.workflow,
 		context.state_store,
@@ -1781,8 +1816,11 @@ where
 		let Some(refreshed_issue) = refresh_issue(context.tracker, &lease_issue_id)? else {
 			return Ok(None);
 		};
+		let tracker_project =
+			resolve_tracker_project(context.tracker, context.project.tracker().project_slug())?;
 		let dispatch_allowed = context.dispatch_mode.allows_issue(
 			&refreshed_issue,
+			&tracker_project.slug,
 			context.project,
 			context.workflow,
 			context.state_store,
@@ -1807,6 +1845,7 @@ where
 		Ok(Some(IssueRunPlan {
 			issue: refreshed_issue,
 			workspace,
+			retry_project_slug: tracker_project.slug.clone(),
 			dispatch_mode: context.dispatch_mode,
 			attempt_number,
 			run_id: run_id.clone(),
@@ -1847,6 +1886,7 @@ where
 			project_id: project.id().to_owned(),
 			issue_id: issue_run.issue.id.clone(),
 			issue_identifier: issue_run.issue.identifier.clone(),
+			retry_project_slug: issue_run.retry_project_slug.clone(),
 			dispatch_mode: issue_run.dispatch_mode,
 			branch_name: issue_run.workspace.branch_name.clone(),
 			workspace_path: issue_run.workspace.path.clone(),
@@ -1914,15 +1954,16 @@ where
 	Ok(())
 }
 
-fn validate_tracker_project<T>(tracker: &T, project_slug: &str) -> crate::prelude::Result<()>
+fn resolve_tracker_project<T>(
+	tracker: &T,
+	project_slug: &str,
+) -> crate::prelude::Result<TrackerProject>
 where
 	T: IssueTracker,
 {
 	tracker
 		.get_project_by_slug(project_slug)?
-		.ok_or_else(|| eyre::eyre!("Linear project slug `{project_slug}` was not found."))?;
-
-	Ok(())
+		.ok_or_else(|| eyre::eyre!("Linear project slug `{project_slug}` was not found."))
 }
 
 fn validate_review_handoff_runtime(dry_run: bool) -> crate::prelude::Result<()> {
@@ -2130,6 +2171,7 @@ where
 		project_id: project.id().to_owned(),
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
+		retry_project_slug: issue_run.retry_project_slug.clone(),
 		dispatch_mode: issue_run.dispatch_mode,
 		branch_name: issue_run.workspace.branch_name.clone(),
 		workspace_path: issue_run.workspace.path.clone(),
@@ -2411,13 +2453,24 @@ fn issue_passes_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocumen
 
 fn issue_passes_retry_dispatch_policy(
 	issue: &TrackerIssue,
+	retry_project_slug: &str,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+) -> crate::prelude::Result<bool> {
+	issue_passes_retry_retention_policy(issue, retry_project_slug, project, workflow, state_store)
+}
+
+fn issue_passes_retry_retention_policy(
+	issue: &TrackerIssue,
+	retry_project_slug: &str,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 ) -> crate::prelude::Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
 
-	Ok(issue.project_slug.as_deref() == Some(project.tracker().project_slug())
+	Ok(issue.project_slug.as_deref() == Some(retry_project_slug)
 		&& issue.state.name == tracker_policy.in_progress_state()
 		&& !issue.has_label(tracker_policy.opt_out_label())
 		&& !issue.has_label(tracker_policy.needs_attention_label())
@@ -2755,8 +2808,11 @@ where
 {
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
-	let project_slug = project.tracker().project_slug();
-	let issues = tracker.list_project_issues(project_slug)?;
+	let configured_project_slug = project.tracker().project_slug();
+	let retry_project_slug = tracker
+		.get_project_by_slug(configured_project_slug)?
+		.map_or_else(|| configured_project_slug.to_owned(), |tracker_project| tracker_project.slug);
+	let issues = tracker.list_project_issues(&retry_project_slug)?;
 	let now_unix_epoch = OffsetDateTime::now_utc().unix_timestamp();
 	let mut active_issues = Vec::new();
 
@@ -2774,7 +2830,13 @@ where
 			&workspace.path.display().to_string(),
 		)?;
 
-		if issue_passes_retry_dispatch_policy(&issue, project, workflow, state_store)? {
+		if issue_passes_retry_dispatch_policy(
+			&issue,
+			&retry_project_slug,
+			project,
+			workflow,
+			state_store,
+		)? {
 			match state::read_run_activity_marker_snapshot(&workspace.path)? {
 				Some(marker) if workspace_activity_marker_is_fresh(&marker, now_unix_epoch) => {
 					state_store.record_run_attempt(
@@ -3140,6 +3202,9 @@ mod tests {
 	struct FakeTracker {
 		listed_issues: Vec<TrackerIssue>,
 		project_exists: bool,
+		resolved_project_slug: Option<String>,
+		required_list_project_slug: Option<String>,
+		project_lookup_error: RefCell<Option<String>>,
 		refresh_snapshots: RefCell<Vec<Vec<TrackerIssue>>>,
 		refresh_error: RefCell<Option<String>>,
 		comments: RefCell<Vec<String>>,
@@ -3166,6 +3231,9 @@ mod tests {
 			Self {
 				listed_issues,
 				project_exists,
+				resolved_project_slug: None,
+				required_list_project_slug: None,
+				project_lookup_error: RefCell::new(None),
 				refresh_snapshots: RefCell::new(refresh_snapshots),
 				refresh_error: RefCell::new(None),
 				comments: RefCell::new(Vec::new()),
@@ -3185,17 +3253,45 @@ mod tests {
 
 			tracker
 		}
+
+		fn with_resolved_project_slug(mut self, project_slug: &str) -> Self {
+			self.resolved_project_slug = Some(project_slug.to_owned());
+
+			self
+		}
+
+		fn with_required_list_project_slug(mut self, project_slug: &str) -> Self {
+			self.required_list_project_slug = Some(project_slug.to_owned());
+
+			self
+		}
+
+		fn with_project_lookup_error(self, message: &str) -> Self {
+			*self.project_lookup_error.borrow_mut() = Some(message.to_owned());
+
+			self
+		}
 	}
 	impl IssueTracker for FakeTracker {
-		fn list_project_issues(&self, _project_slug: &str) -> Result<Vec<TrackerIssue>> {
+		fn list_project_issues(&self, project_slug: &str) -> Result<Vec<TrackerIssue>> {
+			if let Some(required_project_slug) = &self.required_list_project_slug
+				&& project_slug != required_project_slug
+			{
+				return Ok(Vec::new());
+			}
+
 			Ok(self.listed_issues.clone())
 		}
 
 		fn get_project_by_slug(&self, project_slug: &str) -> Result<Option<TrackerProject>> {
+			if let Some(message) = self.project_lookup_error.borrow_mut().take() {
+				return Err(Report::msg(message));
+			}
+
 			Ok(self.project_exists.then_some(TrackerProject {
 				id: String::from("project-1"),
 				name: String::from("Pubfi"),
-				slug: project_slug.to_owned(),
+				slug: self.resolved_project_slug.clone().unwrap_or_else(|| project_slug.to_owned()),
 			}))
 		}
 
@@ -3241,9 +3337,10 @@ mod tests {
 	}
 
 	fn sample_issue(state_name: &str, labels: &[&str]) -> TrackerIssue {
-		sample_issue_with_sort_fields(
+		sample_issue_with_project_slug_and_sort_fields(
 			"issue-1",
 			"PUB-101",
+			"pubfi",
 			state_name,
 			labels,
 			Some(3),
@@ -3267,6 +3364,20 @@ mod tests {
 		priority: Option<i64>,
 		created_at: &str,
 	) -> TrackerIssue {
+		sample_issue_with_project_slug_and_sort_fields(
+			id, identifier, "pubfi", state_name, labels, priority, created_at,
+		)
+	}
+
+	fn sample_issue_with_project_slug_and_sort_fields(
+		id: &str,
+		identifier: &str,
+		project_slug: &str,
+		state_name: &str,
+		labels: &[&str],
+		priority: Option<i64>,
+		created_at: &str,
+	) -> TrackerIssue {
 		let team_labels = vec![
 			TrackerLabel {
 				id: String::from("label-manual"),
@@ -3281,7 +3392,7 @@ mod tests {
 		TrackerIssue {
 			id: id.to_owned(),
 			identifier: identifier.to_owned(),
-			project_slug: Some(String::from("pubfi")),
+			project_slug: Some(project_slug.to_owned()),
 			title: String::from("Implement orchestration"),
 			description: String::from("Body"),
 			priority,
@@ -3327,13 +3438,36 @@ mod tests {
 	}
 
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
-		temp_project_layout_with_read_first(
+		temp_project_layout_with_tracker_project_slug_and_read_first(
+			"pubfi",
+			&[("AGENTS.md", "Read me first.\n")],
+			"Follow the repository policy.\n",
+		)
+	}
+
+	fn temp_project_layout_with_tracker_project_slug(
+		project_slug: &str,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_tracker_project_slug_and_read_first(
+			project_slug,
 			&[("AGENTS.md", "Read me first.\n")],
 			"Follow the repository policy.\n",
 		)
 	}
 
 	fn temp_project_layout_with_read_first(
+		read_first_files: &[(&str, &str)],
+		workflow_body: &str,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_tracker_project_slug_and_read_first(
+			"pubfi",
+			read_first_files,
+			workflow_body,
+		)
+	}
+
+	fn temp_project_layout_with_tracker_project_slug_and_read_first(
+		project_slug: &str,
 		read_first_files: &[(&str, &str)],
 		workflow_body: &str,
 	) -> (TempDir, ServiceConfig, WorkflowDocument) {
@@ -3357,7 +3491,7 @@ mod tests {
 
 		fs::write(
 			repo_root.join("WORKFLOW.md"),
-			sample_workflow_markdown(&read_first_paths, workflow_body),
+			sample_workflow_markdown(project_slug, &read_first_paths, workflow_body),
 		)
 		.expect("workflow should exist");
 
@@ -3419,7 +3553,7 @@ mod tests {
 				workspace_root = "{}"
 
 				[tracker]
-				project_slug = "pubfi"
+				project_slug = "{project_slug}"
 				api_key = "lin_api_test"
 			"#,
 			repo_root.display(),
@@ -3432,7 +3566,11 @@ mod tests {
 		(temp_dir, config, workflow)
 	}
 
-	fn sample_workflow_markdown(read_first: &[&str], workflow_body: &str) -> String {
+	fn sample_workflow_markdown(
+		project_slug: &str,
+		read_first: &[&str],
+		workflow_body: &str,
+	) -> String {
 		let read_first =
 			read_first.iter().map(|path| format!("\"{path}\"")).collect::<Vec<_>>().join(", ");
 
@@ -3443,7 +3581,7 @@ version = 1
 
 [tracker]
 provider = "linear"
-project_slug = "pubfi"
+project_slug = "{project_slug}"
 startable_states = ["Todo"]
 
 [agent]
@@ -3490,7 +3628,7 @@ read_first = [{read_first}]
 			.expect("initial workflow load should succeed");
 
 		let updated_workflow =
-			sample_workflow_markdown(&["AGENTS.md"], "Updated workflow policy.\n")
+			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Updated workflow policy.\n")
 				.replace("max_attempts = 3", "max_attempts = 5");
 
 		fs::write(config.repo_root().join("WORKFLOW.md"), updated_workflow)
@@ -3546,12 +3684,12 @@ read_first = [{read_first}]
 	fn active_child_reconciliation_keeps_spawn_time_workflow_until_exit() {
 		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let active_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown(&["AGENTS.md"], "Spawn-time workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Spawn-time workflow policy.\n")
 				.replace("max_attempts = 3", "max_attempts = 5"),
 		)
 		.expect("workflow should parse");
 		let current_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown(&["AGENTS.md"], "Current workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Current workflow policy.\n")
 				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]"),
 		)
 		.expect("workflow should parse");
@@ -3813,6 +3951,87 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn retry_run_dry_run_accepts_issue_in_configured_canonical_project() {
+		let configured_project_slug = "1a216b6d7100";
+		let (_temp_dir, config, workflow) =
+			temp_project_layout_with_tracker_project_slug(configured_project_slug);
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			configured_project_slug,
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		)
+		.with_resolved_project_slug("1a216b6d7100");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})
+		.expect("retry run should succeed");
+
+		assert!(
+			summary.is_some(),
+			"retry should accept issues that already report the configured canonical project slug"
+		);
+	}
+
+	#[test]
+	fn retry_run_dry_run_rejects_unrelated_trailing_slug_segment() {
+		let configured_project_slug = "foo-bar";
+		let (_temp_dir, config, workflow) =
+			temp_project_layout_with_tracker_project_slug(configured_project_slug);
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"bar",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![issue.clone()], vec![issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &issue.id,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_dispatch_slot_fd: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})
+		.expect("retry run should succeed");
+
+		assert!(
+			summary.is_none(),
+			"retry should reject unrelated projects that happen to share a trailing slug segment"
+		);
+	}
+
+	#[test]
 	fn retry_run_dry_run_rejects_terminal_guarded_issue_without_attention_label() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue_without_needs_attention_team_label("In Progress", &[]);
@@ -3873,6 +4092,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			exit_status,
 		)
 		.expect("failure retry should schedule");
@@ -3919,6 +4139,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 4 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			exit_status,
 		)
 		.expect("first failure after continuations should still schedule");
@@ -3966,6 +4187,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 3 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -4002,6 +4224,7 @@ read_first = [{read_first}]
 				state_store: &state_store,
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			exit_status,
 		)
 		.expect("continuation retry should schedule");
@@ -4011,6 +4234,89 @@ read_first = [{read_first}]
 
 		assert_eq!(entry.kind, orchestrator::RetryKind::Continuation);
 		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_tolerates_project_lookup_blip() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]])
+				.with_project_lookup_error("transient project lookup failure");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-1";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 0"]).status().expect("success exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			exit_status,
+		)
+		.expect("retry scheduling should stay resilient to project lookup blips");
+
+		let entry = retry_queue.entries.get(&issue.id).expect("retry entry should still be queued");
+
+		assert_eq!(entry.kind, orchestrator::RetryKind::Continuation);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_skips_retry_when_issue_moves_to_another_project() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"other-project",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-1";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 0"]).status().expect("success exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			"pubfi",
+			exit_status,
+		)
+		.expect("retry scheduling should release lanes that moved to another project");
+
+		assert!(
+			!retry_queue.entries.contains_key(&issue.id),
+			"child-exit retries should not remain queued after the issue leaves the configured project"
+		);
 	}
 
 	#[test]
@@ -4042,6 +4348,7 @@ read_first = [{read_first}]
 				run_id: "planned-run",
 				attempt_number: 1,
 			},
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -4077,6 +4384,10 @@ read_first = [{read_first}]
 			issue_id: issue.id.clone(),
 			run_id: String::from("planned-run"),
 			attempt_number: 1,
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			from_retry_queue: true,
 			workflow: workflow.clone(),
 		});
@@ -4084,6 +4395,10 @@ read_first = [{read_first}]
 
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -4118,6 +4433,10 @@ read_first = [{read_first}]
 
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -4137,6 +4456,81 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn queued_retry_stays_blocked_when_project_lookup_blips_before_due_time() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]])
+				.with_project_lookup_error("transient project lookup failure");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("future retry should not fail on project lookup blips");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
+		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
+	}
+
+	#[test]
+	fn future_retry_claim_releases_when_issue_moves_to_another_project_before_due_time() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"other-project",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: String::from("pubfi"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should release lanes that leave the configured project");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
+		assert!(
+			!retry_queue.entries.contains_key(&issue.id),
+			"future retry should release the queued claim after the issue leaves the configured project"
+		);
+	}
+
+	#[test]
 	fn future_retry_claim_releases_when_issue_becomes_non_active_before_due_time() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
@@ -4147,6 +4541,10 @@ read_first = [{read_first}]
 
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -4176,6 +4574,10 @@ read_first = [{read_first}]
 
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -4205,6 +4607,10 @@ read_first = [{read_first}]
 
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -4237,6 +4643,10 @@ read_first = [{read_first}]
 			.expect("temporary competing lease should record");
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -4274,6 +4684,7 @@ read_first = [{read_first}]
 				project_id: String::from("pubfi"),
 				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
+				retry_project_slug: String::from("pubfi"),
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				branch_name: String::from("x/pubfi-pub-101"),
 				workspace_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
@@ -4282,6 +4693,18 @@ read_first = [{read_first}]
 			}
 		);
 		assert!(tracker.comments.borrow().is_empty());
+	}
+
+	#[test]
+	fn dry_run_validates_project_when_no_issue_is_selected() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::with_refresh_snapshots_and_project(vec![], vec![vec![]], false);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let error =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect_err("dry run should surface a missing project slug");
+
+		assert!(error.to_string().contains("Linear project slug `pubfi` was not found."));
 	}
 
 	#[test]
@@ -4296,6 +4719,7 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			retry_project_slug: String::from("pubfi"),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
@@ -4340,6 +4764,7 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			retry_project_slug: String::from("pubfi"),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
@@ -4699,6 +5124,10 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
@@ -5813,6 +6242,75 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn stalled_run_reconciliation_tolerates_missing_project_slug() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::new(vec![]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager = crate::workspace::WorkspaceManager::new(
+			"pubfi",
+			config.repo_root(),
+			config.workspace_root(),
+		);
+		let run_id = "run-stalled-no-project";
+		let workspace_path = config.workspace_root().join("PUB-101");
+		let mut issue = sample_issue("In Progress", &[]);
+
+		issue.project_slug = None;
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace mapping should record");
+
+		let action = orchestrator::ActiveRunReconciliation {
+			issue: issue.clone(),
+			run_attempt: state_store
+				.run_attempt(run_id)
+				.expect("run attempt query should succeed")
+				.expect("run attempt should exist"),
+			workspace_mapping: state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace query should succeed"),
+			disposition: orchestrator::ActiveRunDisposition::Stalled {
+				idle_for: ACTIVE_RUN_IDLE_TIMEOUT + Duration::from_secs(1),
+			},
+			workflow: workflow.clone(),
+		};
+
+		orchestrator::apply_active_run_reconciliation(
+			&tracker,
+			&config,
+			&state_store,
+			&workspace_manager,
+			vec![action],
+		)
+		.expect("stalled reconciliation should still converge without a project slug");
+
+		assert!(
+			state_store.lease_for_issue(&issue.id).expect("lease lookup should succeed").is_none()
+		);
+		assert_eq!(
+			state_store
+				.run_attempt(run_id)
+				.expect("run attempt lookup should succeed")
+				.expect("run attempt should exist")
+				.status(),
+			"stalled"
+		);
+		assert!(tracker.comments.borrow().iter().any(|comment| {
+			comment.contains("stalled_run_detected") && comment.contains("needs attention")
+		}));
+	}
+
+	#[test]
 	fn stalled_run_reconciliation_preserves_retry_budget_marker_from_retained_workspace() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let tracker = FakeTracker::new(vec![]);
@@ -5890,6 +6388,10 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			attempt_number: 1,
 			run_id: String::from("pub-101-attempt-1-123"),
@@ -5995,6 +6497,10 @@ read_first = [{read_first}]
 				path: config.workspace_root().join("PUB-101"),
 				reused_existing: false,
 			},
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			attempt_number: 4,
 			run_id: String::from("pub-101-attempt-4-123"),
@@ -6146,6 +6652,41 @@ read_first = [{read_first}]
 				.is_some(),
 			"workspace mapping should be reconstructed from the retained lane"
 		);
+	}
+
+	#[test]
+	fn run_project_once_recovers_retained_workspace_for_configured_canonical_project() {
+		let configured_project_slug = "1a216b6d7100";
+		let (_temp_dir, config, workflow) =
+			temp_project_layout_with_tracker_project_slug(configured_project_slug);
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			configured_project_slug,
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]])
+				.with_resolved_project_slug(configured_project_slug)
+				.with_required_list_project_slug(configured_project_slug);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let expected_workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("recovered workspace should be created")
+			.path;
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, true)
+				.expect("recovered dry run should succeed")
+				.expect("active recovered issue should be selected");
+
+		assert_eq!(summary.issue_id, issue.id);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+		assert_eq!(summary.workspace_path, expected_workspace);
 	}
 
 	#[test]

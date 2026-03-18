@@ -67,7 +67,7 @@ workspace_root = "/absolute/path/to/hack-ink/maestro/.workspaces"
 workflow_path = "WORKFLOW.md"
 
 [tracker]
-project_slug = "maestro-pilot-ops-hardening-1a216b6d7100"
+project_slug = "1a216b6d7100"
 api_key = "$LINEAR_API_KEY"
 
 [agent]
@@ -83,7 +83,8 @@ Notes:
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
 - `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
-- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear, whose current project slug is `maestro-pilot-ops-hardening-1a216b6d7100`.
+- The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear.
+- Checked-in config examples should use the canonical Linear `slugId` for the target project. For the current self-dogfood pilot, that value is `1a216b6d7100`.
 
 ## Target repository contract
 
