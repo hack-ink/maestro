@@ -59,7 +59,6 @@ Supported keys:
   - type: string
   - required
   - note: canonical stable project identity; this should normally match the Linear project `slugId`
-  - compatibility note: runtime retry recovery may receive the historical full-slug form here, but it must resolve that configured value through Linear and compare retained issues against the canonical returned `slugId`
 - `startable_states`
   - type: array of string
   - optional
