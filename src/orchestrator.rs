@@ -511,7 +511,11 @@ pub(crate) fn run_daemon(
 		}) {
 			Ok(()) => {},
 			Err(error) => {
-				tracing::warn!(?error, "Daemon tick failed.");
+				let _ = error;
+
+				tracing::warn!(
+					"Daemon tick failed; sensitive runtime details were withheld from daemon logs."
+				);
 			},
 		}
 
@@ -2395,7 +2399,6 @@ where
 				max_attempts,
 				workspace_path,
 				&issue_run.workspace.branch_name,
-				error,
 			),
 		)?;
 
@@ -2498,7 +2501,8 @@ where
 		guard_with_nonstartable_state,
 		tracker_policy.in_progress_state(),
 	);
-	let error_class = terminal_failure_error_class(manual_attention_requested, error);
+	let (error_class, next_action) =
+		terminal_failure_comment_details(manual_attention_requested, error, &recovery_gate);
 
 	tracker.create_comment(
 		&issue_run.issue.id,
@@ -2507,9 +2511,8 @@ where
 			issue_run.attempt_number,
 			workspace_path.to_owned(),
 			&issue_run.workspace.branch_name,
-			&recovery_gate,
-			manual_attention_requested,
-			error,
+			error_class,
+			&next_action,
 		),
 	)?;
 
@@ -2549,18 +2552,6 @@ where
 	);
 
 	Ok(false)
-}
-
-fn terminal_failure_error_class(manual_attention_requested: bool, error: &Report) -> &'static str {
-	if manual_attention_requested {
-		"human_attention_required"
-	} else if error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some() {
-		"review_handoff_writeback_failed"
-	} else if error.downcast_ref::<StalledRunNeedsAttention>().is_some() {
-		"stalled_run_detected"
-	} else {
-		"retry_budget_exhausted"
-	}
 }
 
 fn validate_project_contract(
@@ -3212,10 +3203,9 @@ fn format_retry_comment(
 	max_attempts: i64,
 	workspace_path: String,
 	branch_name: &str,
-	error: &Report,
 ) -> String {
 	format!(
-		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- retry_budget_attempt: `{retry_budget_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
+		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- retry_budget_attempt: `{retry_budget_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error_summary: `Sensitive runtime details were withheld from the tracker comment; inspect the local lane for the full failure context.`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
 		workspace = workspace_path
@@ -3227,11 +3217,23 @@ fn format_terminal_failure_comment(
 	attempt_number: i64,
 	workspace_path: String,
 	branch_name: &str,
-	recovery_gate: &str,
+	error_class: &str,
+	next_action: &str,
+) -> String {
+	format!(
+		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error_summary: `Sensitive runtime details were withheld from the tracker comment; inspect the local lane for the full failure context.`",
+		failed_at = current_timestamp(),
+		branch = branch_name,
+		workspace = workspace_path
+	)
+}
+
+fn terminal_failure_comment_details(
 	manual_attention_requested: bool,
 	error: &Report,
-) -> String {
-	let (error_class, next_action) = if manual_attention_requested {
+	recovery_gate: &str,
+) -> (&'static str, String) {
+	if manual_attention_requested {
 		(
 			"human_attention_required",
 			format!(
@@ -3257,14 +3259,7 @@ fn format_terminal_failure_comment(
 			"retry_budget_exhausted",
 			format!("inspect the workspace, resolve the issue manually, {recovery_gate}"),
 		)
-	};
-
-	format!(
-		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error: `{error}`",
-		failed_at = current_timestamp(),
-		branch = branch_name,
-		workspace = workspace_path
-	)
+	}
 }
 
 fn terminal_failure_recovery_gate(
@@ -5417,24 +5412,20 @@ read_first = [{read_first}]
 
 	#[test]
 	fn human_required_terminal_failure_comments_use_manual_attention_error_class() {
-		let error = Report::new(super::ManualAttentionRequested {
-			issue_identifier: String::from("PUB-101"),
-			label: String::from("maestro:needs-attention"),
-			run_id: String::from("pub-101-attempt-1-123"),
-		});
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
 			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
-			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
-			true,
-			&error,
+			"human_attention_required",
+			"inspect the issue comment and workspace, resolve the blocker manually, clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 		);
 
 		assert!(comment.contains("- error_class: `human_attention_required`"));
-		assert!(comment.contains("stop automatic retries and hand off manually"));
+		assert!(comment.contains("inspect the issue comment and workspace"));
+		assert!(comment.contains("resolve the blocker manually"));
 		assert!(comment.contains("clear label `maestro:needs-attention`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
 	}
 
 	#[test]
@@ -5471,45 +5462,52 @@ read_first = [{read_first}]
 
 	#[test]
 	fn review_handoff_writeback_failures_use_nonretryable_terminal_failure_comment() {
-		let error = Report::new(super::ReviewHandoffNeedsAttention {
-			issue_identifier: String::from("PUB-101"),
-			run_id: String::from("pub-101-attempt-1-123"),
-		});
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
 			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
-			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
-			false,
-			&error,
+			"review_handoff_writeback_failed",
+			"inspect the tracker state, PR, and workspace, repair the incomplete review handoff manually, clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 		);
 
 		assert!(comment.contains("- error_class: `review_handoff_writeback_failed`"));
 		assert!(comment.contains("repair the incomplete review handoff manually"));
 		assert!(comment.contains("clear label `maestro:needs-attention`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
 	}
 
 	#[test]
 	fn terminal_failure_comments_explain_state_guard_when_needs_attention_label_is_unavailable() {
-		let error = Report::new(super::StalledRunNeedsAttention {
-			issue_identifier: String::from("PUB-101"),
-			run_id: String::from("pub-101-attempt-1-123"),
-			idle_for: ACTIVE_RUN_IDLE_TIMEOUT,
-		});
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
 			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
-			"`maestro:needs-attention` could not be applied because it does not exist on the team; the issue remains in `In Progress` to block automatic retries, so move it back to a startable state manually if another automated run is desired",
-			false,
-			&error,
+			"stalled_run_detected",
+			"inspect the workspace and app-server activity for the stalled lane, resolve the blocker manually, `maestro:needs-attention` could not be applied because it does not exist on the team; the issue remains in `In Progress` to block automatic retries, so move it back to a startable state manually if another automated run is desired",
 		);
 
 		assert!(comment.contains("- error_class: `stalled_run_detected`"));
 		assert!(comment.contains("does not exist on the team"));
 		assert!(comment.contains("remains in `In Progress`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
+	}
+
+	#[test]
+	fn retry_failure_comments_withhold_raw_error_text() {
+		let comment = orchestrator::format_retry_comment(
+			"pub-101-attempt-1-123",
+			1,
+			1,
+			3,
+			String::from(".workspaces/PUB-101"),
+			"x/pubfi-pub-101",
+		);
+
+		assert!(comment.contains("- error_class: `retryable_execution_failure`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
+		assert!(!comment.contains("error:"));
 	}
 
 	#[test]
