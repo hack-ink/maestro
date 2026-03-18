@@ -1,6 +1,6 @@
 //! Downstream `WORKFLOW.md` parsing and validation.
 
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +110,8 @@ impl WorkflowFrontmatter {
 		if self.execution.max_retry_backoff_ms == 0 {
 			eyre::bail!("`execution.max_retry_backoff_ms` must be greater than zero.");
 		}
+
+		self.execution.validate()?;
 
 		Ok(())
 	}
@@ -256,6 +258,9 @@ pub struct WorkflowExecution {
 	max_attempts: u32,
 	#[serde(default = "default_max_retry_backoff_ms")]
 	max_retry_backoff_ms: u64,
+	max_concurrent_agents: Option<u32>,
+	#[serde(default)]
+	max_concurrent_agents_by_state: HashMap<String, u32>,
 	#[serde(default)]
 	validation_commands: Vec<String>,
 }
@@ -274,6 +279,47 @@ impl WorkflowExecution {
 	pub fn validation_commands(&self) -> &[String] {
 		&self.validation_commands
 	}
+
+	/// Maximum concurrent agents allowed for this repository.
+	pub fn max_concurrent_agents(&self) -> u32 {
+		self.max_concurrent_agents.unwrap_or(default_max_concurrent_agents())
+	}
+
+	/// Per-state concurrency overrides keyed by tracker state name.
+	pub fn max_concurrent_agents_by_state(&self) -> &HashMap<String, u32> {
+		&self.max_concurrent_agents_by_state
+	}
+
+	/// Maximum concurrent agents allowed for the provided tracker state, when configured.
+	pub fn state_concurrency_limit(&self, state_name: &str) -> Option<u32> {
+		self.max_concurrent_agents_by_state.get(state_name).copied()
+	}
+
+	fn validate(&self) -> Result<()> {
+		if let Some(limit) = self.max_concurrent_agents
+			&& limit == 0
+		{
+			eyre::bail!("`execution.max_concurrent_agents` must be greater than zero.");
+		}
+
+		let global_limit = self.max_concurrent_agents();
+
+		for (state, limit) in &self.max_concurrent_agents_by_state {
+			if *limit == 0 {
+				eyre::bail!(
+					"`execution.max_concurrent_agents_by_state.{}` must be greater than zero.",
+					state
+				);
+			}
+			if *limit > global_limit {
+				eyre::bail!(
+					"`execution.max_concurrent_agents_by_state.{state}` ({limit}) exceeds `execution.max_concurrent_agents` ({global_limit})."
+				);
+			}
+		}
+
+		Ok(())
+	}
 }
 
 impl Default for WorkflowExecution {
@@ -281,6 +327,8 @@ impl Default for WorkflowExecution {
 		Self {
 			max_attempts: default_max_attempts(),
 			max_retry_backoff_ms: default_max_retry_backoff_ms(),
+			max_concurrent_agents: None,
+			max_concurrent_agents_by_state: HashMap::new(),
 			validation_commands: Vec::new(),
 		}
 	}
@@ -387,6 +435,10 @@ fn default_max_retry_backoff_ms() -> u64 {
 	300_000
 }
 
+fn default_max_concurrent_agents() -> u32 {
+	1
+}
+
 fn default_read_first() -> Vec<String> {
 	vec![String::from("AGENTS.md")]
 }
@@ -413,6 +465,8 @@ project_slug = "pubfi"
 [execution]
 max_attempts = 3
 max_retry_backoff_ms = 300000
+max_concurrent_agents = 2
+max_concurrent_agents_by_state = { "In Progress" = 1 }
 validation_commands = ["cargo make test"]
 +++
 
@@ -427,6 +481,11 @@ Use `cargo make`.
 		assert_eq!(document.frontmatter().tracker().project_slug(), "pubfi");
 		assert_eq!(document.frontmatter().execution().max_attempts(), 3);
 		assert_eq!(document.frontmatter().execution().max_retry_backoff_ms(), 300_000);
+		assert_eq!(document.frontmatter().execution().max_concurrent_agents(), 2);
+		assert_eq!(
+			document.frontmatter().execution().state_concurrency_limit("In Progress"),
+			Some(1)
+		);
 		assert_eq!(document.body(), "Read `AGENTS.md` first.\nUse `cargo make`.");
 	}
 
@@ -541,5 +600,72 @@ Then validate the lane.
 		.expect("rendered workflow should parse");
 
 		assert_eq!(reparsed, document);
+	}
+
+	#[test]
+	fn rejects_zero_global_concurrency_limit() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+
+[execution]
+max_attempts = 3
+max_retry_backoff_ms = 300000
+max_concurrent_agents = 0
++++
+			"#,
+		);
+
+		assert!(result.is_err(), "zero global concurrency should be invalid");
+	}
+
+	#[test]
+	fn rejects_zero_state_concurrency_override() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+
+[execution]
+max_attempts = 3
+max_retry_backoff_ms = 300000
+max_concurrent_agents_by_state = { "In Progress" = 0 }
++++
+			"#,
+		);
+
+		assert!(result.is_err(), "zero state override should be invalid");
+	}
+
+	#[test]
+	fn rejects_state_override_above_global_limit() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+
+[execution]
+max_attempts = 3
+max_retry_backoff_ms = 300000
+max_concurrent_agents = 1
+max_concurrent_agents_by_state = { "In Progress" = 2 }
++++
+			"#,
+		);
+
+		assert!(result.is_err(), "state override above the global limit should be invalid");
 	}
 }

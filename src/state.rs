@@ -51,7 +51,13 @@ impl StateStore {
 	}
 
 	/// Create or replace the active lease for one issue.
-	pub fn upsert_lease(&self, project_id: &str, issue_id: &str, run_id: &str) -> Result<()> {
+	pub fn upsert_lease(
+		&self,
+		project_id: &str,
+		issue_id: &str,
+		run_id: &str,
+		issue_state: &str,
+	) -> Result<()> {
 		let mut state = self.lock()?;
 
 		state.leases.insert(
@@ -60,6 +66,7 @@ impl StateStore {
 				project_id: project_id.to_owned(),
 				issue_id: issue_id.to_owned(),
 				run_id: run_id.to_owned(),
+				issue_state: issue_state.to_owned(),
 			},
 		);
 
@@ -72,18 +79,16 @@ impl StateStore {
 		project_id: &str,
 		issue_id: &str,
 		run_id: &str,
+		issue_state: &str,
 	) -> Result<bool> {
 		let mut state = self.lock()?;
 
-		if state
-			.leases
-			.values()
-			.any(|lease| lease.project_id == project_id || lease.issue_id == issue_id)
-		{
+		if state.leases.values().any(|lease| lease.issue_id == issue_id) {
 			return Ok(false);
 		}
-
-		if let Some(dispatch_lock_root) = state.dispatch_lock_roots.get(project_id) {
+		if !state.dispatch_slot_guards.contains_key(project_id)
+			&& let Some(dispatch_lock_root) = state.dispatch_lock_roots.get(project_id)
+		{
 			fs::create_dir_all(dispatch_lock_root)?;
 
 			let lock_file = OpenOptions::new()
@@ -110,6 +115,7 @@ impl StateStore {
 				project_id: project_id.to_owned(),
 				issue_id: issue_id.to_owned(),
 				run_id: run_id.to_owned(),
+				issue_state: issue_state.to_owned(),
 			},
 		);
 
@@ -182,6 +188,7 @@ impl StateStore {
 		project_id: &str,
 		issue_id: &str,
 		run_id: &str,
+		issue_state: &str,
 		dispatch_slot_fd: i32,
 	) -> Result<()> {
 		let lock_file = unsafe { File::from_raw_fd(dispatch_slot_fd) };
@@ -196,6 +203,7 @@ impl StateStore {
 				project_id: project_id.to_owned(),
 				issue_id: issue_id.to_owned(),
 				run_id: run_id.to_owned(),
+				issue_state: issue_state.to_owned(),
 			},
 		);
 
@@ -506,6 +514,7 @@ pub struct IssueLease {
 	project_id: String,
 	issue_id: String,
 	run_id: String,
+	issue_state: String,
 }
 impl IssueLease {
 	/// Local project identifier owning this lease.
@@ -521,6 +530,11 @@ impl IssueLease {
 	/// Run identifier holding the lease.
 	pub fn run_id(&self) -> &str {
 		&self.run_id
+	}
+
+	/// Tracker state representing the dispatched run.
+	pub fn issue_state(&self) -> &str {
+		&self.issue_state
 	}
 }
 
@@ -1070,11 +1084,15 @@ mod tests {
 
 	use crate::state::StateStore;
 
+	const IN_PROGRESS_STATE: &str = "In Progress";
+
 	#[test]
 	fn manages_issue_leases() {
 		let store = StateStore::open_in_memory().expect("in-memory state store should open");
 
-		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should be inserted");
+		store
+			.upsert_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+			.expect("lease should be inserted");
 
 		let lease = store
 			.lease_for_issue("PUB-101")
@@ -1084,6 +1102,7 @@ mod tests {
 		assert_eq!(lease.issue_id(), "PUB-101");
 		assert_eq!(lease.run_id(), "run-1");
 		assert_eq!(lease.project_id(), "pubfi");
+		assert_eq!(lease.issue_state(), IN_PROGRESS_STATE);
 
 		store.clear_lease("PUB-101").expect("lease should be deleted");
 
@@ -1091,27 +1110,27 @@ mod tests {
 	}
 
 	#[test]
-	fn tries_to_acquire_single_project_dispatch_slot() {
+	fn tracks_issue_specific_leases_without_project_limit() {
 		let store = StateStore::open_in_memory().expect("in-memory state store should open");
 
 		assert!(
 			store
-				.try_acquire_lease("pubfi", "PUB-101", "run-1")
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
 				.expect("first lease acquisition should succeed")
 		);
 		assert!(
-			!store
-				.try_acquire_lease("pubfi", "PUB-102", "run-2")
-				.expect("second lease acquisition should be rejected")
+			store
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
+				.expect("second lease acquisition should succeed for another issue")
 		);
 		assert!(
 			!store
-				.try_acquire_lease("pubfi", "PUB-101", "run-3")
+				.try_acquire_lease("pubfi", "PUB-101", "run-3", IN_PROGRESS_STATE)
 				.expect("duplicate issue acquisition should be rejected")
 		);
 		assert!(
 			store
-				.try_acquire_lease("other", "PUB-201", "run-4")
+				.try_acquire_lease("other", "PUB-201", "run-4", IN_PROGRESS_STATE)
 				.expect("other project should still acquire its own slot")
 		);
 	}
@@ -1131,12 +1150,12 @@ mod tests {
 
 		assert!(
 			store_one
-				.try_acquire_lease("pubfi", "PUB-101", "run-1")
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
 				.expect("first shared lease acquisition should succeed")
 		);
 		assert!(
 			!store_two
-				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
 				.expect("second store should observe the shared slot as busy")
 		);
 
@@ -1144,7 +1163,7 @@ mod tests {
 
 		assert!(
 			store_two
-				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
 				.expect("shared slot should reopen after the first lease clears")
 		);
 	}
@@ -1169,7 +1188,7 @@ mod tests {
 
 		assert!(
 			parent_store
-				.try_acquire_lease("pubfi", "PUB-101", "run-1")
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
 				.expect("parent should acquire the shared slot")
 		);
 
@@ -1178,7 +1197,13 @@ mod tests {
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
-			.adopt_preacquired_lease("pubfi", "PUB-101", "run-1", child_guard.into_raw_fd())
+			.adopt_preacquired_lease(
+				"pubfi",
+				"PUB-101",
+				"run-1",
+				IN_PROGRESS_STATE,
+				child_guard.into_raw_fd(),
+			)
 			.expect("child should adopt the inherited lease guard");
 		parent_store
 			.release_dispatch_slot("pubfi")
@@ -1186,7 +1211,7 @@ mod tests {
 
 		assert!(
 			!contender_store
-				.try_acquire_lease("pubfi", "PUB-102", "run-2")
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
 				.expect("child-held guard should keep the slot busy")
 		);
 
@@ -1314,8 +1339,12 @@ mod tests {
 	fn lists_issue_leases() {
 		let store = StateStore::open_in_memory().expect("in-memory state store should open");
 
-		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("first lease should be inserted");
-		store.upsert_lease("pubfi", "PUB-102", "run-2").expect("second lease should be inserted");
+		store
+			.upsert_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+			.expect("first lease should be inserted");
+		store
+			.upsert_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
+			.expect("second lease should be inserted");
 
 		let leases = store.list_leases("pubfi").expect("lease listing should succeed");
 
@@ -1336,7 +1365,9 @@ mod tests {
 			.record_run_attempt("run-1", "PUB-101", 1, "running")
 			.expect("active run attempt should be recorded");
 		store.update_run_thread("run-1", "thread-1").expect("thread id should attach");
-		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should record");
+		store
+			.upsert_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+			.expect("lease should record");
 		store
 			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
 			.expect("active workspace should record");
@@ -1375,8 +1406,12 @@ mod tests {
 		store
 			.record_run_attempt("run-2", "PUB-102", 1, "running")
 			.expect("second run should record");
-		store.upsert_lease("pubfi", "PUB-101", "run-1").expect("lease should record");
-		store.upsert_lease("other", "PUB-102", "run-2").expect("other-project lease should record");
+		store
+			.upsert_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+			.expect("lease should record");
+		store
+			.upsert_lease("other", "PUB-102", "run-2", IN_PROGRESS_STATE)
+			.expect("other-project lease should record");
 		store
 			.upsert_workspace("pubfi", "PUB-101", "x/pubfi-pub-101", "/tmp/workspaces/pub-101")
 			.expect("first workspace should record");
