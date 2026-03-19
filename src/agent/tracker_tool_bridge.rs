@@ -700,8 +700,10 @@ impl<'a> TrackerToolBridge<'a> {
 		let Some(reason) = self.continuation_blocking_tracker_write.borrow().clone() else {
 			return Ok(None);
 		};
+		let tracker_policy = self.workflow.frontmatter().tracker();
+		let run_started_active = self.issue.state.name == tracker_policy.in_progress_state();
 
-		if !self.local_issue_remains_active() {
+		if run_started_active && !self.local_issue_remains_active() {
 			return Ok(Some(reason));
 		}
 
@@ -709,7 +711,6 @@ impl<'a> TrackerToolBridge<'a> {
 			Some(issue) => issue,
 			None => return Ok(Some(reason)),
 		};
-		let tracker_policy = self.workflow.frontmatter().tracker();
 		let issue_still_active = issue.state.name == tracker_policy.in_progress_state()
 			&& !issue.has_label(tracker_policy.opt_out_label())
 			&& !issue.has_label(tracker_policy.needs_attention_label());
@@ -2138,6 +2139,85 @@ Use the tracker tools.
 
 		assert!(error.to_string().contains("without recording a terminal path"));
 		assert!(error.to_string().contains(ISSUE_TRANSITION_TOOL_NAME));
+	}
+
+	#[test]
+	fn turn_classification_allows_opt_out_label_when_refresh_reactivates_issue_for_startable_start()
+	{
+		let mut reactivated_issue = sample_issue();
+
+		reactivated_issue.state =
+			TrackerState { id: String::from("state-progress"), name: String::from("In Progress") };
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![
+			vec![reactivated_issue.clone()],
+			vec![reactivated_issue],
+		]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:manual-only" }),
+		);
+
+		assert!(response.success);
+		assert_eq!(
+			DynamicToolHandler::classify_turn_completion(
+				&bridge,
+				"The issue was reactivated before turn completion, so the stale stop-write must not block continuation."
+			)
+			.expect("startable-start lanes should allow continuation when the tracker reread reactivates the issue"),
+			TurnCompletionStatus::Continue
+		);
+	}
+
+	#[test]
+	fn turn_classification_allows_non_in_progress_transition_when_refresh_reactivates_issue_for_startable_start()
+	 {
+		let mut reactivated_issue = sample_issue();
+
+		reactivated_issue.state =
+			TrackerState { id: String::from("state-progress"), name: String::from("In Progress") };
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![reactivated_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "Todo" }),
+		);
+
+		assert!(response.success);
+		assert_eq!(
+			DynamicToolHandler::classify_turn_completion(
+				&bridge,
+				"The issue was reactivated before turn completion, so the stale stop-transition must not block continuation."
+			)
+			.expect("startable-start lanes should allow continuation when the tracker reread reactivates the issue"),
+			TurnCompletionStatus::Continue
+		);
 	}
 
 	#[test]

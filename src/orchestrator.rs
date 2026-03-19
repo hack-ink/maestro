@@ -85,6 +85,7 @@ struct MaterializedDaemonSpawnState {
 struct IssueRunPlan {
 	issue: TrackerIssue,
 	issue_state: String,
+	initial_issue_state: String,
 	workspace: WorkspaceSpec,
 	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
@@ -1813,6 +1814,7 @@ where
 			IssueDispatchMode::Retry,
 			None,
 		),
+		initial_issue_state: action.issue.state.name.clone(),
 		workspace,
 		// Stalled reconciliation can refresh an issue by ID after it has already been
 		// removed from its Linear project. This path always converges via terminal
@@ -2380,9 +2382,14 @@ where
 			clear_terminal_guard_marker(&workspace.path)?;
 		}
 
+		let initial_issue_state = context
+			.preferred_initial_issue_state
+			.map_or_else(|| refreshed_issue.state.name.clone(), str::to_owned);
+
 		Ok(Some(IssueRunPlan {
 			issue: refreshed_issue,
 			issue_state: issue_state.clone(),
+			initial_issue_state,
 			workspace,
 			retry_project_slug: tracker_project.slug.clone(),
 			dispatch_mode: context.dispatch_mode,
@@ -2680,7 +2687,7 @@ where
 		workflow,
 		issue_id: &issue_run.issue.id,
 		issue_identifier: &issue_run.issue.identifier,
-		initial_issue_state: &issue_run.issue.state.name,
+		initial_issue_state: &issue_run.initial_issue_state,
 		retry_project_slug: &issue_run.retry_project_slug,
 	};
 	let run_result = agent::execute_app_server_run(
@@ -2757,7 +2764,7 @@ fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> Run
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
 		issue_state: issue_run.issue_state.clone(),
-		initial_issue_state: issue_run.issue.state.name.clone(),
+		initial_issue_state: issue_run.initial_issue_state.clone(),
 		retry_project_slug: issue_run.retry_project_slug.clone(),
 		dispatch_mode: issue_run.dispatch_mode,
 		branch_name: issue_run.workspace.branch_name.clone(),
@@ -6024,6 +6031,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
 			issue_state: String::from("In Progress"),
+			initial_issue_state: String::from("Todo"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -6064,6 +6072,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
 			issue_state: String::from("In Progress"),
+			initial_issue_state: String::from("Todo"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -6091,6 +6100,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
 			issue_state: String::from("In Progress"),
+			initial_issue_state: String::from("Todo"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -6127,6 +6137,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
 			issue_state: String::from("In Progress"),
+			initial_issue_state: String::from("Todo"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -6290,6 +6301,36 @@ read_first = [{read_first}]
 			guard
 				.should_continue_turn(2)
 				.expect("a stale pre-write reread should remain tolerated after turn one")
+		);
+	}
+
+	#[test]
+	fn continuation_guard_preserves_original_startable_state_across_continuation_retries() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let stale_issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![issue.clone()],
+			vec![vec![stale_issue.clone()]],
+		);
+		let tracker_tool_bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let guard = orchestrator::IssueTurnContinuationGuard {
+			tracker: &tracker,
+			tracker_tool_bridge: &tracker_tool_bridge,
+			workflow: &workflow,
+			issue_id: &issue.id,
+			issue_identifier: &issue.identifier,
+			initial_issue_state: "Todo",
+			retry_project_slug: issue
+				.project_slug
+				.as_deref()
+				.expect("sample issue should carry a project slug"),
+		};
+
+		assert!(
+			guard
+				.should_continue_turn(2)
+				.expect("continuation retries must preserve the original startable state even after a refreshed in-progress run plan")
 		);
 	}
 
@@ -6785,6 +6826,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
 			issue_state: issue.state.name.clone(),
+			initial_issue_state: issue.state.name.clone(),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
@@ -8150,6 +8192,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
 			issue_state: String::from("In Progress"),
+			initial_issue_state: String::from("Todo"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
@@ -8262,6 +8305,7 @@ read_first = [{read_first}]
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
 			issue_state: issue.state.name.clone(),
+			initial_issue_state: issue.state.name.clone(),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),

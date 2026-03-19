@@ -156,14 +156,16 @@
       "2026-03-19: Reopened execution on XY-183 to separate continuation outcome signaling from generic success and to persist the exact original startable state for stale continuation retry retention.",
       "2026-03-19: Added explicit `continuation_pending` run status plumbing through child-exit retry scheduling so only clean continuation boundaries enqueue `RetryKind::Continuation`; completed successful exits now release their retry claim instead of reopening the same thread.",
       "2026-03-19: Persisted `continuation_initial_issue_state` on queued continuation retries and narrowed stale continuation retention to exact startable-state matches, so a move from `Todo` to another configured startable state like `Backlog` no longer resurrects the old thread.",
-      "2026-03-19: Fresh verification on the repaired diff passed: cargo make fmt-check, cargo make lint, cargo make test, git diff --check, plus targeted continuation scheduling/retention regressions."
+      "2026-03-19: Fresh verification on the repaired diff passed: cargo make fmt-check, cargo make lint, cargo make test, git diff --check, plus targeted continuation scheduling/retention regressions.",
+      "2026-03-19: Another late Codex review on PR #19 after head `caaa626` exposed two final continuity gaps: startable-start lanes still hard-blocked on local stop writes even when a fresh reread had already reactivated the issue, and continuation retries still overwrote the original startable state when the retried run was prepared from a refreshed `In Progress` snapshot.",
+      "2026-03-19: Repaired the remaining gaps by letting startable-start lanes consult a fresh reread before enforcing local stop-write blocking, while keeping active-start lanes conservative, and by persisting `IssueRunPlan.initial_issue_state` so the continuation guard and later retries retain the original startable-state hint even after tracker rereads briefly catch up to `In Progress`."
     ],
-    "last_updated": "2026-03-19T15:48:55Z",
+    "last_updated": "2026-03-19T16:15:21Z",
     "replan_reason": null,
     "context_snapshot": {
-      "late_review_head": "7908d7b4f642aeadf374b6eb71ba5d5c4d13ce15",
+      "late_review_head": "caaa6268f730f0b69db7e84d3d699b236f614046",
       "merge_anchor": "759d5e6f5a85599d521d62786bca400aa704a875",
-      "pr": "https://github.com/hack-ink/maestro/pull/18"
+      "pr": "https://github.com/hack-ink/maestro/pull/19"
     }
   }
 }
