@@ -93,13 +93,9 @@ fn read_local_git_config(cwd: &Path, key: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-	use std::path::Path;
-
-	use crate::github::parse_pull_request_url;
-
 	#[test]
 	fn parses_pull_request_url() {
-		let locator = parse_pull_request_url("https://github.com/hack-ink/maestro/pull/20")
+		let locator = super::parse_pull_request_url("https://github.com/hack-ink/maestro/pull/20")
 			.expect("pull request URL should parse");
 
 		assert_eq!(locator.owner, "hack-ink");
@@ -109,7 +105,7 @@ mod tests {
 
 	#[test]
 	fn rejects_non_pull_github_url() {
-		let error = parse_pull_request_url("https://github.com/hack-ink/maestro/issues/20")
+		let error = super::parse_pull_request_url("https://github.com/hack-ink/maestro/issues/20")
 			.expect_err("issue URL should be rejected");
 
 		assert!(error.to_string().contains("/pull/<number>"));
@@ -117,7 +113,7 @@ mod tests {
 
 	#[test]
 	fn rejects_missing_number() {
-		let error = parse_pull_request_url("https://github.com/hack-ink/maestro/pull/")
+		let error = super::parse_pull_request_url("https://github.com/hack-ink/maestro/pull/")
 			.expect_err("missing pull number should be rejected");
 
 		assert!(error.to_string().contains("missing the pull request number"));
@@ -126,14 +122,16 @@ mod tests {
 	#[test]
 	fn configure_gh_command_requires_repo_local_identity_when_missing() {
 		let temp_dir = tempfile::tempdir().expect("temp dir should exist");
+
 		std::process::Command::new("git")
 			.arg("-C")
 			.arg(temp_dir.path())
 			.args(["init"])
 			.output()
 			.expect("git init should run");
+
 		let mut command = std::process::Command::new("gh");
-		let error = super::configure_gh_command(&mut command, Path::new(temp_dir.path()))
+		let error = super::configure_gh_command(&mut command, temp_dir.path())
 			.expect_err("missing codex.github-identity should be rejected");
 
 		assert!(error.to_string().contains("codex.github-identity"));
