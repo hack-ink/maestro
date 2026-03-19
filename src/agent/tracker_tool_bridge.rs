@@ -12,7 +12,9 @@ use serde_json::{self, Value};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
+	github,
 	prelude::eyre,
+	state::{self, ReviewHandoffMarker},
 	tracker::{IssueTracker, TrackerIssue},
 	workflow::WorkflowDocument,
 };
@@ -792,10 +794,9 @@ impl<'a> TrackerToolBridge<'a> {
 
 			pending_review_handoff.clone()
 		};
-
-		self.validate_review_handoff_pr(review_context, &pending_review_handoff.pr_url)
+		let pull_request = self
+			.validate_review_handoff_pr(review_context, &pending_review_handoff.pr_url)
 			.map_err(|error| eyre::eyre!(error))?;
-
 		let completion_comment =
 			format_review_handoff_comment(review_context, &pending_review_handoff);
 
@@ -820,6 +821,27 @@ impl<'a> TrackerToolBridge<'a> {
 				source: error.to_string(),
 			}));
 		}
+
+		state::write_review_handoff_marker(
+			&review_context.cwd,
+			&ReviewHandoffMarker::new(
+				review_context.run_id.clone(),
+				review_context.attempt_number,
+				review_context.branch_name.clone(),
+				pull_request.url.clone(),
+				pull_request.head_ref_name.clone(),
+				pull_request.head_ref_oid.clone(),
+			),
+		)
+		.map_err(|error| {
+			Report::new(ReviewHandoffWritebackFailed {
+				issue_identifier: self.issue.identifier.clone(),
+				run_id: review_context.run_id.clone(),
+				pr_url: pull_request.url.clone(),
+				success_state: success_state.to_owned(),
+				source: format!("failed to persist the local review handoff marker: {error}"),
+			})
+		})?;
 
 		self.pending_review_handoff.borrow_mut().take();
 
@@ -972,7 +994,7 @@ impl Display for ReviewHandoffWritebackFailed {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
 		write!(
 			f,
-			"Run `{}` moved issue `{}` to `{}` for PR `{}`, but failed to post the completion comment: {}",
+			"Run `{}` moved issue `{}` to `{}` for PR `{}`, but failed to finalize the review handoff: {}",
 			self.run_id, self.issue_identifier, self.success_state, self.pr_url, self.source
 		)
 	}
@@ -1026,15 +1048,21 @@ impl PullRequestInspector for GhPullRequestInspector {
 		cwd: &std::path::Path,
 		pr_url: &str,
 	) -> std::result::Result<PullRequestDetails, String> {
-		let output = Command::new("gh")
-			.args([
-				"pr",
-				"view",
-				pr_url,
-				"--json",
-				"url,headRefName,headRefOid,state,isDraft,headRepository,headRepositoryOwner",
-			])
-			.current_dir(cwd)
+		let mut command = Command::new("gh");
+
+		command.args([
+			"pr",
+			"view",
+			pr_url,
+			"--json",
+			"url,headRefName,headRefOid,state,isDraft,headRepository,headRepositoryOwner",
+		]);
+		command.current_dir(cwd);
+
+		github::configure_gh_command(&mut command, cwd)
+			.map_err(|error| format!("Failed to configure GitHub CLI for `{pr_url}`: {error}"))?;
+
+		let output = command
 			.output()
 			.map_err(|error| format!("Failed to inspect pull request `{pr_url}`: {error}"))?;
 
@@ -1333,6 +1361,8 @@ mod tests {
 		path::{Path, PathBuf},
 	};
 
+	use tempfile::TempDir;
+
 	use crate::{
 		agent::tracker_tool_bridge::{
 			DynamicToolHandler, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
@@ -1342,6 +1372,7 @@ mod tests {
 			TrackerToolBridge, TurnCompletionStatus,
 		},
 		prelude::{Result, eyre},
+		state,
 		tracker::{
 			IssueTracker, TrackerIssue, TrackerLabel, TrackerProject, TrackerState, TrackerTeam,
 		},
@@ -1583,6 +1614,16 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: PathBuf::from("/tmp/PUB-618"),
+		}
+	}
+
+	fn sample_review_context_in(cwd: &Path) -> ReviewHandoffContext {
+		ReviewHandoffContext {
+			attempt_number: 2,
+			branch_name: String::from("x/maestro-pub-618"),
+			run_id: String::from("pub-618-attempt-2-123"),
+			workspace_path: String::from(".workspaces/PUB-618"),
+			cwd: cwd.to_path_buf(),
 		}
 	}
 
@@ -2475,6 +2516,65 @@ Use the tracker tools.
 		assert!(comments[0].contains("- pr_url: `https://github.com/helixbox/maestro/pull/42`"));
 		assert!(comments[0].contains("- validation_result: `passed`"));
 		assert!(comments[0].contains("- workspace_path: `.workspaces/PUB-618`"));
+	}
+
+	#[test]
+	fn review_handoff_apply_persists_local_handoff_marker() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(vec![
+			Ok(PullRequestDetails {
+				head_ref_name: String::from("x/maestro-pub-618"),
+				head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				head_repository_name: String::from("maestro"),
+				head_repository_owner: String::from("helixbox"),
+				is_draft: false,
+				state: String::from("OPEN"),
+				url: String::from("https://github.com/helixbox/maestro/pull/142"),
+			}),
+			Ok(PullRequestDetails {
+				head_ref_name: String::from("x/maestro-pub-618"),
+				head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				head_repository_name: String::from("maestro"),
+				head_repository_owner: String::from("helixbox"),
+				is_draft: false,
+				state: String::from("OPEN"),
+				url: String::from("https://github.com/helixbox/maestro/pull/142"),
+			}),
+		]);
+		let local_repo_inspector =
+			FakeLocalRepoInspector::new(vec![Ok(sample_local_repo()), Ok(sample_local_repo())]);
+		let review_context = sample_review_context_in(temp_dir.path());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			review_context.clone(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/142",
+				"summary": "Ready for review."
+			}),
+		);
+
+		assert!(response.success);
+
+		bridge.apply_review_handoff().expect("review handoff should apply");
+
+		let marker = state::read_review_handoff_marker(temp_dir.path())
+			.expect("review handoff marker should read")
+			.expect("review handoff marker should exist");
+
+		assert_eq!(marker.branch_name(), review_context.branch_name);
+		assert_eq!(marker.pr_url(), "https://github.com/helixbox/maestro/pull/142");
+		assert_eq!(marker.pr_head_oid(), "08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
 	}
 
 	#[test]

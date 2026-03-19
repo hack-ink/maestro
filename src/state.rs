@@ -16,6 +16,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::prelude::{Result, eyre};
 
 pub(crate) const RUN_ACTIVITY_MARKER_FILE: &str = ".maestro-run-activity";
+pub(crate) const REVIEW_HANDOFF_MARKER_FILE: &str = ".maestro-review-handoff";
 
 const DISPATCH_SLOT_LOCK_FILE_PREFIX: &str = ".maestro-dispatch-slot";
 const ISSUE_CLAIM_LOCK_FILE_PREFIX: &str = ".maestro-issue-claim";
@@ -966,6 +967,47 @@ impl RunActivityMarker {
 	}
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewHandoffMarker {
+	run_id: String,
+	attempt_number: i64,
+	branch_name: String,
+	pr_url: String,
+	pr_head_ref_name: String,
+	pr_head_oid: String,
+}
+impl ReviewHandoffMarker {
+	pub(crate) fn new(
+		run_id: impl Into<String>,
+		attempt_number: i64,
+		branch_name: impl Into<String>,
+		pr_url: impl Into<String>,
+		pr_head_ref_name: impl Into<String>,
+		pr_head_oid: impl Into<String>,
+	) -> Self {
+		Self {
+			run_id: run_id.into(),
+			attempt_number,
+			branch_name: branch_name.into(),
+			pr_url: pr_url.into(),
+			pr_head_ref_name: pr_head_ref_name.into(),
+			pr_head_oid: pr_head_oid.into(),
+		}
+	}
+
+	pub(crate) fn branch_name(&self) -> &str {
+		&self.branch_name
+	}
+
+	pub(crate) fn pr_url(&self) -> &str {
+		&self.pr_url
+	}
+
+	pub(crate) fn pr_head_oid(&self) -> &str {
+		&self.pr_head_oid
+	}
+}
+
 #[derive(Clone)]
 struct DispatchSlotConfig {
 	root: PathBuf,
@@ -1139,6 +1181,16 @@ struct StateGateGuard {
 	_guard: Option<File>,
 }
 
+#[derive(Default)]
+struct ReviewHandoffMarkerRecord {
+	run_id: Option<String>,
+	attempt_number: Option<i64>,
+	branch_name: Option<String>,
+	pr_url: Option<String>,
+	pr_head_ref_name: Option<String>,
+	pr_head_oid: Option<String>,
+}
+
 pub(crate) fn write_run_activity_marker(
 	workspace_path: &Path,
 	run_id: &str,
@@ -1254,6 +1306,42 @@ pub(crate) fn read_run_activity_marker_snapshot(
 			last_activity_unix_epoch: marker.last_activity_unix_epoch,
 			last_protocol_activity_unix_epoch: marker.last_protocol_activity_unix_epoch,
 			retry_budget_attempt_count: marker.retry_budget_attempt_count,
+		})
+	}))
+}
+
+pub(crate) fn write_review_handoff_marker(
+	workspace_path: &Path,
+	marker: &ReviewHandoffMarker,
+) -> Result<()> {
+	fs::create_dir_all(workspace_path)?;
+	fs::write(
+		workspace_path.join(REVIEW_HANDOFF_MARKER_FILE),
+		format!(
+			"run_id={}\nattempt_number={}\nbranch_name={}\npr_url={}\npr_head_ref_name={}\npr_head_oid={}\n",
+			marker.run_id,
+			marker.attempt_number,
+			marker.branch_name,
+			marker.pr_url,
+			marker.pr_head_ref_name,
+			marker.pr_head_oid
+		),
+	)?;
+
+	Ok(())
+}
+
+pub(crate) fn read_review_handoff_marker(
+	workspace_path: &Path,
+) -> Result<Option<ReviewHandoffMarker>> {
+	Ok(read_review_handoff_marker_record(workspace_path)?.and_then(|marker| {
+		Some(ReviewHandoffMarker {
+			run_id: marker.run_id?,
+			attempt_number: marker.attempt_number?,
+			branch_name: marker.branch_name?,
+			pr_url: marker.pr_url?,
+			pr_head_ref_name: marker.pr_head_ref_name?,
+			pr_head_oid: marker.pr_head_oid?,
 		})
 	}))
 }
@@ -1531,6 +1619,36 @@ fn read_run_activity_marker_record(
 	Ok(Some(marker))
 }
 
+fn read_review_handoff_marker_record(
+	workspace_path: &Path,
+) -> Result<Option<ReviewHandoffMarkerRecord>> {
+	let marker_path = workspace_path.join(REVIEW_HANDOFF_MARKER_FILE);
+	let marker_body = match fs::read_to_string(&marker_path) {
+		Ok(body) => body,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
+	let mut marker = ReviewHandoffMarkerRecord::default();
+
+	for line in marker_body.lines() {
+		let Some((key, value)) = line.split_once('=') else {
+			continue;
+		};
+
+		match key {
+			"run_id" => marker.run_id = Some(value.to_owned()),
+			"attempt_number" => marker.attempt_number = value.parse::<i64>().ok(),
+			"branch_name" => marker.branch_name = Some(value.to_owned()),
+			"pr_url" => marker.pr_url = Some(value.to_owned()),
+			"pr_head_ref_name" => marker.pr_head_ref_name = Some(value.to_owned()),
+			"pr_head_oid" => marker.pr_head_oid = Some(value.to_owned()),
+			_ => {},
+		}
+	}
+
+	Ok(Some(marker))
+}
+
 fn timestamp_parts() -> TimestampParts {
 	let now = OffsetDateTime::now_utc();
 
@@ -1585,9 +1703,31 @@ mod tests {
 
 	use tempfile::TempDir;
 
-	use crate::state::{PreacquiredLeaseGuards, StateStore};
+	use crate::state::{self, PreacquiredLeaseGuards, ReviewHandoffMarker, StateStore};
 
 	const IN_PROGRESS_STATE: &str = "In Progress";
+
+	#[test]
+	fn review_handoff_marker_roundtrip_preserves_required_fields() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let marker = ReviewHandoffMarker::new(
+			"run-1",
+			2,
+			"x/maestro-pub-101",
+			"https://github.com/hack-ink/maestro/pull/101",
+			"x/maestro-pub-101",
+			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+		);
+
+		state::write_review_handoff_marker(temp_dir.path(), &marker)
+			.expect("review handoff marker should write");
+
+		let restored = state::read_review_handoff_marker(temp_dir.path())
+			.expect("review handoff marker should read")
+			.expect("review handoff marker should exist");
+
+		assert_eq!(restored, marker);
+	}
 
 	#[test]
 	fn manages_issue_leases() {

@@ -1,0 +1,135 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-173-review-state-classifier",
+    "goal": "Implement the first runtime slice of post-In-Review autonomy by letting Maestro classify an owned PR-backed lane as wait_for_review, needs_review_repair, ready_to_land, or blocked from authoritative GitHub review and check state.",
+    "success_criteria": [
+      "Maestro can re-read the recorded PR for an owned In Review lane and classify the lane as wait_for_review, needs_review_repair, ready_to_land, or blocked without mutating the lane.",
+      "The classification uses authoritative PR identity, review-thread state, review verdicts, required-check state, and mergeability instead of user chat relay.",
+      "The current runtime exposes the classification through status or deterministic logs for the owned lane and handles the absence of an eligible In Review lane explicitly.",
+      "Docs and targeted tests cover the classification rules and the ownership boundary between signal intake and later repair or landing work."
+    ],
+    "constraints": [
+      "Implement against the accepted XY-160 and XY-176 lifecycle and owned-lane policy instead of inventing new skill-specific states.",
+      "Do not perform repair, merge, closeout, or cleanup in this issue.",
+      "Do not rely on Linear comment rereads alone for PR identity because the current tracker abstraction does not expose comment or attachment history.",
+      "Keep the branch rooted at the latest origin/main in the isolated XY-173 workspace; do not touch the root checkout's local WORKFLOW.md modification."
+    ],
+    "defaults": {
+      "status_surface": "reuse local status/reporting surfaces before adding new commands",
+      "classification_outcomes": [
+        "wait_for_review",
+        "needs_review_repair",
+        "ready_to_land",
+        "blocked"
+      ],
+      "authoritative_pr_identity": "must be persisted by the runtime, not reconstructed from chat"
+    },
+    "tasks": [
+      {
+        "id": "task-1",
+        "title": "Pin the persisted review-handoff identity and signal model",
+        "status": "done",
+        "objective": "Trace where an owned In Review lane can recover its authoritative PR identity today, extend persisted runtime state where needed, and codify the exact signal inputs XY-173 will classify.",
+        "inputs": [
+          "XY-173 issue scope",
+          "system_maestro_post_review_lifecycle.md",
+          "system_maestro_owned_lane_policy.md",
+          "current tracker_tool_bridge review-handoff implementation",
+          "current state/status surfaces"
+        ],
+        "outputs": [
+          "Persisted runtime representation for the owned review handoff PR identity and lineage",
+          "Documented classifier input set bound to existing retained-lane state"
+        ],
+        "verification": [
+          "Targeted unit tests for persisted review-handoff identity or recovery metadata",
+          "cargo make fmt-check"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "task-2",
+        "title": "Implement the review-state classifier and operator-visible surface",
+        "status": "done",
+        "objective": "Add the GitHub review/check classifier for owned In Review lanes, wire it into the runtime's local status/reporting surface, and make the no-lane path deterministic.",
+        "inputs": [
+          "Task 1 persisted handoff identity model",
+          "current CLI status surface",
+          "current orchestrator retained-lane logic"
+        ],
+        "outputs": [
+          "Classifier implementation returning wait_for_review, needs_review_repair, ready_to_land, or blocked",
+          "Status/log output exposing the classification for the owned lane",
+          "Tests covering wait, repair, ready_to_land, blocked, and no-lane cases"
+        ],
+        "verification": [
+          "Targeted classifier tests",
+          "cargo make fmt-check",
+          "cargo make lint"
+        ],
+        "depends_on": [
+          "task-1"
+        ]
+      },
+      {
+        "id": "task-3",
+        "title": "Align docs and finish verification for the slice",
+        "status": "done",
+        "objective": "Update specs and plan evidence so the accepted runtime surface, operator expectations, and tests match the implemented classifier slice.",
+        "inputs": [
+          "Task 1 and Task 2 changes",
+          "Accepted XY-160 and XY-176 specs"
+        ],
+        "outputs": [
+          "Spec and doc updates for the review-state classifier slice",
+          "Plan evidence recording the implementation and verification outcomes"
+        ],
+        "verification": [
+          "cargo make fmt-check",
+          "cargo make lint",
+          "cargo make test",
+          "git diff --check"
+        ],
+        "depends_on": [
+          "task-2"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "The retained-lane state cannot safely persist PR identity without expanding the tracker abstraction or state model beyond the scoped classifier slice.",
+        "The smallest safe operator-visible surface is not the existing status/log path and would require a new command or wire protocol.",
+        "Authoritative GitHub review or check signals differ materially from the XY-160 lifecycle assumptions."
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "Added `src/github.rs` for repo-local GitHub identity routing plus PR URL parsing, and persisted `.maestro-review-handoff` markers in `src/state.rs` and `src/agent/tracker_tool_bridge.rs` so retained review lanes can rebind to authoritative PR identity without relying on tracker comment rereads.",
+      "Implemented post-review lane classification in `src/orchestrator.rs` using GitHub GraphQL review/check state and exposed it through the existing operator `status` surface as `wait_for_review`, `needs_review_repair`, `ready_to_land`, or `blocked`.",
+      "Added regression coverage for review handoff marker roundtrip, review handoff marker persistence, ready-to-land status, missing-marker blocked status, unresolved-thread repair classification, and repo-local GitHub identity routing.",
+      "Updated `docs/spec/system_maestro_runtime.md` and `docs/spec/system_maestro_post_review_lifecycle.md` to document the `.maestro-review-handoff` marker and the read-only post-review status surface introduced by XY-173.",
+      "Verification passed on the XY-173 lane: `cargo make fmt-check`, `cargo make lint`, `cargo make test`, and `git diff --check`.",
+      "Pre-commit self-review tightened the status surface so a GitHub PR state read failure degrades the affected post-review lane to `blocked` with reason `pull_request_state_read_failed` instead of aborting the entire `status` command."
+    ],
+    "last_updated": "2026-03-20T01:57:00Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "issue": "XY-173",
+      "workspace": ".workspaces/XY-173",
+      "branch": "x/maestro-xy-173",
+      "baseline_origin_main": "b38fbc0d10493715cd16b7b1dcea517767de68d3",
+      "key_findings": [
+        "The tracker abstraction currently exposes issue fields, labels, blockers, and write-side comments, but not comment or attachment rereads.",
+        "The accepted XY-160 lifecycle already defines the classifier outcomes and authoritative signals for post-In-Review lanes.",
+        "The new XY-173 lane had to be rebased to origin/main because the root checkout is intentionally behind and carries a local WORKFLOW.md modification."
+      ]
+    }
+  }
+}

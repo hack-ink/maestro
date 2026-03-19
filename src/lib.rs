@@ -9,6 +9,7 @@ pub mod workflow;
 
 mod agent;
 mod cli;
+mod github;
 mod orchestrator;
 mod prelude {
 	pub use color_eyre::{Result, eyre};
