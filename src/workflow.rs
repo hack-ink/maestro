@@ -114,6 +114,19 @@ impl WorkflowFrontmatter {
 			eyre::bail!("`execution.max_retry_backoff_ms` must be greater than zero.");
 		}
 
+		let resolved_completed_state =
+			self.tracker.resolved_completed_state_candidate().ok_or_else(|| {
+				eyre::eyre!(
+					"`tracker.completed_state` must be set explicitly when `tracker.terminal_states` does not contain exact `Done`."
+				)
+			})?;
+
+		if !self.tracker.terminal_states.iter().any(|state| state == resolved_completed_state) {
+			eyre::bail!(
+				"`tracker.completed_state` must resolve to one of `tracker.terminal_states`."
+			);
+		}
+
 		self.execution.validate()?;
 
 		Ok(())
@@ -134,6 +147,7 @@ pub struct WorkflowTracker {
 	in_progress_state: String,
 	#[serde(default = "default_success_state")]
 	success_state: String,
+	completed_state: Option<String>,
 	#[serde(default = "default_failure_state")]
 	failure_state: String,
 	#[serde(default = "default_opt_out_label")]
@@ -172,6 +186,17 @@ impl WorkflowTracker {
 		&self.success_state
 	}
 
+	/// Explicit state used after a successful post-merge closeout.
+	pub fn completed_state(&self) -> Option<&str> {
+		self.completed_state.as_deref()
+	}
+
+	/// Resolved state used after a successful post-merge closeout.
+	pub fn resolved_completed_state(&self) -> &str {
+		self.resolved_completed_state_candidate()
+			.expect("validated workflow tracker must resolve a completed_state")
+	}
+
 	/// State used when retries are exhausted.
 	pub fn failure_state(&self) -> &str {
 		&self.failure_state
@@ -185,6 +210,12 @@ impl WorkflowTracker {
 	/// Label that marks failed runs needing human attention.
 	pub fn needs_attention_label(&self) -> &str {
 		&self.needs_attention_label
+	}
+
+	fn resolved_completed_state_candidate(&self) -> Option<&str> {
+		self.completed_state.as_deref().or_else(|| {
+			self.terminal_states.iter().find(|state| state.as_str() == "Done").map(String::as_str)
+		})
 	}
 }
 
@@ -530,6 +561,96 @@ Read `AGENTS.md` first.
 			WorkflowDocument::from_path(file.path()).expect("workflow should load from path");
 
 		assert_eq!(document.frontmatter().tracker().project_slug(), "pubfi");
+	}
+
+	#[test]
+	fn parses_explicit_completed_state() {
+		let document = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+terminal_states = ["Released", "Canceled"]
+completed_state = "Released"
++++
+
+Read `AGENTS.md` first.
+			"#,
+		)
+		.expect("workflow document should parse");
+
+		assert_eq!(document.frontmatter().tracker().completed_state(), Some("Released"));
+		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), "Released");
+	}
+
+	#[test]
+	fn resolves_default_completed_state_from_done_terminal() {
+		let document = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+terminal_states = ["Done", "Canceled", "Duplicate"]
++++
+
+Read `AGENTS.md` first.
+			"#,
+		)
+		.expect("workflow document should parse");
+
+		assert_eq!(document.frontmatter().tracker().completed_state(), None);
+		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), "Done");
+	}
+
+	#[test]
+	fn rejects_missing_completed_state_when_done_terminal_is_missing() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+terminal_states = ["Released", "Canceled"]
++++
+
+Read `AGENTS.md` first.
+			"#,
+		);
+		let error = result.expect_err("completed_state should be required without exact Done");
+
+		assert!(error.to_string().contains("`tracker.completed_state` must be set explicitly"));
+	}
+
+	#[test]
+	fn rejects_completed_state_outside_terminal_states() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+terminal_states = ["Released", "Canceled"]
+completed_state = "Done"
++++
+
+Read `AGENTS.md` first.
+			"#,
+		);
+		let error = result.expect_err("completed_state must belong to terminal_states");
+
+		assert!(error.to_string().contains(
+			"`tracker.completed_state` must resolve to one of `tracker.terminal_states`"
+		));
 	}
 
 	#[test]
