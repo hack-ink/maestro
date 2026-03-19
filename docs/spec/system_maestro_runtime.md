@@ -264,8 +264,8 @@ After a process restart, recent-run history may be shallow because attempt and e
 
 - Lease and session mappings: remove when the run closes.
 - Attempt and event journals: retain only for the current process lifetime.
-- Workspaces: retain while the issue is non-terminal.
-- Terminal issue cleanup: once the issue reaches a terminal tracker state, remove the workspace during reconciliation or startup cleanup.
+- Workspaces: retain while the issue is non-terminal, and also retain terminal owned lanes while authoritative post-merge delivery closeout or deterministic cleanup is still incomplete.
+- Terminal issue cleanup: once the issue reaches a terminal tracker state and no authoritative post-merge tail remains pending, remove the workspace during reconciliation or startup cleanup.
 - If an issue becomes non-terminal but no longer eligible while `maestro` is still preparing the lane, keep the workspace and skip execution for that pass.
 
 ## Recovery rules

@@ -79,8 +79,8 @@ Supported keys:
 - `completed_state`
   - type: string
   - optional
-  - default: `"Done"`
-  - note: successful post-merge closeout target; this must be a member of `terminal_states`
+  - default: if omitted and `terminal_states` contains exact `"Done"`, the resolved completed state is `"Done"`; otherwise this field must be set explicitly
+  - note: successful post-merge closeout target; the resolved completed state must be a member of `terminal_states`
 - `failure_state`
   - type: string
   - optional
