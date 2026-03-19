@@ -1,0 +1,111 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "2026-03-19-maestro-xy-183-read-after-write-lag",
+    "goal": "Harden same-thread continuation against tracker read-after-write lag without reopening the merged XY-157 lane.",
+    "success_criteria": [
+      "Turn-1 continuation validation accepts a locally successful startup transition even when the immediate tracker reread is stale.",
+      "Continuation-blocking local stop writes remain blocking until tracker rereads confirm the issue is active again.",
+      "Targeted tests cover stale reread cases for both startup-transition and stop-write paths.",
+      "Repo-native verification passes on the repaired lane."
+    ],
+    "constraints": [
+      "Do not rewrite XY-157 history or reopen the merged PR; land this as a follow-up fix lane.",
+      "Preserve the conservative terminal-path enforcement added in XY-157.",
+      "Do not touch the root checkout's unrelated WORKFLOW.md change."
+    ],
+    "defaults": {
+      "issue": "XY-183",
+      "workspace": "/Users/xavier/code/trusted/y/hack-ink/maestro/.workspaces/XY-183"
+    },
+    "tasks": [
+      {
+        "id": "task-1",
+        "title": "Pin the stale-reread semantics",
+        "status": "done",
+        "objective": "Identify the smallest safe contract for local successful tracker writes versus stale tracker rereads so the repair closes the late review without reopening the old continuation holes.",
+        "inputs": [
+          "Late review threads on PR #18 discussion_r2958265829 and discussion_r2958265833",
+          "Current orchestrator continuation guard and tracker tool bridge logic on origin/main"
+        ],
+        "outputs": [
+          "A concrete repair shape for startup-transition lag and stop-write lag",
+          "Target test list for the stale-reread cases"
+        ],
+        "verification": [
+          "Cross-check the chosen repair against the current code paths and existing continuation tests"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "task-2",
+        "title": "Implement lag hardening and tests",
+        "status": "done",
+        "objective": "Apply the runtime changes and add targeted tests for stale tracker rereads after local tracker writes.",
+        "inputs": [
+          "task-1 repair shape",
+          "Current continuation and tracker bridge tests"
+        ],
+        "outputs": [
+          "Code changes in the continuation guard / tracker bridge",
+          "Targeted tests for stale startup-transition and stop-write rereads"
+        ],
+        "verification": [
+          "Targeted cargo test coverage for the new stale-reread scenarios"
+        ],
+        "depends_on": [
+          "task-1"
+        ]
+      },
+      {
+        "id": "task-3",
+        "title": "Run gates and record repair evidence",
+        "status": "done",
+        "objective": "Run repo-native verification, update the saved plan state/evidence, and determine whether the lane is ready for review.",
+        "inputs": [
+          "task-2 implementation diff"
+        ],
+        "outputs": [
+          "Fresh verification evidence",
+          "Updated plan state reflecting execution results"
+        ],
+        "verification": [
+          "cargo make fmt-check",
+          "cargo make lint",
+          "cargo make test",
+          "git diff --check"
+        ],
+        "depends_on": [
+          "task-2"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "The repair needs a broader contract change than a local post-merge fix.",
+        "Tests show the stale-reread cases require changing the lifecycle or tracker tool surface.",
+        "Review feedback implies new module or workflow boundaries."
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-19: Created XY-183 as a follow-up fix after PR #18 merged and then received a final Codex review pass at 2026-03-19T07:14:42Z with two new read-after-write lag findings.",
+      "2026-03-19: Pinned the repair shape to two local signals: turn-1 continuation now honors a locally successful startup transition when the immediate tracker reread still reflects the pre-write snapshot, and continuation-blocking local stop writes stay blocking until tracker rereads confirm the issue is active again.",
+      "2026-03-19: Added stale-reread regression coverage in orchestrator::tests::continuation_guard_allows_turn_one_after_local_startup_transition_on_stale_reread plus tracker_tool_bridge stale-active stop-write tests for both opt-out labels and non-In-Progress transitions.",
+      "2026-03-19: Verification passed: cargo test continuation_guard_allows_turn_one_after_local_startup_transition_on_stale_reread -- --nocapture; cargo test turn_classification_rejects_ -- --nocapture; cargo make fmt; cargo make fmt-check; cargo make lint-fix; cargo make lint; cargo make test; git diff --check."
+    ],
+    "last_updated": "2026-03-19T07:30:03Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "late_review_head": "7908d7b4f642aeadf374b6eb71ba5d5c4d13ce15",
+      "merge_anchor": "759d5e6f5a85599d521d62786bca400aa704a875",
+      "pr": "https://github.com/hack-ink/maestro/pull/18"
+    }
+  }
+}

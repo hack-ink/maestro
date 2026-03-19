@@ -72,6 +72,8 @@ pub(crate) struct TrackerToolBridge<'a> {
 	review_context: Option<ReviewHandoffContext>,
 	pull_request_inspector: &'a dyn PullRequestInspector,
 	local_repo_inspector: &'a dyn LocalRepoInspector,
+	local_issue_state_name: RefCell<String>,
+	local_opt_out_requested: RefCell<bool>,
 	manual_attention_requested: RefCell<bool>,
 	manual_attention_comment_recorded: RefCell<bool>,
 	continuation_blocking_tracker_write: RefCell<Option<String>>,
@@ -92,6 +94,10 @@ impl<'a> TrackerToolBridge<'a> {
 			review_context: None,
 			pull_request_inspector: &GH_PULL_REQUEST_INSPECTOR,
 			local_repo_inspector: &LOCAL_GIT_REPO_INSPECTOR,
+			local_issue_state_name: RefCell::new(issue.state.name.clone()),
+			local_opt_out_requested: RefCell::new(
+				issue.has_label(workflow.frontmatter().tracker().opt_out_label()),
+			),
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
 			continuation_blocking_tracker_write: RefCell::new(None),
@@ -115,6 +121,10 @@ impl<'a> TrackerToolBridge<'a> {
 			review_context: Some(review_context),
 			pull_request_inspector,
 			local_repo_inspector,
+			local_issue_state_name: RefCell::new(issue.state.name.clone()),
+			local_opt_out_requested: RefCell::new(
+				issue.has_label(workflow.frontmatter().tracker().opt_out_label()),
+			),
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
 			continuation_blocking_tracker_write: RefCell::new(None),
@@ -322,6 +332,7 @@ impl<'a> TrackerToolBridge<'a> {
 
 		match self.tracker.update_issue_state(&self.issue.id, state_id) {
 			Ok(()) => {
+				self.local_issue_state_name.replace(parsed.state.clone());
 				self.record_continuation_blocking_transition(&parsed.state);
 
 				DynamicToolCallResponse::success(format!(
@@ -486,6 +497,7 @@ impl<'a> TrackerToolBridge<'a> {
 			if manual_attention_label {
 				self.manual_attention_requested.replace(true);
 			} else if parsed.label == self.workflow.frontmatter().tracker().opt_out_label() {
+				self.local_opt_out_requested.replace(true);
 				self.record_continuation_blocking_write(format!(
 					"`{ISSUE_LABEL_ADD_TOOL_NAME}` with label `{}`",
 					parsed.label
@@ -505,6 +517,7 @@ impl<'a> TrackerToolBridge<'a> {
 				if manual_attention_label {
 					self.manual_attention_requested.replace(true);
 				} else if parsed.label == self.workflow.frontmatter().tracker().opt_out_label() {
+					self.local_opt_out_requested.replace(true);
 					self.record_continuation_blocking_write(format!(
 						"`{ISSUE_LABEL_ADD_TOOL_NAME}` with label `{}`",
 						parsed.label
@@ -676,10 +689,22 @@ impl<'a> TrackerToolBridge<'a> {
 		self.continuation_blocking_tracker_write.replace(Some(reason));
 	}
 
+	fn local_issue_remains_active(&self) -> bool {
+		self.local_issue_state_name.borrow().as_str()
+			== self.workflow.frontmatter().tracker().in_progress_state()
+			&& !*self.local_opt_out_requested.borrow()
+			&& !*self.manual_attention_requested.borrow()
+	}
+
 	fn continuation_blocking_write_reason(&self) -> crate::prelude::Result<Option<String>> {
 		let Some(reason) = self.continuation_blocking_tracker_write.borrow().clone() else {
 			return Ok(None);
 		};
+
+		if !self.local_issue_remains_active() {
+			return Ok(Some(reason));
+		}
+
 		let issue = match self.refreshed_issue_snapshot()? {
 			Some(issue) => issue,
 			None => return Ok(Some(reason)),
@@ -694,6 +719,11 @@ impl<'a> TrackerToolBridge<'a> {
 		}
 
 		Ok(Some(reason))
+	}
+
+	pub(crate) fn startup_transition_succeeded_locally(&self) -> bool {
+		self.local_issue_state_name.borrow().as_str()
+			== self.workflow.frontmatter().tracker().in_progress_state()
 	}
 
 	pub(crate) fn completion_disposition(
@@ -2023,6 +2053,78 @@ Use the tracker tools.
 			"The issue moved back to Todo without a terminal path.",
 		)
 		.expect_err("non-In-Progress transitions must not exit via a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_TRANSITION_TOOL_NAME));
+	}
+
+	#[test]
+	fn turn_classification_rejects_opt_out_label_when_refresh_is_stale_active() {
+		let active_issue = sample_issue();
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![active_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:manual-only" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"Tracker reread is stale, but the local opt-out write should still block continuation.",
+		)
+		.expect_err(
+			"local opt-out writes must remain blocking until the tracker reread catches up",
+		);
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_LABEL_ADD_TOOL_NAME));
+	}
+
+	#[test]
+	fn turn_classification_rejects_non_in_progress_transition_when_refresh_is_stale_active() {
+		let active_issue = sample_issue();
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![active_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "Todo" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"Tracker reread is stale, but the local non-active transition should still block continuation.",
+		)
+		.expect_err(
+			"local stop transitions must remain blocking until the tracker reread catches up",
+		);
 
 		assert!(error.to_string().contains("without recording a terminal path"));
 		assert!(error.to_string().contains(ISSUE_TRANSITION_TOOL_NAME));

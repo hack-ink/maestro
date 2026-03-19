@@ -142,30 +142,59 @@ struct PrepareIssueRunContext<'a, T> {
 
 struct IssueTurnContinuationGuard<'a, T> {
 	tracker: &'a T,
+	tracker_tool_bridge: &'a TrackerToolBridge<'a>,
 	workflow: &'a WorkflowDocument,
 	issue_id: &'a str,
 	issue_identifier: &'a str,
+	initial_issue_state: &'a str,
 	retry_project_slug: &'a str,
 }
 impl<T> TurnContinuationGuard for IssueTurnContinuationGuard<'_, T>
 where
 	T: IssueTracker,
 {
-	fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+	fn should_continue_turn(&self, turn_count: u32) -> crate::prelude::Result<bool> {
 		let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
 			return Ok(false);
 		};
 		let tracker_policy = self.workflow.frontmatter().tracker();
-
-		Ok(issue.project_slug.as_deref() == Some(self.retry_project_slug)
+		let issue_remains_active = issue.project_slug.as_deref() == Some(self.retry_project_slug)
 			&& issue.state.name == tracker_policy.in_progress_state()
 			&& !issue.has_label(tracker_policy.opt_out_label())
-			&& !issue.has_label(tracker_policy.needs_attention_label()))
+			&& !issue.has_label(tracker_policy.needs_attention_label());
+
+		if issue_remains_active {
+			return Ok(true);
+		}
+
+		let turn_one_still_reflects_prewrite_snapshot = turn_count == 1
+			&& self.tracker_tool_bridge.startup_transition_succeeded_locally()
+			&& issue.project_slug.as_deref() == Some(self.retry_project_slug)
+			&& issue.state.name == self.initial_issue_state
+			&& !issue.has_label(tracker_policy.opt_out_label())
+			&& !issue.has_label(tracker_policy.needs_attention_label());
+
+		Ok(turn_one_still_reflects_prewrite_snapshot)
 	}
 
 	fn validate_continuation_boundary(&self, turn_count: u32) -> crate::prelude::Result<()> {
 		if turn_count != 1 {
 			return Ok(());
+		}
+		if self.tracker_tool_bridge.startup_transition_succeeded_locally() {
+			let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
+				return Ok(());
+			};
+			let tracker_policy = self.workflow.frontmatter().tracker();
+
+			if issue.project_slug.as_deref() == Some(self.retry_project_slug)
+				&& !issue.has_label(tracker_policy.opt_out_label())
+				&& !issue.has_label(tracker_policy.needs_attention_label())
+				&& (issue.state.name == tracker_policy.in_progress_state()
+					|| issue.state.name == self.initial_issue_state)
+			{
+				return Ok(());
+			}
 		}
 
 		let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
@@ -2532,9 +2561,11 @@ where
 	);
 	let continuation_guard = IssueTurnContinuationGuard {
 		tracker,
+		tracker_tool_bridge: &tracker_tool_bridge,
 		workflow,
 		issue_id: &issue_run.issue.id,
 		issue_identifier: &issue_run.issue.identifier,
+		initial_issue_state: &issue_run.issue.state.name,
 		retry_project_slug: &issue_run.retry_project_slug,
 	};
 	let run_result = agent::execute_app_server_run(
@@ -3690,7 +3721,9 @@ mod tests {
 	use time::OffsetDateTime;
 
 	use crate::{
-		agent::{ACTIVE_RUN_IDLE_TIMEOUT, TurnContinuationGuard},
+		agent::{
+			ACTIVE_RUN_IDLE_TIMEOUT, DynamicToolHandler, TrackerToolBridge, TurnContinuationGuard,
+		},
 		config::ServiceConfig,
 		orchestrator::{
 			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
@@ -5739,17 +5772,20 @@ read_first = [{read_first}]
 		);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let tracker_tool_bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let guard = orchestrator::IssueTurnContinuationGuard {
 			tracker: &tracker,
+			tracker_tool_bridge: &tracker_tool_bridge,
 			workflow: &workflow,
 			issue_id: &issue.id,
 			issue_identifier: &issue.identifier,
+			initial_issue_state: &issue.state.name,
 			retry_project_slug: resolved_project_slug,
 		};
 
 		assert!(
 			guard
-				.should_continue_turn()
+				.should_continue_turn(2)
 				.expect("resolved project slug should keep the continuation active")
 		);
 	}
@@ -5760,11 +5796,14 @@ read_first = [{read_first}]
 		let issue = sample_issue("Todo", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let tracker_tool_bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let guard = orchestrator::IssueTurnContinuationGuard {
 			tracker: &tracker,
+			tracker_tool_bridge: &tracker_tool_bridge,
 			workflow: &workflow,
 			issue_id: &issue.id,
 			issue_identifier: &issue.identifier,
+			initial_issue_state: &issue.state.name,
 			retry_project_slug: issue
 				.project_slug
 				.as_deref()
@@ -5776,6 +5815,45 @@ read_first = [{read_first}]
 
 		assert!(
 			error.to_string().contains("ended without moving the tracker issue to `In Progress`")
+		);
+	}
+
+	#[test]
+	fn continuation_guard_allows_turn_one_after_local_startup_transition_on_stale_reread() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let tracker_tool_bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let transition_response = DynamicToolHandler::handle_call(
+			&tracker_tool_bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "In Progress" }),
+		);
+
+		assert!(transition_response.success);
+
+		let guard = orchestrator::IssueTurnContinuationGuard {
+			tracker: &tracker,
+			tracker_tool_bridge: &tracker_tool_bridge,
+			workflow: &workflow,
+			issue_id: &issue.id,
+			issue_identifier: &issue.identifier,
+			initial_issue_state: &issue.state.name,
+			retry_project_slug: issue
+				.project_slug
+				.as_deref()
+				.expect("sample issue should carry a project slug"),
+		};
+
+		assert!(
+			guard
+				.should_continue_turn(1)
+				.expect("a stale pre-write reread should not block turn-one continuation")
+		);
+
+		guard.validate_continuation_boundary(1).expect(
+			"a stale pre-write reread should not hard-fail turn one after a local startup transition",
 		);
 	}
 

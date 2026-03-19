@@ -33,7 +33,7 @@ const PROBE_DEVELOPER_INSTRUCTIONS: &str = "You are a protocol probe. You must c
 const PROBE_USER_INPUT: &str = "Call `echo_probe` with `{\\\"text\\\":\\\"PROBE_OK\\\"}`. After the tool succeeds, reply with the exact text PROBE_OK.";
 
 pub(crate) trait TurnContinuationGuard {
-	fn should_continue_turn(&self) -> Result<bool>;
+	fn should_continue_turn(&self, turn_count: u32) -> Result<bool>;
 	fn validate_continuation_boundary(&self, _turn_count: u32) -> Result<()> {
 		Ok(())
 	}
@@ -610,7 +610,7 @@ fn continuation_boundary_reached(
 		return Ok(false);
 	};
 
-	if continuation_guard.should_continue_turn()? {
+	if continuation_guard.should_continue_turn(turn_count)? {
 		return Ok(false);
 	}
 
@@ -929,14 +929,14 @@ mod tests {
 
 	struct YieldingContinuationGuard;
 	impl super::TurnContinuationGuard for YieldingContinuationGuard {
-		fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+		fn should_continue_turn(&self, _turn_count: u32) -> crate::prelude::Result<bool> {
 			Ok(false)
 		}
 	}
 
 	struct RejectingContinuationGuard;
 	impl super::TurnContinuationGuard for RejectingContinuationGuard {
-		fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+		fn should_continue_turn(&self, _turn_count: u32) -> crate::prelude::Result<bool> {
 			Ok(false)
 		}
 
