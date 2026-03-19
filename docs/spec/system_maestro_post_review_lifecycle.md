@@ -137,7 +137,7 @@ While in `delivery_closeout`:
 - tracker closeout runs before GitHub mirror updates
 - the tracker issue transitions from `In Review` to the resolved `tracker.completed_state`
 
-Successful post-merge closeout requires a machine-readable resolved `tracker.completed_state`. Repository workflow policy resolves that target either from the explicit `tracker.completed_state` field or, if that field is omitted, from an exact `"Done"` terminal-state default. If workflow policy cannot resolve a valid completed state, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target.
+Successful post-merge closeout requires a machine-readable resolved `tracker.completed_state`. Repository workflow policy resolves that target either from the explicit `tracker.completed_state` field or, if that field is omitted, from an exact `"Done"` terminal-state default. Until post-merge closeout is actually implemented, workflow parsing may remain permissive so existing repositories still load; once `delivery_closeout` consumes this field, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target whenever workflow policy still cannot resolve a valid completed state.
 
 If merge is authoritative but closeout fails due to a deterministic infrastructure problem with no contradictory state, the runtime may resume `delivery_closeout` later within the same owned lane. A terminal tracker state written during `delivery_closeout` does not by itself authorize workspace deletion while GitHub mirroring or deterministic cleanup are still pending. If state is contradictory, the runtime must stop for human intervention.
 

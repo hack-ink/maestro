@@ -8,7 +8,6 @@ startable_states = ["Todo"]
 terminal_states = ["Done", "Canceled", "Duplicate"]
 in_progress_state = "In Progress"
 success_state = "In Review"
-completed_state = "Done"
 failure_state = "Todo"
 opt_out_label = "maestro:manual-only"
 needs_attention_label = "maestro:needs-attention"

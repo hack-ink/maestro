@@ -114,17 +114,10 @@ impl WorkflowFrontmatter {
 			eyre::bail!("`execution.max_retry_backoff_ms` must be greater than zero.");
 		}
 
-		let resolved_completed_state =
-			self.tracker.resolved_completed_state_candidate().ok_or_else(|| {
-				eyre::eyre!(
-					"`tracker.completed_state` must be set explicitly when `tracker.terminal_states` does not contain exact `Done`."
-				)
-			})?;
-
-		if !self.tracker.terminal_states.iter().any(|state| state == resolved_completed_state) {
-			eyre::bail!(
-				"`tracker.completed_state` must resolve to one of `tracker.terminal_states`."
-			);
+		if let Some(completed_state) = self.tracker.completed_state()
+			&& !self.tracker.terminal_states.iter().any(|state| state == completed_state)
+		{
+			eyre::bail!("`tracker.completed_state` must be one of `tracker.terminal_states`.");
 		}
 
 		self.execution.validate()?;
@@ -191,10 +184,10 @@ impl WorkflowTracker {
 		self.completed_state.as_deref()
 	}
 
-	/// Resolved state used after a successful post-merge closeout.
-	pub fn resolved_completed_state(&self) -> &str {
+	/// Resolved state used after a successful post-merge closeout when workflow
+	/// policy can determine one.
+	pub fn resolved_completed_state(&self) -> Option<&str> {
 		self.resolved_completed_state_candidate()
-			.expect("validated workflow tracker must resolve a completed_state")
 	}
 
 	/// State used when retries are exhausted.
@@ -583,7 +576,7 @@ Read `AGENTS.md` first.
 		.expect("workflow document should parse");
 
 		assert_eq!(document.frontmatter().tracker().completed_state(), Some("Released"));
-		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), "Released");
+		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), Some("Released"));
 	}
 
 	#[test]
@@ -605,12 +598,12 @@ Read `AGENTS.md` first.
 		.expect("workflow document should parse");
 
 		assert_eq!(document.frontmatter().tracker().completed_state(), None);
-		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), "Done");
+		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), Some("Done"));
 	}
 
 	#[test]
-	fn rejects_missing_completed_state_when_done_terminal_is_missing() {
-		let result = WorkflowDocument::parse_markdown(
+	fn allows_missing_completed_state_when_done_terminal_is_missing() {
+		let document = WorkflowDocument::parse_markdown(
 			r#"
 +++
 version = 1
@@ -623,10 +616,11 @@ terminal_states = ["Released", "Canceled"]
 
 Read `AGENTS.md` first.
 			"#,
-		);
-		let error = result.expect_err("completed_state should be required without exact Done");
+		)
+		.expect("workflow document should parse without a resolved completed_state");
 
-		assert!(error.to_string().contains("`tracker.completed_state` must be set explicitly"));
+		assert_eq!(document.frontmatter().tracker().completed_state(), None);
+		assert_eq!(document.frontmatter().tracker().resolved_completed_state(), None);
 	}
 
 	#[test]
@@ -648,9 +642,11 @@ Read `AGENTS.md` first.
 		);
 		let error = result.expect_err("completed_state must belong to terminal_states");
 
-		assert!(error.to_string().contains(
-			"`tracker.completed_state` must resolve to one of `tracker.terminal_states`"
-		));
+		assert!(
+			error
+				.to_string()
+				.contains("`tracker.completed_state` must be one of `tracker.terminal_states`")
+		);
 	}
 
 	#[test]

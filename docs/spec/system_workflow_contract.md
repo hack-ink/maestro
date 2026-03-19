@@ -80,7 +80,8 @@ Supported keys:
   - type: string
   - optional
   - default: if omitted and `terminal_states` contains exact `"Done"`, the resolved completed state is `"Done"`; otherwise this field must be set explicitly
-  - note: successful post-merge closeout target; the resolved completed state must be a member of `terminal_states`
+  - note: successful post-merge closeout target; when present, it must be a member of `terminal_states`
+  - note: parser/load paths may remain permissive until post-merge closeout is implemented, but the runtime must stop for `manual_intervention_required` if closeout needs a completed state and workflow policy cannot resolve one
 - `failure_state`
   - type: string
   - optional
