@@ -1,0 +1,121 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-160-post-in-review-lifecycle",
+    "goal": "Define the normative post-In-Review lifecycle for Maestro-owned lanes using openai/symphony as the only external design standard and the local owned-lane policy plus workflow adapters as execution constraints.",
+    "success_criteria": [
+      "A new spec document defines the authoritative post-In-Review states, decisions, transitions, and ownership boundaries for Maestro-owned lanes.",
+      "The spec aligns with the current runtime handoff boundary and the owned-lane policy without turning current skill names into the core domain model.",
+      "The spec maps the accepted lifecycle to the existing follow-on implementation issues XY-173, XY-174, XY-175, and XY-177."
+    ],
+    "constraints": [
+      "Treat openai/symphony README.md and SPEC.md as the only external design standard.",
+      "Use AGENTS.md and checked-in skills only as local execution-context inputs and operating constraints.",
+      "Stay in spec scope; do not implement the runtime in this issue.",
+      "Keep durable artifacts in English."
+    ],
+    "defaults": {
+      "index_path": "docs/spec/index.md",
+      "issue": "XY-160",
+      "spec_path": "docs/spec/system_maestro_post_review_lifecycle.md"
+    },
+    "tasks": [
+      {
+        "id": "task-1",
+        "title": "Synthesize governing inputs",
+        "status": "done",
+        "objective": "Capture the current Maestro runtime boundary, owned-lane policy, local workflow adapter constraints, and latest Symphony service principles that should shape the post-In-Review lifecycle.",
+        "inputs": [
+          "docs/spec/system_maestro_runtime.md",
+          "docs/spec/system_maestro_owned_lane_policy.md",
+          "/Users/xavier/code/trusted/y/hack-ink/maestro/AGENTS.md",
+          "/Users/xavier/code/trusted/y/hack-ink/skills/* relevant workflow skills",
+          "openai/symphony README.md and SPEC.md"
+        ],
+        "outputs": [
+          "A grounded design frame for the new lifecycle spec"
+        ],
+        "verification": [
+          "Collected sources are reflected in the written spec without placeholder claims"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "task-2",
+        "title": "Write the post-In-Review lifecycle spec",
+        "status": "done",
+        "objective": "Author the normative spec covering wait, repair, land, closeout, cleanup, manual intervention, and automatic recovery after PR-backed In Review handoff.",
+        "inputs": [
+          "task-1 synthesis"
+        ],
+        "outputs": [
+          "docs/spec/system_maestro_post_review_lifecycle.md"
+        ],
+        "verification": [
+          "Spec header follows docs/spec contract",
+          "State transitions and ownership boundaries are explicit",
+          "Failure and retry handling after In Review are defined"
+        ],
+        "depends_on": [
+          "task-1"
+        ]
+      },
+      {
+        "id": "task-3",
+        "title": "Integrate and verify the new spec",
+        "status": "done",
+        "objective": "Link the new spec from the spec index, reference the existing follow-on issues, and validate the plan/spec artifacts.",
+        "inputs": [
+          "task-2 spec draft",
+          "existing follow-on issues XY-173, XY-174, XY-175, XY-177"
+        ],
+        "outputs": [
+          "Updated docs/spec/index.md",
+          "Validated plan and spec artifacts"
+        ],
+        "verification": [
+          "cargo make fmt-check",
+          "python3 /Users/xavier/.codex/skills/plan-writing/scripts/validate_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json",
+          "git diff --check"
+        ],
+        "depends_on": [
+          "task-2"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "Symphony evidence materially changes the intended lifecycle boundary",
+        "The accepted lifecycle requires new follow-on issue splits beyond XY-173/174/175/177",
+        "Local runtime or owned-lane policy evidence contradicts the drafted state machine"
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-19: Reviewed the current Maestro handoff boundary in system_maestro_runtime, the owned-lane decision classes in system_maestro_owned_lane_policy, the local workflow adapter contracts in AGENTS.md and checked-in skills, and the latest openai/symphony README.md plus SPEC.md as the only external design standard.",
+      "2026-03-19: Added docs/spec/system_maestro_post_review_lifecycle.md to define the normative lane phases after PR-backed In Review handoff: review_wait, review_repair, ready_to_land, landing, delivery_closeout, and cleanup, along with retry, cancellation, and manual-intervention boundaries.",
+      "2026-03-19: Updated docs/spec/index.md to route readers to the new post-In-Review lifecycle spec and mapped the accepted implementation split onto XY-173, XY-174, XY-175, and XY-177.",
+      "2026-03-19: Fresh verification passed: cargo make fmt-check, python3 /Users/xavier/.codex/skills/plan-writing/scripts/validate_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json, python3 /Users/xavier/.codex/skills/plan-execution/scripts/read_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json, git diff --check."
+    ],
+    "last_updated": "2026-03-19T17:00:22Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "design_standard": "openai/symphony README.md + SPEC.md",
+      "issue": "XY-160",
+      "follow_on_issues": [
+        "XY-173",
+        "XY-174",
+        "XY-175",
+        "XY-177"
+      ],
+      "policy_anchor": "docs/spec/system_maestro_owned_lane_policy.md",
+      "runtime_anchor": "docs/spec/system_maestro_runtime.md"
+    }
+  }
+}

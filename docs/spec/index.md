@@ -56,3 +56,4 @@ Then keep the body explicit:
 
 - [`system_maestro_runtime.md`](./system_maestro_runtime.md) defines the runtime state model, reconciliation rules, and tracker writeback boundaries.
 - [`system_maestro_owned_lane_policy.md`](./system_maestro_owned_lane_policy.md) defines the fallback policy for Maestro-owned lanes, including manual-intervention and automatic-recovery decisions.
+- [`system_maestro_post_review_lifecycle.md`](./system_maestro_post_review_lifecycle.md) defines the normative post-`In Review` lane phases, transitions, and ownership boundaries through landing, closeout, and cleanup.
