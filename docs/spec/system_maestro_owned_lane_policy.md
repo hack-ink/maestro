@@ -56,6 +56,7 @@ The runtime may use only the following signal groups to decide lane behavior:
   - current attempt and retry-budget bookkeeping
 - Review state:
   - whether the recorded PR still matches the lane branch and validated head
+  - whether the PR is still open, closed without merge, or merged
   - review approval or requested-change state
   - unresolved review-thread state
   - required-check state

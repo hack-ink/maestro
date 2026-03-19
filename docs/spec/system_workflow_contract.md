@@ -76,6 +76,11 @@ Supported keys:
   - optional
   - default: `"In Review"`
   - note: `maestro` treats this as a PR-backed review handoff state, not a terminal completion state
+- `completed_state`
+  - type: string
+  - optional
+  - default: `"Done"`
+  - note: successful post-merge closeout target; this must be a member of `terminal_states`
 - `failure_state`
   - type: string
   - optional

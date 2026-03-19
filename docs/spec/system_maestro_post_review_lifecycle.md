@@ -26,7 +26,7 @@ Defines: Post-`In Review` lane phases, phase-to-action-class mapping, authoritat
 
 1. Post-`In Review` work remains part of the same Maestro-owned lane.
 2. Post-`In Review` automation must keep using authoritative signals rather than chat memory, branch-name heuristics, or skill-name-specific states.
-3. The tracker issue must remain in `In Review` until authoritative delivery closeout transitions it to a terminal completed state, unless a human explicitly cancels or redirects the lane.
+3. The tracker issue must remain in `In Review` until authoritative delivery closeout transitions it to the workflow-defined `tracker.completed_state`, unless a human explicitly cancels the lane into a terminal tracker state first.
 4. A later review-repair attempt must resume the retained lane for the same issue and PR head lineage; it must not silently open a fresh unrelated implementation lane.
 5. Landing, delivery closeout, and cleanup are deterministic tail stages of the same owned lane, not separate human-only ceremonies.
 6. No phase in this lifecycle may depend on the permanent existence of a particular local helper name such as `review-request`, `review-repair`, `pr-land`, or `delivery-closeout`.
@@ -46,6 +46,7 @@ Post-`In Review` classification may use only these signal groups:
   - current branch, validated head, and retry/churn bookkeeping
 - Review state:
   - PR identity and current head
+  - whether the PR is still open, closed without merge, or merged
   - review approval or requested-change state
   - unresolved review-thread state
   - required-check state
@@ -134,13 +135,9 @@ While in `delivery_closeout`:
 
 - the merge anchor is authoritative
 - tracker closeout runs before GitHub mirror updates
-- the tracker issue transitions from `In Review` to the successful completed state
+- the tracker issue transitions from `In Review` to `tracker.completed_state`
 
-Successful completed-state resolution must be deterministic:
-
-1. If repository workflow policy exposes exactly one terminal state intended for successful completion, use it.
-2. Otherwise, if the terminal-state set contains an exact `Done` state, use `Done`.
-3. Otherwise, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target.
+`tracker.completed_state` is a required machine-readable workflow-policy target for successful post-merge closeout. It must be a member of `tracker.terminal_states`. If workflow policy does not provide a valid `tracker.completed_state`, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target.
 
 If merge is authoritative but closeout fails due to a deterministic infrastructure problem with no contradictory state, the runtime may resume `delivery_closeout` later within the same owned lane. If state is contradictory, the runtime must stop for human intervention.
 
@@ -149,12 +146,12 @@ If merge is authoritative but closeout fails due to a deterministic infrastructu
 `cleanup` is the final deterministic tail stage. It removes retained workspace and lane branch state only after one of these terminal ownership conditions is authoritative:
 
 - successful delivery: merge and delivery closeout are already authoritative
-- explicit pre-merge cancellation: the tracker or PR state ended owned-lane progress before merge, and no contradictory retained-lane evidence remains
+- explicit pre-merge terminal cancellation: the tracker issue already reached a terminal cancellation state before merge, and no contradictory retained-lane evidence remains
 
 `cleanup` must not begin while:
 
 - review work is still pending for a lane whose owned progress has not been explicitly canceled
-- neither successful delivery nor explicit cancellation has ended owned-lane progress
+- neither successful delivery nor explicit pre-merge terminal cancellation has ended owned-lane progress
 - successful delivery is the governing path but merge is not yet authoritative
 - successful delivery is the governing path and delivery closeout is incomplete
 
@@ -169,7 +166,7 @@ If merge is authoritative but closeout fails due to a deterministic infrastructu
 7. `ready_to_land -> landing` when the runtime begins the merge step.
 8. `landing -> delivery_closeout` when merge is authoritative for the lane's anchor.
 9. `delivery_closeout -> cleanup` when the tracker closeout succeeds and only deterministic local cleanup remains.
-10. `review_wait`, `review_repair`, or `ready_to_land` may transition directly to `cleanup` when explicit pre-merge cancellation ends owned-lane progress and only deterministic local cleanup remains.
+10. `review_wait`, `review_repair`, or `ready_to_land` may transition directly to `cleanup` when the tracker issue reaches a terminal cancellation state before merge and only deterministic local cleanup remains.
 11. `cleanup -> finished` when the retained workspace and lane branch state are clean.
 
 At any phase, contradictory signals or exhausted repair/convergence budgets force `manual_intervention_required`.
@@ -201,12 +198,13 @@ Cancellation is not a separate owned-lane action class. It is an authoritative e
 Examples:
 
 - the issue is moved to `Canceled` or `Duplicate`
-- the PR is closed without merge and the tracker issue is explicitly redirected away from the owned lane
+- the PR is closed without merge and the tracker issue is moved to `Canceled` or `Duplicate`
 
 When cancellation is authoritative:
 
 - the runtime must stop autonomous review follow-up and landing
-- `review_wait`, `review_repair`, and `ready_to_land` may transition directly to `cleanup` only if the cancellation state is explicit and no contradictory retained-lane evidence remains
+- `review_wait`, `review_repair`, and `ready_to_land` may transition directly to `cleanup` only if the tracker issue is already terminal and no contradictory retained-lane evidence remains
+- if the PR closes without merge but the tracker issue remains non-terminal or is redirected back to active workflow, the runtime must retain the workspace and stop rather than deleting recovery state
 - `landing` and `delivery_closeout` must not reinterpret an already-authoritative merge as cancellation; contradictory post-merge cancellation signals require `manual_intervention_required`
 - the runtime must not reopen or reinterpret the lane automatically
 
