@@ -19,6 +19,7 @@ pub(crate) const RUN_ACTIVITY_MARKER_FILE: &str = ".maestro-run-activity";
 
 const DISPATCH_SLOT_LOCK_FILE_PREFIX: &str = ".maestro-dispatch-slot";
 const ISSUE_CLAIM_LOCK_FILE_PREFIX: &str = ".maestro-issue-claim";
+const STATE_GATE_LOCK_FILE_PREFIX: &str = ".maestro-state-gate";
 
 /// Local runtime store for leases, attempts, workspaces, and protocol events.
 #[derive(Default)]
@@ -43,6 +44,17 @@ impl StateStore {
 		workspace_root: impl AsRef<Path>,
 		slot_limit: u32,
 	) -> Result<()> {
+		self.configure_dispatch_slot_policy(project_id, workspace_root, slot_limit, &HashMap::new())
+	}
+
+	/// Configure the shared dispatch-slot root plus per-state limits for one project.
+	pub fn configure_dispatch_slot_policy(
+		&self,
+		project_id: &str,
+		workspace_root: impl AsRef<Path>,
+		slot_limit: u32,
+		state_slot_limits: &HashMap<String, u32>,
+	) -> Result<()> {
 		let mut state = self.lock()?;
 
 		state.dispatch_slot_configs.insert(
@@ -51,6 +63,17 @@ impl StateStore {
 				root: workspace_root.as_ref().to_path_buf(),
 				slot_limit: usize::try_from(slot_limit)
 					.map_err(|_error| eyre::eyre!("dispatch slot limit overflowed usize"))?,
+				state_slot_limits: state_slot_limits
+					.iter()
+					.map(|(state_name, limit)| {
+						Ok((
+							state_name.clone(),
+							usize::try_from(*limit).map_err(|_error| {
+								eyre::eyre!("state dispatch slot limit overflowed usize")
+							})?,
+						))
+					})
+					.collect::<Result<HashMap<_, _>>>()?,
 			},
 		);
 
@@ -80,7 +103,7 @@ impl StateStore {
 		Ok(())
 	}
 
-	/// Try to acquire the project's single active dispatch slot for one issue.
+	/// Try to acquire one issue claim plus one shared dispatch slot for one issue.
 	pub fn try_acquire_lease(
 		&self,
 		project_id: &str,
@@ -119,6 +142,18 @@ impl StateStore {
 				run_id,
 				issue_state,
 			)?;
+
+			let state_gate_guard = acquire_state_gate_guard(
+				&state,
+				&dispatch_slot_config,
+				project_id,
+				issue_id,
+				issue_state,
+			)?;
+
+			if state_gate_guard.blocked {
+				return Ok(false);
+			}
 
 			let held_slot_indexes = state
 				.dispatch_slot_guards
@@ -917,6 +952,7 @@ impl RunActivityMarker {
 struct DispatchSlotConfig {
 	root: PathBuf,
 	slot_limit: usize,
+	state_slot_limits: HashMap<String, usize>,
 }
 
 struct IssueClaimGuard {
@@ -1052,6 +1088,11 @@ struct RunActivityMarkerRecord {
 	retry_budget_attempt_count: Option<i64>,
 }
 
+struct StateGateGuard {
+	blocked: bool,
+	_guard: Option<File>,
+}
+
 pub(crate) fn write_run_activity_marker(
 	workspace_path: &Path,
 	run_id: &str,
@@ -1179,6 +1220,23 @@ fn issue_claim_lock_path(root: &Path, issue_id: &str) -> PathBuf {
 	root.join(format!("{ISSUE_CLAIM_LOCK_FILE_PREFIX}.{issue_id}.lock"))
 }
 
+fn state_gate_lock_path(root: &Path, state_name: &str) -> PathBuf {
+	root.join(format!("{STATE_GATE_LOCK_FILE_PREFIX}.{}.lock", encode_lock_component(state_name)))
+}
+
+fn encode_lock_component(value: &str) -> String {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+
+	let mut encoded = String::with_capacity(value.len() * 2);
+
+	for byte in value.as_bytes() {
+		encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+		encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+	}
+
+	encoded
+}
+
 fn issue_claim_id_from_path(path: &Path) -> Option<String> {
 	let file_name = path.file_name()?.to_str()?;
 
@@ -1251,6 +1309,106 @@ fn read_issue_claim_record(path: &Path) -> Result<Option<IssueLease>> {
 	};
 
 	Ok(Some(IssueLease { project_id, issue_id, run_id, issue_state }))
+}
+
+fn count_shared_state_occupancy(
+	state: &StateData,
+	dispatch_slot_config: &DispatchSlotConfig,
+	project_id: &str,
+	issue_state: &str,
+	excluded_issue_id: &str,
+) -> Result<usize> {
+	let mut seen_issue_ids = HashSet::from([excluded_issue_id.to_owned()]);
+	let mut occupied = 0;
+
+	for lease in state.leases.values() {
+		if lease.project_id == project_id
+			&& lease.issue_state == issue_state
+			&& seen_issue_ids.insert(lease.issue_id.clone())
+		{
+			occupied += 1;
+		}
+	}
+
+	let read_dir = match fs::read_dir(&dispatch_slot_config.root) {
+		Ok(read_dir) => read_dir,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(occupied),
+		Err(error) => return Err(error.into()),
+	};
+
+	for entry in read_dir {
+		let entry = entry?;
+		let path = entry.path();
+		let Some(issue_id) = issue_claim_id_from_path(&path) else {
+			continue;
+		};
+
+		if !seen_issue_ids.insert(issue_id.clone()) {
+			continue;
+		}
+
+		let claim_lock_file = match OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(false)
+			.truncate(false)
+			.open(&path)
+		{
+			Ok(file) => file,
+			Err(error) if error.kind() == ErrorKind::NotFound => continue,
+			Err(error) => return Err(error.into()),
+		};
+
+		match claim_lock_file.try_lock() {
+			Ok(()) => claim_lock_file.unlock()?,
+			Err(TryLockError::WouldBlock) => {
+				if let Some(lease) = read_issue_claim_record(&path)?
+					&& lease.project_id == project_id
+					&& lease.issue_state == issue_state
+				{
+					occupied += 1;
+				}
+			},
+			Err(TryLockError::Error(error)) => return Err(error.into()),
+		}
+	}
+
+	Ok(occupied)
+}
+
+fn acquire_state_gate_guard(
+	state: &StateData,
+	dispatch_slot_config: &DispatchSlotConfig,
+	project_id: &str,
+	issue_id: &str,
+	issue_state: &str,
+) -> Result<StateGateGuard> {
+	let Some(limit) = dispatch_slot_config.state_slot_limits.get(issue_state).copied() else {
+		return Ok(StateGateGuard { blocked: false, _guard: None });
+	};
+	let state_gate_path = state_gate_lock_path(&dispatch_slot_config.root, issue_state);
+	let state_gate_lock_file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(false)
+		.open(state_gate_path)?;
+
+	state_gate_lock_file.lock()?;
+
+	let occupied = count_shared_state_occupancy(
+		state,
+		dispatch_slot_config,
+		project_id,
+		issue_state,
+		issue_id,
+	)?;
+
+	if occupied >= limit {
+		return Ok(StateGateGuard { blocked: true, _guard: Some(state_gate_lock_file) });
+	}
+
+	Ok(StateGateGuard { blocked: false, _guard: Some(state_gate_lock_file) })
 }
 
 fn write_run_activity_marker_at(
@@ -1377,7 +1535,7 @@ fn clear_close_on_exec(file: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	#[cfg(unix)] use std::os::fd::IntoRawFd;
-	use std::path::Path;
+	use std::{collections::HashMap, path::Path};
 
 	use tempfile::TempDir;
 
@@ -1533,6 +1691,38 @@ mod tests {
 		assert_eq!(leases[0].issue_id(), "PUB-101");
 		assert_eq!(leases[0].run_id(), "run-1");
 		assert_eq!(leases[0].issue_state(), IN_PROGRESS_STATE);
+	}
+
+	#[test]
+	fn shared_state_limit_blocks_duplicate_state_across_process_local_stores() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let store_one = StateStore::open_in_memory().expect("first store should open");
+		let store_two = StateStore::open_in_memory().expect("second store should open");
+		let mut state_limits = HashMap::new();
+
+		state_limits.insert(String::from(IN_PROGRESS_STATE), 1);
+		store_one
+			.configure_dispatch_slot_policy("pubfi", temp_dir.path(), 2, &state_limits)
+			.expect("first store should configure dispatch policy");
+		store_two
+			.configure_dispatch_slot_policy("pubfi", temp_dir.path(), 2, &state_limits)
+			.expect("second store should configure dispatch policy");
+
+		assert!(
+			store_one
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+				.expect("first in-progress lease should succeed")
+		);
+		assert!(
+			!store_two
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
+				.expect("second in-progress lease should respect the shared state cap")
+		);
+		assert!(
+			store_two
+				.try_acquire_lease("pubfi", "PUB-103", "run-3", "Todo")
+				.expect("an unbounded state should still use the remaining global slot")
+		);
 	}
 
 	#[cfg(unix)]

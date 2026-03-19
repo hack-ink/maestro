@@ -881,10 +881,11 @@ where
 
 	match next_run {
 		Some((summary, from_retry_queue)) => {
-			state_store.configure_dispatch_slot_root(
+			state_store.configure_dispatch_slot_policy(
 				project.id(),
 				project.workspace_root(),
 				workflow.frontmatter().execution().max_concurrent_agents(),
+				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
 			)?;
 
 			validate_review_handoff_runtime(false)?;
@@ -1260,19 +1261,24 @@ where
 	let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
 		return Ok(false);
 	};
-	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
-
-	if concurrency.allows_state(workflow.frontmatter().execution(), &issue.state.name) {
-		return Ok(false);
-	}
-
-	issue_passes_retry_retention_policy(
+	let retained = issue_passes_retry_retention_policy(
 		&issue,
 		&entry.retry_project_slug,
 		project,
 		workflow,
 		state_store,
-	)
+	)?;
+
+	if !retained {
+		return Ok(false);
+	}
+	if state_store.issue_has_active_shared_claim(project.id(), &entry.issue_id)? {
+		return Ok(true);
+	}
+
+	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
+
+	Ok(!concurrency.allows_state(workflow.frontmatter().execution(), &issue.state.name))
 }
 
 fn schedule_retry_after_child_exit<T>(
@@ -1878,10 +1884,11 @@ where
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 
-	state_store.configure_dispatch_slot_root(
+	state_store.configure_dispatch_slot_policy(
 		project.id(),
 		project.workspace_root(),
 		workflow.frontmatter().execution().max_concurrent_agents(),
+		workflow.frontmatter().execution().max_concurrent_agents_by_state(),
 	)?;
 
 	let recovered_state =
@@ -1974,10 +1981,11 @@ where
 		context.project.workspace_root(),
 	);
 
-	context.state_store.configure_dispatch_slot_root(
+	context.state_store.configure_dispatch_slot_policy(
 		context.project.id(),
 		context.project.workspace_root(),
 		context.workflow.frontmatter().execution().max_concurrent_agents(),
+		context.workflow.frontmatter().execution().max_concurrent_agents_by_state(),
 	)?;
 
 	if context.lease_preacquired && !context.dry_run {
@@ -5315,6 +5323,70 @@ read_first = [{read_first}]
 		assert!(
 			retry_queue.entries.contains_key(&issue.id),
 			"active retry entry should remain queued while another lease temporarily holds the slot"
+		);
+	}
+
+	#[test]
+	fn due_retry_claim_stays_queued_when_issue_is_claimed_by_another_process() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let local_store = StateStore::open_in_memory().expect("local state store should open");
+		let remote_store = StateStore::open_in_memory().expect("remote state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		local_store
+			.configure_dispatch_slot_policy(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+			)
+			.expect("local dispatch policy should configure");
+		remote_store
+			.configure_dispatch_slot_policy(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+			)
+			.expect("remote dispatch policy should configure");
+
+		assert!(
+			remote_store
+				.try_acquire_lease(config.id(), &issue.id, "run-foreign", "In Progress")
+				.expect("foreign process should acquire the shared issue claim")
+		);
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now(),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&local_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(
+			decision,
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
+		));
+		assert!(
+			retry_queue.entries.contains_key(&issue.id),
+			"retry queue should keep the claim until the foreign issue claim clears"
 		);
 	}
 
