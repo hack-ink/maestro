@@ -51,3 +51,8 @@ Then keep the body explicit:
 - Do not require fixed filename prefixes up front.
 - Choose names for topic clarity and retrieval quality, not visual uniformity.
 - If a guide depends on a spec, the guide links back to the governing spec.
+
+## Current governing specs
+
+- [`system_maestro_runtime.md`](./system_maestro_runtime.md) defines the runtime state model, reconciliation rules, and tracker writeback boundaries.
+- [`system_maestro_owned_lane_policy.md`](./system_maestro_owned_lane_policy.md) defines the fallback policy for Maestro-owned lanes, including manual-intervention and automatic-recovery decisions.

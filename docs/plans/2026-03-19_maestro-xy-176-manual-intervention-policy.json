@@ -1,0 +1,120 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-176-manual-intervention-policy",
+    "goal": "Author a Symphony-aligned fallback policy spec for Maestro-owned lanes that makes manual-intervention and automatic-recovery boundaries explicit without coupling the model to the current local skill catalog.",
+    "success_criteria": [
+      "A normative spec artifact defines the decision matrix for continue, wait, retry, retained-lane resume, manual intervention, and ready-to-land outcomes.",
+      "The spec distinguishes stable runtime concepts from the current local workflow implementation and cites Symphony as the sole external design reference.",
+      "Local spec navigation is updated so future work on XY-173, XY-174, and XY-175 can implement against the accepted policy.",
+      "The policy clarifies that review-request and bounded resend behavior are orchestration concerns implemented by local workflow adapters rather than core domain states."
+    ],
+    "constraints": [
+      "Use openai/symphony README and SPEC as the only external design standard.",
+      "Treat AGENTS.md and installed skills as local execution-context inputs, not the core domain model.",
+      "Keep the work scoped to documentation and issue-record alignment in this lane."
+    ],
+    "defaults": {
+      "workspace": ".workspaces/XY-176",
+      "issue": "XY-176",
+      "external_reference": "openai/symphony"
+    },
+    "tasks": [
+      {
+        "id": "task-1",
+        "title": "Capture the abstract fallback model",
+        "status": "done",
+        "objective": "Synthesize the current Maestro runtime boundaries and the latest Symphony architecture boundaries into a stable set of runtime decisions, authoritative signals, and action classes for owned lanes.",
+        "inputs": [
+          "docs/spec/system_maestro_runtime.md",
+          "docs/guide/pilot.md",
+          "docs/spec/index.md",
+          "openai/symphony README.md and SPEC.md",
+          "AGENTS.md and current workflow skills as local execution context"
+        ],
+        "outputs": [
+          "A concrete outline for the fallback policy spec",
+          "A confirmed list of stable runtime decisions and human-intervention boundaries"
+        ],
+        "verification": [
+          "The outline separates stable runtime concepts from local workflow implementation details.",
+          "The outline covers both pre-review failures and post-In-Review outcomes."
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "task-2",
+        "title": "Write the fallback policy spec",
+        "status": "done",
+        "objective": "Create the in-repo normative spec document and any necessary spec-index links so the fallback policy becomes an authoritative reference for later implementation issues.",
+        "inputs": [
+          "task-1 outputs"
+        ],
+        "outputs": [
+          "docs/spec/system_maestro_owned_lane_policy.md",
+          "Updated docs/spec/index.md"
+        ],
+        "verification": [
+          "The new spec includes the required routing header.",
+          "The new spec contains a concise decision table and explicit recovery boundaries.",
+          "The spec index links or references the new policy topic."
+        ],
+        "depends_on": [
+          "task-1"
+        ]
+      },
+      {
+        "id": "task-3",
+        "title": "Validate and sync progress",
+        "status": "done",
+        "objective": "Validate the saved plan and the edited docs, then record the resulting artifact back to the authority issue so follow-on implementation issues can rely on it.",
+        "inputs": [
+          "task-2 outputs"
+        ],
+        "outputs": [
+          "Validated plan state",
+          "Verification evidence",
+          "Issue progress note linking the drafted artifact"
+        ],
+        "verification": [
+          "python3 \"$PLAN_WRITING_HOME/scripts/validate_plan_contract.py\" --path docs/plans/2026-03-19_maestro-xy-176-manual-intervention-policy.json",
+          "cargo make fmt-check"
+        ],
+        "depends_on": [
+          "task-2"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "Symphony alignment requires changing the spec structure or success criteria.",
+        "The fallback policy needs additional lifecycle scope that overlaps XY-160 materially.",
+        "Local workflow constraints force a different artifact shape than the current plan assumes."
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-19: Confirmed root checkout has a local WORKFLOW.md modification, so implementation work for XY-176 moved to clone-backed lane .workspaces/XY-176.",
+      "2026-03-19: Validated the saved plan with plan-writing and read it back successfully through plan-execution.",
+      "2026-03-19: Aligned the design reference to openai/symphony README.md and SPEC.md while keeping AGENTS.md and installed skills as local execution-context inputs rather than the core runtime model.",
+      "2026-03-19: Added docs/spec/system_maestro_owned_lane_policy.md with the stable action classes, decision table, human-intervention boundaries, and automatic-recovery prerequisites for Maestro-owned lanes.",
+      "2026-03-19: Updated docs/spec/index.md to route future readers to the owned-lane fallback policy spec.",
+      "2026-03-19: Verification passed for plan validation, cargo make fmt-check, and git diff --check in .workspaces/XY-176.",
+      "2026-03-19: Reopened the spec drafting task to clarify that review-request submission and bounded resend logic are orchestration-owned behaviors rather than core domain states.",
+      "2026-03-19: Added orchestration-owned convergence-budget policy for pre-PR self-review and post-review repair churn, routing exhausted budgets to manual_intervention_required instead of endless patch loops.",
+      "2026-03-19: Re-ran cargo make fmt-check and git diff --check after the orchestration-budget refinement."
+    ],
+    "last_updated": "2026-03-19T02:30:22Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "design_standard": "openai/symphony README.md + SPEC.md",
+      "issue_url": "https://linear.app/hack-ink/issue/XY-176/define-manual-intervention-and-automatic-recovery-policy-for-maestro"
+    }
+  }
+}
