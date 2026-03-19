@@ -105,9 +105,13 @@
       "2026-03-19: Added adopted_issue_claim_blocks_same_issue_after_parent_clears_local_guard to lock the same-issue handoff case: with two shared slots available, parent clear_lease now drops only its local cloned guard while the adopted child still blocks reacquisition of the same issue claim.",
       "2026-03-19: A subsequent Codex review on PR #19 flagged a stricter safety hole on head `ca93624`: active-start retry/recovery lanes could still let stale active rereads clear local stop writes before the tracker had actually reflected those writes.",
       "2026-03-19: Repaired TrackerToolBridge by restoring the local active-state guard ahead of reread-based continuation unblocking, so local stop writes stay blocking unless the lane still reflects an active local state.",
-      "2026-03-19: Replaced the optimistic reactivation tests with active-start stale-reread regressions for both opt-out-label and non-In-Progress stop writes, then reran cargo make fmt-check, cargo make lint, cargo make test, and git diff --check on the repaired diff."
+      "2026-03-19: Replaced the optimistic reactivation tests with active-start stale-reread regressions for both opt-out-label and non-In-Progress stop writes, then reran cargo make fmt-check, cargo make lint, cargo make test, and git diff --check on the repaired diff.",
+      "2026-03-19: A later Codex review on PR #19 flagged that continuation retries still only preserved stale-startable tracker snapshots through turn 1, so long-lived read-after-write lag could fall back to a fresh attempt/run_id instead of a retained continuation retry.",
+      "2026-03-19: Extended continuation tolerance across turns and reused `preferred_issue_state = In Progress` as the retry-retention signal so continuation retries still queue and dispatch when the tracker reread remains in a configured startable state.",
+      "2026-03-19: Hardened `retry_entry_is_temporarily_blocked()` to apply concurrency gating against the continuation's planned dispatch state rather than the stale tracker state, which keeps stale-startable continuation retries queued when an `In Progress` per-state cap blocks dispatch.",
+      "2026-03-19: Added regressions for schedule_retry_after_child_exit_retains_continuation_retry_for_stale_startable_issue, due_continuation_retry_dispatches_when_issue_still_reflects_startable_state, due_continuation_retry_stays_queued_when_stale_startable_issue_hits_in_progress_state_cap, and continuation_guard_allows_turn_two_after_local_startup_transition_on_stale_reread; reran cargo make fmt-check, cargo make lint, cargo make test, and git diff --check on the repaired diff."
     ],
-    "last_updated": "2026-03-19T09:34:00Z",
+    "last_updated": "2026-03-19T11:13:31Z",
     "replan_reason": null,
     "context_snapshot": {
       "late_review_head": "7908d7b4f642aeadf374b6eb71ba5d5c4d13ce15",
