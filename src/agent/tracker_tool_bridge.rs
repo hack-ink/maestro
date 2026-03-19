@@ -457,7 +457,13 @@ impl<'a> TrackerToolBridge<'a> {
 		}
 
 		let current_issue = match self.refreshed_issue_snapshot() {
-			Ok(issue) => issue,
+			Ok(Some(issue)) => issue,
+			Ok(None) => {
+				return DynamicToolCallResponse::failure(format!(
+					"Failed to refresh issue `{}` before updating labels: tracker returned no current snapshot.",
+					self.issue.identifier
+				));
+			},
 			Err(error) => {
 				return DynamicToolCallResponse::failure(format!(
 					"Failed to refresh issue `{}` before updating labels: {error}",
@@ -602,11 +608,11 @@ impl<'a> TrackerToolBridge<'a> {
 		states
 	}
 
-	fn refreshed_issue_snapshot(&self) -> crate::prelude::Result<TrackerIssue> {
+	fn refreshed_issue_snapshot(&self) -> crate::prelude::Result<Option<TrackerIssue>> {
 		let issue_ids = [self.issue.id.clone()];
 		let mut refreshed_issues = self.tracker.refresh_issues(&issue_ids)?;
 
-		Ok(refreshed_issues.pop().unwrap_or_else(|| self.issue.clone()))
+		Ok(refreshed_issues.pop())
 	}
 
 	fn validate_review_handoff_pr(
@@ -674,7 +680,10 @@ impl<'a> TrackerToolBridge<'a> {
 		let Some(reason) = self.continuation_blocking_tracker_write.borrow().clone() else {
 			return Ok(None);
 		};
-		let issue = self.refreshed_issue_snapshot()?;
+		let issue = match self.refreshed_issue_snapshot()? {
+			Some(issue) => issue,
+			None => return Ok(Some(reason)),
+		};
 		let tracker_policy = self.workflow.frontmatter().tracker();
 		let issue_still_active = issue.state.name == tracker_policy.in_progress_state()
 			&& !issue.has_label(tracker_policy.opt_out_label())
@@ -1481,6 +1490,10 @@ mod tests {
 		}
 	}
 
+	fn tracker_with_current_issue_snapshot(issue: &TrackerIssue) -> FakeTracker {
+		FakeTracker::with_refresh_snapshots(vec![vec![issue.clone()]])
+	}
+
 	fn sample_workflow() -> WorkflowDocument {
 		sample_workflow_with_tracker_states(&["Todo"], "In Progress", "In Review", "Todo")
 	}
@@ -1790,8 +1803,8 @@ Use the tracker tools.
 
 	#[test]
 	fn adds_allowed_workflow_label() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let response = DynamicToolHandler::handle_call(
@@ -1855,8 +1868,8 @@ Use the tracker tools.
 
 	#[test]
 	fn completion_disposition_allows_manual_attention_exit_without_review_handoff() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
@@ -2017,8 +2030,8 @@ Use the tracker tools.
 
 	#[test]
 	fn manual_attention_requires_explanatory_comment() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
@@ -2103,9 +2116,74 @@ Use the tracker tools.
 	}
 
 	#[test]
-	fn completion_disposition_rejects_conflicting_review_handoff_and_manual_attention() {
-		let tracker = FakeTracker::new();
+	fn label_add_fails_when_refresh_returns_no_snapshot() {
+		let tracker = FakeTracker::with_refresh_snapshots(vec![Vec::new()]);
+		let workflow = sample_workflow();
 		let issue = sample_issue();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:needs-attention" }),
+		);
+
+		assert!(!response.success);
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: format!(
+					"Failed to refresh issue `{}` before updating labels: tracker returned no current snapshot.",
+					issue.identifier
+				),
+			}]
+		);
+		assert!(tracker.label_updates.borrow().is_empty());
+	}
+
+	#[test]
+	fn turn_classification_rejects_continuation_blocking_write_when_refresh_returns_no_snapshot() {
+		let mut opted_out_issue = sample_issue();
+
+		opted_out_issue.labels.push(TrackerLabel {
+			id: String::from("label-manual"),
+			name: String::from("maestro:manual-only"),
+		});
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![opted_out_issue], Vec::new()]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:manual-only" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"The lane recorded a continuation-blocking tracker write without a terminal path.",
+		)
+		.expect_err("missing refresh snapshots must not allow a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_LABEL_ADD_TOOL_NAME));
+	}
+
+	#[test]
+	fn completion_disposition_rejects_conflicting_review_handoff_and_manual_attention() {
+		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(vec![Ok(PullRequestDetails {
 			head_ref_name: String::from("x/maestro-pub-618"),
@@ -2342,8 +2420,8 @@ Use the tracker tools.
 
 	#[test]
 	fn terminal_finalize_accepts_matching_manual_attention_path() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
