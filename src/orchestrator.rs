@@ -3118,6 +3118,11 @@ fn build_developer_instructions(
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
 ) -> crate::prelude::Result<String> {
+	let continuation_guidance = if workflow.frontmatter().execution().max_turns() > 1 {
+		"\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn."
+	} else {
+		""
+	};
 	let mut sections = Vec::new();
 
 	for relative_path in workflow.frontmatter().context().read_first() {
@@ -3132,7 +3137,7 @@ fn build_developer_instructions(
 	));
 
 	sections.push(format!(
-		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn.\n- Never write to any other issue.",
+		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
 		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
@@ -3145,6 +3150,7 @@ fn build_developer_instructions(
 		branch = issue_run.workspace.branch_name,
 		success = workflow.frontmatter().tracker().success_state(),
 		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+		continuation_guidance = continuation_guidance,
 	));
 
 	Ok(sections.join("\n\n"))
@@ -3155,8 +3161,14 @@ fn build_user_input(
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
 ) -> String {
+	let continuation_guidance = if workflow.frontmatter().execution().max_turns() > 1 {
+		"\n- If more work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` will decide whether to continue the lane."
+	} else {
+		""
+	};
+
 	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- If more work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` will decide whether to continue the lane.",
+		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}",
 		identifier = issue.identifier,
 		title = issue.title,
 		description = if issue.description.trim().is_empty() {
@@ -3175,6 +3187,7 @@ fn build_user_input(
 		branch = issue_run.workspace.branch_name,
 		success = workflow.frontmatter().tracker().success_state(),
 		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+		continuation_guidance = continuation_guidance,
 	)
 }
 
@@ -3961,8 +3974,33 @@ mod tests {
 		)
 	}
 
+	fn temp_project_layout_with_max_turns(
+		max_turns: u32,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_tracker_project_slug_max_turns_and_read_first(
+			"pubfi",
+			max_turns,
+			&[("AGENTS.md", "Read me first.\n")],
+			"Follow the repository policy.\n",
+		)
+	}
+
 	fn temp_project_layout_with_tracker_project_slug_and_read_first(
 		project_slug: &str,
+		read_first_files: &[(&str, &str)],
+		workflow_body: &str,
+	) -> (TempDir, ServiceConfig, WorkflowDocument) {
+		temp_project_layout_with_tracker_project_slug_max_turns_and_read_first(
+			project_slug,
+			1,
+			read_first_files,
+			workflow_body,
+		)
+	}
+
+	fn temp_project_layout_with_tracker_project_slug_max_turns_and_read_first(
+		project_slug: &str,
+		max_turns: u32,
 		read_first_files: &[(&str, &str)],
 		workflow_body: &str,
 	) -> (TempDir, ServiceConfig, WorkflowDocument) {
@@ -3986,7 +4024,7 @@ mod tests {
 
 		fs::write(
 			repo_root.join("WORKFLOW.md"),
-			sample_workflow_markdown(project_slug, &read_first_paths, workflow_body),
+			sample_workflow_markdown(project_slug, &read_first_paths, workflow_body, max_turns),
 		)
 		.expect("workflow should exist");
 
@@ -4065,6 +4103,7 @@ mod tests {
 		project_slug: &str,
 		read_first: &[&str],
 		workflow_body: &str,
+		max_turns: u32,
 	) -> String {
 		let read_first =
 			read_first.iter().map(|path| format!("\"{path}\"")).collect::<Vec<_>>().join(", ");
@@ -4086,6 +4125,7 @@ approval_policy = "never"
 
 [execution]
 max_attempts = 3
+max_turns = {max_turns}
 max_retry_backoff_ms = 300000
 max_concurrent_agents = 1
 max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
@@ -4125,7 +4165,7 @@ read_first = [{read_first}]
 			.expect("initial workflow load should succeed");
 
 		let updated_workflow =
-			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Updated workflow policy.\n")
+			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Updated workflow policy.\n", 1)
 				.replace("max_attempts = 3", "max_attempts = 5");
 
 		fs::write(config.repo_root().join("WORKFLOW.md"), updated_workflow)
@@ -4184,12 +4224,12 @@ read_first = [{read_first}]
 	fn active_child_reconciliation_keeps_spawn_time_workflow_until_exit() {
 		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let active_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Spawn-time workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Spawn-time workflow policy.\n", 1)
 				.replace("max_attempts = 3", "max_attempts = 5"),
 		)
 		.expect("workflow should parse");
 		let current_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Current workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Current workflow policy.\n", 1)
 				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]"),
 		)
 		.expect("workflow should parse");
@@ -4250,6 +4290,11 @@ read_first = [{read_first}]
 		workflow: &WorkflowDocument,
 		issue_run: &orchestrator::IssueRunPlan,
 	) -> String {
+		let continuation_guidance = if workflow.frontmatter().execution().max_turns() > 1 {
+			"\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn."
+		} else {
+			""
+		};
 		let mut sections = read_first_files
 			.iter()
 			.map(|(relative_path, contents)| format!("File: {relative_path}\n{contents}"))
@@ -4260,7 +4305,7 @@ read_first = [{read_first}]
 		));
 
 		sections.push(format!(
-			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn.\n- Never write to any other issue.",
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",
 			issue = issue_run.issue.identifier,
 			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 			comment_tool = ISSUE_COMMENT_TOOL_NAME,
@@ -4273,6 +4318,7 @@ read_first = [{read_first}]
 			branch = issue_run.workspace.branch_name,
 			success = workflow.frontmatter().tracker().success_state(),
 			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			continuation_guidance = continuation_guidance,
 		));
 
 		sections.join("\n\n")
@@ -5020,7 +5066,7 @@ read_first = [{read_first}]
 	#[test]
 	fn blocked_retry_still_allows_other_daemon_work_when_capacity_remains() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
 		)
 		.expect("workflow should parse");
@@ -5079,7 +5125,7 @@ read_first = [{read_first}]
 	#[test]
 	fn blocked_future_retry_excludes_all_queued_retries_before_normal_fallback() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
 		)
 		.expect("workflow should parse");
@@ -5579,14 +5625,14 @@ read_first = [{read_first}]
 		assert!(instructions.contains(ISSUE_REVIEW_HANDOFF_TOOL_NAME));
 		assert!(instructions.contains(ISSUE_TERMINAL_FINALIZE_TOOL_NAME));
 		assert!(instructions.contains("mark a saved plan `phase = \"done\"`"));
-		assert!(instructions.contains("you may end the turn without"));
+		assert!(!instructions.contains("you may end the turn without"));
 		assert!(!instructions.contains("WORKFLOW.md\n"));
 		assert!(!instructions.contains("Follow the repository policy."));
 	}
 
 	#[test]
-	fn initial_and_continuation_prompts_agree_on_nonterminal_yield_boundary() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+	fn multi_turn_prompts_allow_nonterminal_yield_boundary() {
+		let (_temp_dir, config, workflow) = temp_project_layout_with_max_turns(4);
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
@@ -5609,6 +5655,35 @@ read_first = [{read_first}]
 		assert!(user_input.contains("you may end the turn without"));
 		assert!(continuation_input.contains("you may end the turn without terminal finalization"));
 		assert!(!user_input.contains("Do not end the turn"));
+	}
+
+	#[test]
+	fn single_turn_prompts_do_not_allow_nonterminal_yield_boundary() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue,
+			issue_state: String::from("In Progress"),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: String::from("PUB-101"),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			retry_project_slug: String::from("pubfi"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1-123"),
+			retry_budget_base: 0,
+		};
+		let developer_instructions =
+			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
+				.expect("developer instructions should build");
+		let user_input =
+			orchestrator::build_user_input(&sample_issue("Todo", &[]), &workflow, &issue_run);
+
+		assert!(!developer_instructions.contains("you may end the turn without"));
+		assert!(!user_input.contains("you may end the turn without"));
 	}
 
 	#[test]
@@ -5842,7 +5917,7 @@ read_first = [{read_first}]
 	#[test]
 	fn candidate_selection_allows_multi_slot_dispatch_when_configured() {
 		let workflow_source =
-			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot workflow policy.\n");
+			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot workflow policy.\n", 1);
 
 		assert!(workflow_source.contains("max_concurrent_agents = 1"));
 
@@ -5884,13 +5959,18 @@ read_first = [{read_first}]
 	fn candidate_selection_honors_per_state_concurrency_overrides_for_projected_in_progress_state()
 	{
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "State-scoped workflow policy.\n")
-				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]")
-				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 3")
-				.replace(
-					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
-					r#"max_concurrent_agents_by_state = { "Backlog" = 2, "In Progress" = 1 }"#,
-				),
+			&sample_workflow_markdown(
+				"pubfi",
+				&["AGENTS.md"],
+				"State-scoped workflow policy.\n",
+				1,
+			)
+			.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]")
+			.replace("max_concurrent_agents = 1", "max_concurrent_agents = 3")
+			.replace(
+				r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
+				r#"max_concurrent_agents_by_state = { "Backlog" = 2, "In Progress" = 1 }"#,
+			),
 		)
 		.expect("workflow should parse");
 		let (_temp_dir, config, _default_workflow) = temp_project_layout();
@@ -5924,7 +6004,7 @@ read_first = [{read_first}]
 	#[test]
 	fn candidate_selection_skips_issue_claimed_by_another_process() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Claim-aware workflow policy.\n")
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Claim-aware workflow policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2")
 				.replace(
 					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
