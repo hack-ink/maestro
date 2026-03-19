@@ -133,7 +133,8 @@ impl StateStore {
 				Err(TryLockError::Error(error)) => return Err(error.into()),
 			}
 
-			let mut issue_claim_guard = IssueClaimGuard { lock_file: issue_claim_lock_file };
+			let mut issue_claim_guard =
+				IssueClaimGuard { lock_file: issue_claim_lock_file, handoff_cloned: false };
 
 			write_issue_claim_record(
 				&mut issue_claim_guard.lock_file,
@@ -183,6 +184,7 @@ impl StateStore {
 							project_id: project_id.to_owned(),
 							slot_index,
 							lock_file,
+							handoff_cloned: false,
 						});
 
 						break;
@@ -361,10 +363,10 @@ impl StateStore {
 		}
 
 		if let Some(guard) = state.issue_claim_guards.remove(issue_id) {
-			guard.unlock()?;
+			guard.release_for_clear()?;
 		}
 		if let Some(guard) = state.dispatch_slot_guards.remove(issue_id) {
-			guard.unlock()?;
+			guard.release_for_clear()?;
 		}
 
 		Ok(())
@@ -382,11 +384,14 @@ impl StateStore {
 	/// Duplicate the held dispatch-slot lock so a spawned child can inherit it across exec.
 	#[cfg(unix)]
 	pub fn clone_issue_claim_for_child(&self, issue_id: &str) -> Result<File> {
-		let state = self.lock()?;
+		let mut state = self.lock()?;
 		let guard = state
 			.issue_claim_guards
-			.get(issue_id)
+			.get_mut(issue_id)
 			.ok_or_else(|| eyre::eyre!("issue `{issue_id}` does not hold an issue-claim guard"))?;
+
+		guard.handoff_cloned = true;
+
 		let child_lock = guard.lock_file.try_clone()?;
 
 		clear_close_on_exec(&child_lock)?;
@@ -397,11 +402,14 @@ impl StateStore {
 	/// Duplicate the held dispatch-slot lock so a spawned child can inherit it across exec.
 	#[cfg(unix)]
 	pub fn clone_dispatch_slot_for_child(&self, issue_id: &str) -> Result<(File, usize)> {
-		let state = self.lock()?;
+		let mut state = self.lock()?;
 		let guard = state
 			.dispatch_slot_guards
-			.get(issue_id)
+			.get_mut(issue_id)
 			.ok_or_else(|| eyre::eyre!("issue `{issue_id}` does not hold a dispatch-slot guard"))?;
+
+		guard.handoff_cloned = true;
+
 		let child_lock = guard.lock_file.try_clone()?;
 
 		clear_close_on_exec(&child_lock)?;
@@ -423,15 +431,17 @@ impl StateStore {
 		let lock_file = unsafe { File::from_raw_fd(guards.dispatch_slot_fd) };
 		let mut state = self.lock()?;
 
-		state
-			.issue_claim_guards
-			.insert(issue_id.to_owned(), IssueClaimGuard { lock_file: issue_claim_lock_file });
+		state.issue_claim_guards.insert(
+			issue_id.to_owned(),
+			IssueClaimGuard { lock_file: issue_claim_lock_file, handoff_cloned: true },
+		);
 		state.dispatch_slot_guards.insert(
 			issue_id.to_owned(),
 			DispatchSlotGuard {
 				project_id: project_id.to_owned(),
 				slot_index: guards.dispatch_slot_index,
 				lock_file,
+				handoff_cloned: true,
 			},
 		);
 		state.leases.insert(
@@ -965,6 +975,7 @@ struct DispatchSlotConfig {
 
 struct IssueClaimGuard {
 	lock_file: File,
+	handoff_cloned: bool,
 }
 impl IssueClaimGuard {
 	fn unlock(self) -> Result<()> {
@@ -972,15 +983,28 @@ impl IssueClaimGuard {
 
 		Ok(())
 	}
+
+	fn release_for_clear(self) -> Result<()> {
+		if self.handoff_cloned {
+			return Ok(());
+		}
+
+		self.unlock()
+	}
 }
 
 struct DispatchSlotGuard {
 	project_id: String,
 	slot_index: usize,
 	lock_file: File,
+	handoff_cloned: bool,
 }
 impl DispatchSlotGuard {
-	fn unlock(self) -> Result<()> {
+	fn release_for_clear(self) -> Result<()> {
+		if self.handoff_cloned {
+			return Ok(());
+		}
+
 		self.lock_file.unlock()?;
 
 		Ok(())
@@ -1865,6 +1889,65 @@ mod tests {
 			!contender_store
 				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
 				.expect("child-held guard should keep the slot busy")
+		);
+
+		child_store.clear_lease("PUB-101").expect("child lease should clear");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn adopted_issue_claim_blocks_same_issue_after_parent_clears_local_guard() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let parent_store = StateStore::open_in_memory().expect("parent store should open");
+		let child_store = StateStore::open_in_memory().expect("child store should open");
+		let contender_store = StateStore::open_in_memory().expect("contender store should open");
+
+		parent_store
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
+			.expect("parent store should configure dispatch slot root");
+		child_store
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
+			.expect("child store should configure dispatch slot root");
+		contender_store
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
+			.expect("contender store should configure dispatch slot root");
+
+		assert!(
+			parent_store
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+				.expect("parent should acquire the shared issue claim")
+		);
+
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child("PUB-101")
+			.expect("child should inherit the shared issue-claim fd");
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child("PUB-101")
+			.expect("child should inherit the shared dispatch-slot fd");
+
+		child_store
+			.adopt_preacquired_lease(
+				"pubfi",
+				"PUB-101",
+				"run-1",
+				IN_PROGRESS_STATE,
+				PreacquiredLeaseGuards {
+					issue_claim_fd: child_issue_claim.into_raw_fd(),
+					dispatch_slot_fd: child_guard.into_raw_fd(),
+					dispatch_slot_index: child_slot_index,
+				},
+			)
+			.expect("child should adopt the inherited lease guard");
+		parent_store
+			.clear_lease("PUB-101")
+			.expect("parent should drop its local lease without unlocking the child handoff");
+
+		assert!(
+			!contender_store
+				.try_acquire_lease("pubfi", "PUB-101", "run-2", IN_PROGRESS_STATE)
+				.expect(
+					"same issue should stay claimed while the child still holds the handoff fd"
+				)
 		);
 
 		child_store.clear_lease("PUB-101").expect("child lease should clear");
