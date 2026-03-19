@@ -91,6 +91,9 @@ struct RunCommand {
 	/// Reuse a daemon-held lease for an issue-targeted child run.
 	#[arg(long, hide = true, requires = "issue_id")]
 	lease_preacquired: bool,
+	/// Reuse the daemon-held issue-claim fd for an issue-targeted child run.
+	#[arg(long, value_name = "FD", hide = true, requires = "issue_id")]
+	issue_claim_fd: Option<i32>,
 	/// Reuse the daemon-held dispatch-slot fd for an issue-targeted child run.
 	#[arg(long, value_name = "FD", hide = true, requires = "issue_id")]
 	dispatch_slot_fd: Option<i32>,
@@ -130,6 +133,7 @@ impl RunCommand {
 			preferred_issue_id: self.issue_id.as_deref(),
 			preferred_issue_state: self.issue_state.as_deref(),
 			preferred_lease_acquired: self.lease_preacquired,
+			preferred_issue_claim_fd: self.issue_claim_fd,
 			preferred_dispatch_slot_fd: self.dispatch_slot_fd,
 			preferred_dispatch_slot_index: self.dispatch_slot_index,
 			preferred_dispatch_mode: self.dispatch_mode.map(Into::into),
@@ -249,6 +253,7 @@ mod tests {
 				issue_id: None,
 				issue_state: None,
 				lease_preacquired: false,
+				issue_claim_fd: None,
 				dispatch_slot_fd: None,
 				dispatch_slot_index: None,
 				dispatch_mode: None,
@@ -273,6 +278,7 @@ mod tests {
 				issue_id: Some(_),
 				issue_state: None,
 				lease_preacquired: false,
+				issue_claim_fd: None,
 				dispatch_slot_fd: None,
 				dispatch_slot_index: None,
 				dispatch_mode: None,
@@ -315,6 +321,7 @@ mod tests {
 				issue_id: Some(_),
 				issue_state: Some(_),
 				lease_preacquired: false,
+				issue_claim_fd: None,
 				dispatch_slot_fd: None,
 				dispatch_slot_index: None,
 				dispatch_mode: Some(RunIssueDispatchMode::Normal),

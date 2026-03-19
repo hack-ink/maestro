@@ -47,6 +47,7 @@ pub(crate) struct RunOnceRequest<'a> {
 	pub(crate) preferred_issue_id: Option<&'a str>,
 	pub(crate) preferred_issue_state: Option<&'a str>,
 	pub(crate) preferred_lease_acquired: bool,
+	pub(crate) preferred_issue_claim_fd: Option<i32>,
 	pub(crate) preferred_dispatch_slot_fd: Option<i32>,
 	pub(crate) preferred_dispatch_slot_index: Option<usize>,
 	pub(crate) preferred_dispatch_mode: Option<IssueDispatchMode>,
@@ -100,6 +101,7 @@ struct RunCycleRequest<'a> {
 	preferred_issue_id: Option<&'a str>,
 	preferred_issue_state: Option<&'a str>,
 	preferred_lease_acquired: bool,
+	preferred_issue_claim_fd: Option<i32>,
 	preferred_dispatch_slot_fd: Option<i32>,
 	preferred_dispatch_slot_index: Option<usize>,
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
@@ -117,6 +119,7 @@ struct SpawnRunOnceChildRequest<'a> {
 	preferred_attempt_number: i64,
 	preferred_retry_budget_base: i64,
 	workflow: &'a WorkflowDocument,
+	issue_claim_handoff: Option<&'a File>,
 	dispatch_slot_handoff: Option<&'a File>,
 	dispatch_slot_index_handoff: Option<usize>,
 }
@@ -364,6 +367,7 @@ struct TargetIssueRunContext<'a, T> {
 	preferred_issue_state: Option<&'a str>,
 	dry_run: bool,
 	lease_preacquired: bool,
+	preferred_issue_claim_fd: Option<i32>,
 	preferred_dispatch_slot_fd: Option<i32>,
 	preferred_dispatch_slot_index: Option<usize>,
 	dispatch_mode: IssueDispatchMode,
@@ -396,7 +400,7 @@ struct ConcurrencySnapshot {
 }
 impl ConcurrencySnapshot {
 	fn new(project_id: &str, state_store: &StateStore) -> crate::prelude::Result<Self> {
-		let leases = state_store.list_leases(project_id)?;
+		let leases = state_store.list_active_shared_leases(project_id)?;
 		let mut counts_by_state = HashMap::new();
 
 		for lease in &leases {
@@ -455,6 +459,7 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		preferred_issue_id: request.preferred_issue_id,
 		preferred_issue_state: request.preferred_issue_state,
 		preferred_lease_acquired: request.preferred_lease_acquired,
+		preferred_issue_claim_fd: request.preferred_issue_claim_fd,
 		preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
 		preferred_dispatch_slot_index: request.preferred_dispatch_slot_index,
 		preferred_dispatch_mode: request.preferred_dispatch_mode,
@@ -911,33 +916,13 @@ where
 				&daemon_spawn_state.workspace.path.display().to_string(),
 			)?;
 
-			#[cfg(unix)]
-			let (dispatch_slot_handoff_file, dispatch_slot_index) =
-				state_store.clone_dispatch_slot_for_child(&summary.issue_id)?;
-			#[cfg(unix)]
-			let dispatch_slot_handoff = Some(dispatch_slot_handoff_file);
-			#[cfg(not(unix))]
-			let dispatch_slot_handoff: Option<File> = None;
-			#[cfg(unix)]
-			let dispatch_slot_index_handoff = Some(dispatch_slot_index);
-			#[cfg(not(unix))]
-			let dispatch_slot_index_handoff: Option<usize> = None;
-			let mut child = spawn_run_once_child(SpawnRunOnceChildRequest {
+			let mut child = spawn_planned_daemon_child(
 				config_path,
-				preferred_issue_id: summary.issue_id.as_str(),
-				preferred_issue_state: summary.issue_state.as_str(),
-				dispatch_mode: summary.dispatch_mode,
-				preferred_run_id: summary.run_id.as_str(),
-				preferred_attempt_number: summary.attempt_number,
-				preferred_retry_budget_base: daemon_spawn_state.retry_budget_base,
+				state_store,
 				workflow,
-				dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
-				dispatch_slot_index_handoff,
-			})
-			.inspect_err(|_error| {
-				let _ = state_store.update_run_status(&summary.run_id, "failed");
-				let _ = state_store.clear_lease(&summary.issue_id);
-			})?;
+				&summary,
+				daemon_spawn_state.retry_budget_base,
+			)?;
 
 			if let Err(error) = state::write_run_activity_marker_for_process(
 				&daemon_spawn_state.workspace.path,
@@ -984,6 +969,52 @@ where
 			Ok(false)
 		},
 	}
+}
+
+fn spawn_planned_daemon_child(
+	config_path: &Path,
+	state_store: &StateStore,
+	workflow: &WorkflowDocument,
+	summary: &RunSummary,
+	retry_budget_base: i64,
+) -> crate::prelude::Result<Child> {
+	#[cfg(unix)]
+	let issue_claim_handoff =
+		Some(state_store.clone_issue_claim_for_child(&summary.issue_id).inspect_err(|_error| {
+			let _ = state_store.update_run_status(&summary.run_id, "failed");
+			let _ = state_store.clear_lease(&summary.issue_id);
+		})?);
+	#[cfg(not(unix))]
+	let issue_claim_handoff: Option<File> = None;
+	#[cfg(unix)]
+	let (dispatch_slot_handoff_file, dispatch_slot_index) =
+		state_store.clone_dispatch_slot_for_child(&summary.issue_id)?;
+	#[cfg(unix)]
+	let dispatch_slot_handoff = Some(dispatch_slot_handoff_file);
+	#[cfg(not(unix))]
+	let dispatch_slot_handoff: Option<File> = None;
+	#[cfg(unix)]
+	let dispatch_slot_index_handoff = Some(dispatch_slot_index);
+	#[cfg(not(unix))]
+	let dispatch_slot_index_handoff: Option<usize> = None;
+
+	spawn_run_once_child(SpawnRunOnceChildRequest {
+		config_path,
+		preferred_issue_id: summary.issue_id.as_str(),
+		preferred_issue_state: summary.issue_state.as_str(),
+		dispatch_mode: summary.dispatch_mode,
+		preferred_run_id: summary.run_id.as_str(),
+		preferred_attempt_number: summary.attempt_number,
+		preferred_retry_budget_base: retry_budget_base,
+		workflow,
+		issue_claim_handoff: issue_claim_handoff.as_ref(),
+		dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
+		dispatch_slot_index_handoff,
+	})
+	.inspect_err(|_error| {
+		let _ = state_store.update_run_status(&summary.run_id, "failed");
+		let _ = state_store.clear_lease(&summary.issue_id);
+	})
 }
 
 fn plan_next_daemon_run<T>(
@@ -1072,7 +1103,8 @@ fn materialize_run_summary_workspace(
 fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
 	let workflow_snapshot = request.workflow.to_markdown()?;
-	let lease_preacquired = request.dispatch_slot_handoff.is_some();
+	let lease_preacquired =
+		request.issue_claim_handoff.is_some() || request.dispatch_slot_handoff.is_some();
 	let mut command = Command::new(executable);
 
 	command
@@ -1099,6 +1131,10 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 		command.arg("--lease-preacquired");
 	}
 
+	#[cfg(unix)]
+	if let Some(issue_claim_handoff) = request.issue_claim_handoff {
+		command.args(["--issue-claim-fd", &issue_claim_handoff.as_raw_fd().to_string()]);
+	}
 	#[cfg(unix)]
 	if let Some(dispatch_slot_handoff) = request.dispatch_slot_handoff {
 		command.args(["--dispatch-slot-fd", &dispatch_slot_handoff.as_raw_fd().to_string()]);
@@ -1179,6 +1215,7 @@ where
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: IssueDispatchMode::Retry,
@@ -1764,6 +1801,7 @@ fn run_configured_cycle(
 			preferred_issue_state: request.preferred_issue_state,
 			dry_run: request.dry_run,
 			lease_preacquired: request.preferred_lease_acquired,
+			preferred_issue_claim_fd: request.preferred_issue_claim_fd,
 			preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
 			preferred_dispatch_slot_index: request.preferred_dispatch_slot_index,
 			dispatch_mode: request.preferred_dispatch_mode.unwrap_or(IssueDispatchMode::Retry),
@@ -1857,19 +1895,29 @@ where
 	validate_review_handoff_runtime(dry_run)?;
 
 	let issues = tracker.list_project_issues(project.tracker().project_slug())?;
-	let selected_issue = recovered_state
-		.active_issues
-		.into_iter()
-		.find(|issue| !excluded_issue_ids.contains(&issue.id.as_str()))
-		.map(|issue| (issue, IssueDispatchMode::Retry))
-		.or(select_issue_candidate_with_exclusions(
-			issues,
-			workflow,
-			state_store,
-			project.id(),
-			excluded_issue_ids,
-		)?
-		.map(|issue| (issue, IssueDispatchMode::Normal)));
+	let mut selected_retry_issue = None;
+
+	for issue in recovered_state.active_issues {
+		if excluded_issue_ids.contains(&issue.id.as_str()) {
+			continue;
+		}
+		if state_store.issue_has_active_shared_claim(project.id(), &issue.id)? {
+			continue;
+		}
+
+		selected_retry_issue = Some((issue, IssueDispatchMode::Retry));
+
+		break;
+	}
+
+	let selected_issue = selected_retry_issue.or(select_issue_candidate_with_exclusions(
+		issues,
+		workflow,
+		state_store,
+		project.id(),
+		excluded_issue_ids,
+	)?
+	.map(|issue| (issue, IssueDispatchMode::Normal)));
 	let Some((issue, dispatch_mode)) = selected_issue else {
 		let _ = resolve_tracker_project(tracker, project.tracker().project_slug())?;
 
@@ -1976,6 +2024,13 @@ where
 	)? {
 		return Ok(None);
 	}
+	if !context.lease_preacquired
+		&& context
+			.state_store
+			.issue_has_active_shared_claim(context.project.id(), context.issue_id)?
+	{
+		return Ok(None);
+	}
 	if !context.lease_preacquired {
 		let concurrency = ConcurrencySnapshot::new(context.project.id(), context.state_store)?;
 
@@ -2025,6 +2080,9 @@ where
 	let preferred_issue_state = context
 		.preferred_issue_state
 		.ok_or_else(|| eyre::eyre!("daemon child lease handoff requires a planned issue state"))?;
+	let issue_claim_fd = context.preferred_issue_claim_fd.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires an inherited issue-claim fd")
+	})?;
 	let dispatch_slot_fd = context.preferred_dispatch_slot_fd.ok_or_else(|| {
 		eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot fd")
 	})?;
@@ -2039,8 +2097,7 @@ where
 			context.issue_id,
 			preferred_run_identity.run_id,
 			preferred_issue_state,
-			dispatch_slot_fd,
-			dispatch_slot_index,
+			state::PreacquiredLeaseGuards { issue_claim_fd, dispatch_slot_fd, dispatch_slot_index },
 		)?;
 	}
 
@@ -3345,6 +3402,9 @@ fn select_issue_candidate_with_exclusions(
 		if excluded_issue_ids.contains(&issue.id.as_str()) {
 			continue;
 		}
+		if state_store.issue_has_active_shared_claim(project_id, &issue.id)? {
+			continue;
+		}
 		if !concurrency.allows_state(
 			workflow.frontmatter().execution(),
 			workflow.frontmatter().tracker().in_progress_state(),
@@ -4009,6 +4069,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
@@ -4226,6 +4287,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
@@ -4255,6 +4317,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
@@ -4287,6 +4350,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
@@ -4327,6 +4391,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
@@ -4369,6 +4434,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
@@ -4406,6 +4472,7 @@ read_first = [{read_first}]
 			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
@@ -5555,8 +5622,16 @@ read_first = [{read_first}]
 				),
 		)
 		.expect("workflow should parse");
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 
+		state_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("dispatch-slot root should configure");
 		state_store
 			.upsert_lease("pubfi", "issue-active", "run-1", "In Progress")
 			.expect("existing lease should record");
@@ -5573,6 +5648,70 @@ read_first = [{read_first}]
 			selected.is_none(),
 			"per-state admission should count the projected in-progress state for normal dispatch"
 		);
+	}
+
+	#[test]
+	fn candidate_selection_skips_issue_claimed_by_another_process() {
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Claim-aware workflow policy.\n")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2")
+				.replace(
+					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
+					r#"max_concurrent_agents_by_state = { "In Progress" = 2 }"#,
+				),
+		)
+		.expect("workflow should parse");
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let remote_store = StateStore::open_in_memory().expect("remote state store should open");
+		let local_store = StateStore::open_in_memory().expect("local state store should open");
+		let claimed_issue = sample_issue_with_sort_fields(
+			"issue-claimed",
+			"PUB-100",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let free_issue = sample_issue_with_sort_fields(
+			"issue-free",
+			"PUB-101",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:16:18.133Z",
+		);
+
+		remote_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("remote dispatch-slot root should configure");
+		local_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("local dispatch-slot root should configure");
+
+		assert!(
+			remote_store
+				.try_acquire_lease(config.id(), &claimed_issue.id, "run-claimed", "In Progress")
+				.expect("remote issue claim should succeed")
+		);
+
+		let selected = orchestrator::select_issue_candidate(
+			vec![claimed_issue, free_issue.clone()],
+			&workflow,
+			&local_store,
+			config.id(),
+		)
+		.expect("candidate selection should succeed")
+		.expect("the unclaimed issue should still be selected");
+
+		assert_eq!(selected.id, free_issue.id);
 	}
 
 	#[test]
@@ -6275,6 +6414,9 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
 		let (child_guard, child_slot_index) = parent_store
 			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
@@ -6285,8 +6427,11 @@ read_first = [{read_first}]
 				&issue.id,
 				"planned-run",
 				"In Progress",
-				child_guard.into_raw_fd(),
-				child_slot_index,
+				state::PreacquiredLeaseGuards {
+					issue_claim_fd: child_issue_claim.into_raw_fd(),
+					dispatch_slot_fd: child_guard.into_raw_fd(),
+					dispatch_slot_index: child_slot_index,
+				},
 			)
 			.expect("child should adopt the inherited lease guard");
 
@@ -6356,6 +6501,9 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
 		let (child_guard, child_slot_index) = parent_store
 			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
@@ -6366,8 +6514,11 @@ read_first = [{read_first}]
 				&issue.id,
 				"planned-run",
 				"In Progress",
-				child_guard.into_raw_fd(),
-				child_slot_index,
+				state::PreacquiredLeaseGuards {
+					issue_claim_fd: child_issue_claim.into_raw_fd(),
+					dispatch_slot_fd: child_guard.into_raw_fd(),
+					dispatch_slot_index: child_slot_index,
+				},
 			)
 			.expect("child should adopt the inherited lease guard");
 		child_store
@@ -6438,6 +6589,9 @@ read_first = [{read_first}]
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
 		let (child_guard, child_slot_index) = parent_store
 			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
@@ -6455,6 +6609,7 @@ read_first = [{read_first}]
 			preferred_issue_state: Some("In Progress"),
 			dry_run: false,
 			lease_preacquired: true,
+			preferred_issue_claim_fd: Some(child_issue_claim.into_raw_fd()),
 			preferred_dispatch_slot_fd: Some(child_guard.into_raw_fd()),
 			preferred_dispatch_slot_index: Some(child_slot_index),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
