@@ -116,9 +116,11 @@
       "Added regression coverage for review handoff marker roundtrip, review handoff marker persistence, ready-to-land status, missing-marker blocked status, unresolved-thread repair classification, and repo-local GitHub identity routing.",
       "Updated `docs/spec/system_maestro_runtime.md` and `docs/spec/system_maestro_post_review_lifecycle.md` to document the `.maestro-review-handoff` marker and the read-only post-review status surface introduced by XY-173.",
       "Verification passed on the XY-173 lane: `cargo make fmt-check`, `cargo make lint`, `cargo make test`, and `git diff --check`.",
-      "Pre-commit self-review tightened the status surface so a GitHub PR state read failure degrades the affected post-review lane to `blocked` with reason `pull_request_state_read_failed` instead of aborting the entire `status` command."
+      "Pre-commit self-review tightened the status surface so a GitHub PR state read failure degrades the affected post-review lane to `blocked` with reason `pull_request_state_read_failed` instead of aborting the entire `status` command.",
+      "Review repair propagated `codex.github-identity` and `codex.linear-workspace` into clone-backed workspaces so lane-local GitHub and Linear routing survives `issue_review_handoff` and post-review status inspection without manual workspace config.",
+      "Review repair paginated GitHub review-thread inspection in `src/orchestrator.rs`, counted unresolved threads beyond the first page, and added guards plus tests for mixed-snapshot pagination and missing end-cursor responses."
     ],
-    "last_updated": "2026-03-20T01:57:00Z",
+    "last_updated": "2026-03-19T20:12:16Z",
     "replan_reason": null,
     "context_snapshot": {
       "issue": "XY-173",

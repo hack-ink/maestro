@@ -46,7 +46,7 @@ const CONTINUATION_PENDING_RUN_STATUS: &str = "continuation_pending";
 const TERMINAL_GUARDED_RUN_STATUS: &str = "terminal_guarded";
 const TERMINAL_GUARD_MARKER_FILE: &str = ".maestro-terminal-guarded";
 const PULL_REQUEST_REVIEW_STATE_QUERY: &str = r#"
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       url
@@ -56,10 +56,14 @@ query($owner: String!, $name: String!, $number: Int!) {
       mergeable
       headRefName
       headRefOid
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $reviewThreadsAfter) {
         nodes {
           isResolved
           isOutdated
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
       commits(last: 1) {
@@ -509,58 +513,38 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 		pr_url: &str,
 	) -> crate::prelude::Result<PullRequestReviewState> {
 		let locator = github::parse_pull_request_url(pr_url)?;
-		let mut command = Command::new("gh");
+		let mut review_threads_after: Option<String> = None;
+		let mut review_state: Option<PullRequestReviewState> = None;
 
-		command.args(["api", "graphql", "-f", &format!("query={PULL_REQUEST_REVIEW_STATE_QUERY}")]);
-		command.args(["-F", &format!("owner={}", locator.owner)]);
-		command.args(["-F", &format!("name={}", locator.repo)]);
-		command.args(["-F", &format!("number={}", locator.number)]);
-		command.current_dir(cwd);
+		loop {
+			let pull_request = query_pull_request_review_state_page(
+				cwd,
+				&locator.owner,
+				&locator.repo,
+				locator.number,
+				review_threads_after.as_deref(),
+				pr_url,
+			)?;
+			let next_cursor = match &mut review_state {
+				Some(review_state) =>
+					merge_pull_request_review_state_page(review_state, &pull_request)?,
+				None => {
+					let next_cursor = next_pull_request_review_threads_cursor(&pull_request)?;
 
-		github::configure_gh_command(&mut command, cwd)?;
+					review_state = Some(pull_request_review_state_from_page(&pull_request));
 
-		let output = command.output()?;
+					next_cursor
+				},
+			};
+			let Some(next_cursor) = next_cursor else {
+				break;
+			};
 
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr);
-
-			eyre::bail!(
-				"Failed to inspect pull request review state `{pr_url}`: {}",
-				stderr.trim()
-			);
+			review_threads_after = Some(next_cursor);
 		}
 
-		let response = serde_json::from_slice::<PullRequestReviewStateResponse>(&output.stdout)?;
-		let Some(repository) = response.data.repository else {
-			eyre::bail!("GitHub GraphQL response for `{pr_url}` did not include a repository.");
-		};
-		let Some(pull_request) = repository.pull_request else {
-			eyre::bail!("GitHub GraphQL response for `{pr_url}` did not include a pull request.");
-		};
-		let unresolved_review_threads = pull_request
-			.review_threads
-			.nodes
-			.into_iter()
-			.filter(|thread| !thread.is_resolved && !thread.is_outdated)
-			.count();
-		let status_check_rollup_state = pull_request
-			.commits
-			.nodes
-			.into_iter()
-			.next()
-			.and_then(|node| node.commit.status_check_rollup)
-			.map(|rollup| rollup.state);
-
-		Ok(PullRequestReviewState {
-			url: pull_request.url,
-			state: pull_request.state,
-			is_draft: pull_request.is_draft,
-			review_decision: pull_request.review_decision,
-			mergeable: pull_request.mergeable,
-			head_ref_name: pull_request.head_ref_name,
-			head_ref_oid: pull_request.head_ref_oid,
-			status_check_rollup_state,
-			unresolved_review_threads,
+		review_state.ok_or_else(|| {
+			eyre::eyre!("GitHub GraphQL response for `{pr_url}` did not include a pull request.")
 		})
 	}
 }
@@ -672,6 +656,8 @@ struct PullRequestReviewStateNode {
 #[derive(Deserialize)]
 struct PullRequestReviewThreadConnection {
 	nodes: Vec<PullRequestReviewThreadNode>,
+	#[serde(rename = "pageInfo")]
+	page_info: PullRequestPageInfo,
 }
 
 #[derive(Deserialize)]
@@ -680,6 +666,14 @@ struct PullRequestReviewThreadNode {
 	is_resolved: bool,
 	#[serde(rename = "isOutdated")]
 	is_outdated: bool,
+}
+
+#[derive(Deserialize)]
+struct PullRequestPageInfo {
+	#[serde(rename = "hasNextPage")]
+	has_next_page: bool,
+	#[serde(rename = "endCursor")]
+	end_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -908,6 +902,117 @@ pub(crate) fn print_status(
 	}
 
 	Ok(())
+}
+
+fn query_pull_request_review_state_page(
+	cwd: &Path,
+	owner: &str,
+	repo: &str,
+	number: u64,
+	review_threads_after: Option<&str>,
+	pr_url: &str,
+) -> crate::prelude::Result<PullRequestReviewStateNode> {
+	let mut command = Command::new("gh");
+
+	command.args(["api", "graphql", "-f", &format!("query={PULL_REQUEST_REVIEW_STATE_QUERY}")]);
+	command.args(["-F", &format!("owner={owner}")]);
+	command.args(["-F", &format!("name={repo}")]);
+	command.args(["-F", &format!("number={number}")]);
+
+	if let Some(review_threads_after) = review_threads_after {
+		command.args(["-F", &format!("reviewThreadsAfter={review_threads_after}")]);
+	}
+
+	command.current_dir(cwd);
+
+	github::configure_gh_command(&mut command, cwd)?;
+
+	let output = command.output()?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+
+		eyre::bail!("Failed to inspect pull request review state `{pr_url}`: {}", stderr.trim());
+	}
+
+	let response = serde_json::from_slice::<PullRequestReviewStateResponse>(&output.stdout)?;
+	let Some(repository) = response.data.repository else {
+		eyre::bail!("GitHub GraphQL response for `{pr_url}` did not include a repository.");
+	};
+	let Some(pull_request) = repository.pull_request else {
+		eyre::bail!("GitHub GraphQL response for `{pr_url}` did not include a pull request.");
+	};
+
+	Ok(pull_request)
+}
+
+fn pull_request_review_state_from_page(
+	pull_request: &PullRequestReviewStateNode,
+) -> PullRequestReviewState {
+	PullRequestReviewState {
+		url: pull_request.url.clone(),
+		state: pull_request.state.clone(),
+		is_draft: pull_request.is_draft,
+		review_decision: pull_request.review_decision.clone(),
+		mergeable: pull_request.mergeable.clone(),
+		head_ref_name: pull_request.head_ref_name.clone(),
+		head_ref_oid: pull_request.head_ref_oid.clone(),
+		status_check_rollup_state: pull_request_status_check_rollup_state(pull_request),
+		unresolved_review_threads: count_unresolved_review_threads(&pull_request.review_threads),
+	}
+}
+
+fn merge_pull_request_review_state_page(
+	review_state: &mut PullRequestReviewState,
+	pull_request: &PullRequestReviewStateNode,
+) -> crate::prelude::Result<Option<String>> {
+	if review_state.url != pull_request.url
+		|| review_state.state != pull_request.state
+		|| review_state.is_draft != pull_request.is_draft
+		|| review_state.review_decision != pull_request.review_decision
+		|| review_state.mergeable != pull_request.mergeable
+		|| review_state.head_ref_name != pull_request.head_ref_name
+		|| review_state.head_ref_oid != pull_request.head_ref_oid
+		|| review_state.status_check_rollup_state
+			!= pull_request_status_check_rollup_state(pull_request)
+	{
+		eyre::bail!("Pull request review state changed while paginating `{}`.", review_state.url);
+	}
+
+	review_state.unresolved_review_threads +=
+		count_unresolved_review_threads(&pull_request.review_threads);
+
+	next_pull_request_review_threads_cursor(pull_request)
+}
+
+fn count_unresolved_review_threads(review_threads: &PullRequestReviewThreadConnection) -> usize {
+	review_threads.nodes.iter().filter(|thread| !thread.is_resolved && !thread.is_outdated).count()
+}
+
+fn pull_request_status_check_rollup_state(
+	pull_request: &PullRequestReviewStateNode,
+) -> Option<String> {
+	pull_request
+		.commits
+		.nodes
+		.first()
+		.and_then(|node| node.commit.status_check_rollup.as_ref())
+		.map(|rollup| rollup.state.clone())
+}
+
+fn next_pull_request_review_threads_cursor(
+	pull_request: &PullRequestReviewStateNode,
+) -> crate::prelude::Result<Option<String>> {
+	if !pull_request.review_threads.page_info.has_next_page {
+		return Ok(None);
+	}
+
+	pull_request.review_threads.page_info.end_cursor.clone().map(Some).ok_or_else(|| {
+		eyre::eyre!(
+			"GitHub GraphQL response for `{}` reported additional review thread pages without an end cursor.",
+			pull_request.url
+		)
+	})
 }
 
 fn format_run_once_summary(summary: &RunSummary, dry_run: bool) -> String {
@@ -4400,7 +4505,10 @@ mod tests {
 			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 			ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision, PostReviewLaneSnapshot,
-			PullRequestReviewState, PullRequestReviewStateInspector, RunSummary,
+			PullRequestCommitConnection, PullRequestCommitNode, PullRequestCommitPayload,
+			PullRequestPageInfo, PullRequestReviewState, PullRequestReviewStateInspector,
+			PullRequestReviewStateNode, PullRequestReviewThreadConnection,
+			PullRequestReviewThreadNode, PullRequestStatusCheckRollup, RunSummary,
 		},
 		prelude::Result,
 		state::{self, RUN_ACTIVITY_MARKER_FILE, StateStore},
@@ -4696,6 +4804,43 @@ mod tests {
 			head_ref_oid: head_oid.to_owned(),
 			status_check_rollup_state: check_state.map(str::to_owned),
 			unresolved_review_threads,
+		}
+	}
+
+	fn sample_pull_request_review_state_page(
+		pr_url: &str,
+		branch_name: &str,
+		head_oid: &str,
+		unresolved_review_threads: usize,
+		has_next_page: bool,
+		end_cursor: Option<&str>,
+	) -> PullRequestReviewStateNode {
+		PullRequestReviewStateNode {
+			url: pr_url.to_owned(),
+			state: String::from("OPEN"),
+			is_draft: false,
+			review_decision: Some(String::from("APPROVED")),
+			mergeable: String::from("MERGEABLE"),
+			head_ref_name: branch_name.to_owned(),
+			head_ref_oid: head_oid.to_owned(),
+			review_threads: PullRequestReviewThreadConnection {
+				nodes: (0..unresolved_review_threads)
+					.map(|_| PullRequestReviewThreadNode { is_resolved: false, is_outdated: false })
+					.collect(),
+				page_info: PullRequestPageInfo {
+					has_next_page,
+					end_cursor: end_cursor.map(str::to_owned),
+				},
+			},
+			commits: PullRequestCommitConnection {
+				nodes: vec![PullRequestCommitNode {
+					commit: PullRequestCommitPayload {
+						status_check_rollup: Some(PullRequestStatusCheckRollup {
+							state: String::from("SUCCESS"),
+						}),
+					},
+				}],
+			},
 		}
 	}
 
@@ -7548,6 +7693,80 @@ read_first = [{read_first}]
 
 		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
 		assert_eq!(classification.reason, "pull_request_state_read_failed");
+	}
+
+	#[test]
+	fn merge_pull_request_review_state_page_counts_unresolved_threads_across_pages() {
+		let mut review_state = orchestrator::pull_request_review_state_from_page(
+			&sample_pull_request_review_state_page(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+				100,
+				true,
+				Some("cursor-1"),
+			),
+		);
+		let next_page = sample_pull_request_review_state_page(
+			"https://github.com/hack-ink/maestro/pull/174",
+			"x/pubfi-pub-101",
+			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+			1,
+			false,
+			None,
+		);
+		let next_cursor =
+			orchestrator::merge_pull_request_review_state_page(&mut review_state, &next_page)
+				.expect("page merge should succeed");
+
+		assert_eq!(review_state.unresolved_review_threads, 101);
+		assert_eq!(next_cursor, None);
+	}
+
+	#[test]
+	fn merge_pull_request_review_state_page_rejects_changed_review_metadata() {
+		let mut review_state = orchestrator::pull_request_review_state_from_page(
+			&sample_pull_request_review_state_page(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+				100,
+				true,
+				Some("cursor-1"),
+			),
+		);
+		let mut next_page = sample_pull_request_review_state_page(
+			"https://github.com/hack-ink/maestro/pull/174",
+			"x/pubfi-pub-101",
+			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+			1,
+			false,
+			None,
+		);
+
+		next_page.review_decision = Some(String::from("CHANGES_REQUESTED"));
+
+		let error =
+			orchestrator::merge_pull_request_review_state_page(&mut review_state, &next_page)
+				.expect_err("changed review metadata should fail");
+
+		assert!(error.to_string().contains("changed while paginating"));
+	}
+
+	#[test]
+	fn next_pull_request_review_threads_cursor_requires_end_cursor_when_pagination_continues() {
+		let page = sample_pull_request_review_state_page(
+			"https://github.com/hack-ink/maestro/pull/174",
+			"x/pubfi-pub-101",
+			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+			100,
+			true,
+			None,
+		);
+		let error = orchestrator::next_pull_request_review_threads_cursor(&page)
+			.expect_err("missing end cursor should fail");
+
+		assert!(error.to_string().contains("without an end cursor"));
 	}
 
 	#[test]
