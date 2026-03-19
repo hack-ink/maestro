@@ -4,7 +4,7 @@ mod tracker_tool_bridge;
 
 pub(crate) use self::{
 	app_server::{
-		ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, TurnContinuationGuard,
+		ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, AppServerRunResult, TurnContinuationGuard,
 		execute_app_server_run, probe_app_server,
 	},
 	tracker_tool_bridge::{

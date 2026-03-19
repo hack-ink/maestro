@@ -74,6 +74,7 @@ pub(crate) struct TrackerToolBridge<'a> {
 	local_repo_inspector: &'a dyn LocalRepoInspector,
 	manual_attention_requested: RefCell<bool>,
 	manual_attention_comment_recorded: RefCell<bool>,
+	continuation_blocking_tracker_write: RefCell<Option<String>>,
 	pending_review_handoff: RefCell<Option<PendingReviewHandoff>>,
 	finalized_completion_path: RefCell<Option<RunCompletionDisposition>>,
 }
@@ -93,6 +94,7 @@ impl<'a> TrackerToolBridge<'a> {
 			local_repo_inspector: &LOCAL_GIT_REPO_INSPECTOR,
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
+			continuation_blocking_tracker_write: RefCell::new(None),
 			pending_review_handoff: RefCell::new(None),
 			finalized_completion_path: RefCell::new(None),
 		}
@@ -115,6 +117,7 @@ impl<'a> TrackerToolBridge<'a> {
 			local_repo_inspector,
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
+			continuation_blocking_tracker_write: RefCell::new(None),
 			pending_review_handoff: RefCell::new(None),
 			finalized_completion_path: RefCell::new(None),
 		}
@@ -318,10 +321,14 @@ impl<'a> TrackerToolBridge<'a> {
 		};
 
 		match self.tracker.update_issue_state(&self.issue.id, state_id) {
-			Ok(()) => DynamicToolCallResponse::success(format!(
-				"Issue `{}` moved to `{}`.",
-				self.issue.identifier, parsed.state
-			)),
+			Ok(()) => {
+				self.record_continuation_blocking_transition(&parsed.state);
+
+				DynamicToolCallResponse::success(format!(
+					"Issue `{}` moved to `{}`.",
+					self.issue.identifier, parsed.state
+				))
+			},
 			Err(error) => DynamicToolCallResponse::failure(format!(
 				"Failed to move issue `{}` to `{}`: {error}",
 				self.issue.identifier, parsed.state
@@ -472,6 +479,11 @@ impl<'a> TrackerToolBridge<'a> {
 		if label_ids.iter().any(|existing| existing == label_id) {
 			if manual_attention_label {
 				self.manual_attention_requested.replace(true);
+			} else if parsed.label == self.workflow.frontmatter().tracker().opt_out_label() {
+				self.record_continuation_blocking_write(format!(
+					"`{ISSUE_LABEL_ADD_TOOL_NAME}` with label `{}`",
+					parsed.label
+				));
 			}
 
 			return DynamicToolCallResponse::success(format!(
@@ -486,6 +498,11 @@ impl<'a> TrackerToolBridge<'a> {
 			Ok(()) => {
 				if manual_attention_label {
 					self.manual_attention_requested.replace(true);
+				} else if parsed.label == self.workflow.frontmatter().tracker().opt_out_label() {
+					self.record_continuation_blocking_write(format!(
+						"`{ISSUE_LABEL_ADD_TOOL_NAME}` with label `{}`",
+						parsed.label
+					));
 				}
 
 				DynamicToolCallResponse::success(format!(
@@ -641,6 +658,35 @@ impl<'a> TrackerToolBridge<'a> {
 		Ok(pull_request)
 	}
 
+	fn record_continuation_blocking_transition(&self, state: &str) {
+		if state != self.workflow.frontmatter().tracker().in_progress_state() {
+			self.record_continuation_blocking_write(format!(
+				"`{ISSUE_TRANSITION_TOOL_NAME}` to state `{state}`"
+			));
+		}
+	}
+
+	fn record_continuation_blocking_write(&self, reason: String) {
+		self.continuation_blocking_tracker_write.replace(Some(reason));
+	}
+
+	fn continuation_blocking_write_reason(&self) -> crate::prelude::Result<Option<String>> {
+		let Some(reason) = self.continuation_blocking_tracker_write.borrow().clone() else {
+			return Ok(None);
+		};
+		let issue = self.refreshed_issue_snapshot()?;
+		let tracker_policy = self.workflow.frontmatter().tracker();
+		let issue_still_active = issue.state.name == tracker_policy.in_progress_state()
+			&& !issue.has_label(tracker_policy.opt_out_label())
+			&& !issue.has_label(tracker_policy.needs_attention_label());
+
+		if issue_still_active {
+			return Ok(None);
+		}
+
+		Ok(Some(reason))
+	}
+
 	pub(crate) fn completion_disposition(
 		&self,
 	) -> crate::prelude::Result<RunCompletionDisposition> {
@@ -769,7 +815,18 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 			manual_attention_comment_recorded,
 			review_handoff_recorded,
 		) {
-			(false, false, false) => Ok(TurnCompletionStatus::Continue),
+			(false, false, false) => {
+				if let Some(reason) = self.continuation_blocking_write_reason()? {
+					eyre::bail!(
+						"Run `{}` changed issue `{}` via {} without recording a terminal path. Continuation turns may only yield cleanly while the leased issue remains active.",
+						review_context.run_id,
+						self.issue.identifier,
+						reason
+					);
+				}
+
+				Ok(TurnCompletionStatus::Continue)
+			},
 			(false, false, true) | (true, true, false) => {
 				self.validate_turn_completion("")?;
 
@@ -1878,6 +1935,84 @@ Use the tracker tools.
 			.expect("missing terminal action should request continuation"),
 			TurnCompletionStatus::Continue
 		);
+	}
+
+	#[test]
+	fn turn_classification_rejects_opt_out_label_without_terminal_path() {
+		let mut opted_out_issue = sample_issue();
+
+		opted_out_issue.labels.push(TrackerLabel {
+			id: String::from("label-manual"),
+			name: String::from("maestro:manual-only"),
+		});
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![opted_out_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:manual-only" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"The lane opted out, but no terminal path was recorded.",
+		)
+		.expect_err("opt-out writes must not exit via a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_LABEL_ADD_TOOL_NAME));
+	}
+
+	#[test]
+	fn turn_classification_rejects_non_in_progress_transition_without_terminal_path() {
+		let mut todo_issue = sample_issue();
+
+		todo_issue.state =
+			TrackerState { id: String::from("state-todo"), name: String::from("Todo") };
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![todo_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "Todo" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"The issue moved back to Todo without a terminal path.",
+		)
+		.expect_err("non-In-Progress transitions must not exit via a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_TRANSITION_TOOL_NAME));
 	}
 
 	#[test]

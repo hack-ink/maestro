@@ -116,9 +116,11 @@
       "2026-03-19: CI reproduced a merge-base drift against current origin/main: RunSummary gained issue_state and retry_project_slug on main after the lane branched from 5f261f2, so the continuation-boundary early return had to be rebased onto origin/main and switched to run_summary_from_issue_run(...) instead of a stale hand-written initializer.",
       "2026-03-19: After rebasing XY-157 onto origin/main, cargo make fmt-check, cargo make lint, and cargo make test all passed again on the repaired head.",
       "2026-03-19: review-repair for head 07633a8 reconciled the continuation prompt contract, rejected turn-1 clean yields when the startup tracker transition never happened, compared continuation eligibility against the resolved retry project slug, and refreshed tracker issue labels before cross-turn label writes.",
-      "2026-03-19: Fresh repair verification passed on the current working tree: cargo test continuation -- --nocapture, cargo test label_add_refreshes_issue_snapshot_before_merging_label_ids -- --nocapture, cargo make fmt-check, cargo make lint, cargo make test, and git diff --check."
+      "2026-03-19: Fresh repair verification passed on the current working tree: cargo test continuation -- --nocapture, cargo test label_add_refreshes_issue_snapshot_before_merging_label_ids -- --nocapture, cargo make fmt-check, cargo make lint, cargo make test, and git diff --check.",
+      "2026-03-19: review-repair for head 748f6e3 found two new continuation-boundary gaps on the current PR head: local tracker writes could turn nonterminal continuation into a silent non-active exit, and direct run_once callers treated continuation boundaries like completed runs.",
+      "2026-03-19: The current repair batch now rejects clean continuation after local tracker writes that leave the issue non-active without a terminal path, and it surfaces direct run_once continuation boundaries explicitly via RunSummary.continuation_pending plus a paused run message. Fresh verification on the repaired diff passed: cargo test turn_classification_rejects_opt_out_label_without_terminal_path -- --nocapture, cargo test turn_classification_rejects_non_in_progress_transition_without_terminal_path -- --nocapture, cargo test format_run_once_summary_surfaces_continuation_boundaries -- --nocapture, cargo make fmt, cargo make fmt-check, cargo make lint, cargo make test, and git diff --check."
     ],
-    "last_updated": "2026-03-19T05:49:35Z",
+    "last_updated": "2026-03-19T06:16:17Z",
     "replan_reason": null,
     "context_snapshot": {
       "issue_url": "https://linear.app/hack-ink/issue/XY-157/support-same-thread-continuation-turns-and-max-turns-in-maestro-agent",

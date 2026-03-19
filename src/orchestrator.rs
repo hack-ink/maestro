@@ -20,8 +20,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
 	agent::{
-		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, ISSUE_COMMENT_TOOL_NAME,
-		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, AppServerRunResult,
+		ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 		ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
 		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,
 		TurnContinuationGuard,
@@ -70,6 +70,7 @@ struct RunSummary {
 	workspace_path: PathBuf,
 	attempt_number: i64,
 	run_id: String,
+	continuation_pending: bool,
 }
 
 struct MaterializedDaemonSpawnState {
@@ -513,24 +514,7 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		preferred_retry_budget_base: request.preferred_retry_budget_base,
 		preferred_workflow_snapshot: request.preferred_workflow_snapshot,
 	})? {
-		if request.dry_run {
-			println!(
-				"dry run: project={} issue={} branch={} workspace={} attempt={}",
-				summary.project_id,
-				summary.issue_identifier,
-				summary.branch_name,
-				summary.workspace_path.display(),
-				summary.attempt_number
-			);
-		} else {
-			println!(
-				"run complete: project={} issue={} run_id={} workspace={}",
-				summary.project_id,
-				summary.issue_identifier,
-				summary.run_id,
-				summary.workspace_path.display()
-			);
-		}
+		println!("{}", format_run_once_summary(&summary, request.dry_run));
 
 		return Ok(());
 	}
@@ -624,6 +608,36 @@ pub(crate) fn print_status(
 	}
 
 	Ok(())
+}
+
+fn format_run_once_summary(summary: &RunSummary, dry_run: bool) -> String {
+	if dry_run {
+		return format!(
+			"dry run: project={} issue={} branch={} workspace={} attempt={}",
+			summary.project_id,
+			summary.issue_identifier,
+			summary.branch_name,
+			summary.workspace_path.display(),
+			summary.attempt_number
+		);
+	}
+	if summary.continuation_pending {
+		return format!(
+			"run paused at continuation boundary: project={} issue={} run_id={} workspace={} next_action=rerun_or_use_daemon",
+			summary.project_id,
+			summary.issue_identifier,
+			summary.run_id,
+			summary.workspace_path.display()
+		);
+	}
+
+	format!(
+		"run complete: project={} issue={} run_id={} workspace={}",
+		summary.project_id,
+		summary.issue_identifier,
+		summary.run_id,
+		summary.workspace_path.display()
+	)
 }
 
 fn load_daemon_tick_context(
@@ -2556,19 +2570,7 @@ where
 	})?;
 
 	if run_result.continuation_pending {
-		tracing::info!(
-			project_id = project.id(),
-			issue_id = issue_run.issue.id,
-			issue = issue_run.issue.identifier,
-			run_id = issue_run.run_id,
-			attempt = issue_run.attempt_number,
-			thread_id = run_result.thread_id,
-			turn_count = run_result.turn_count,
-			max_turns = workflow.frontmatter().execution().max_turns(),
-			"Run reached a clean continuation boundary and will rely on the next bounded re-entry."
-		);
-
-		return Ok(run_summary_from_issue_run(project.id(), issue_run));
+		return Ok(continuation_boundary_summary(project, workflow, issue_run, &run_result));
 	}
 
 	match tracker_tool_bridge.completion_disposition()? {
@@ -2600,18 +2602,7 @@ where
 		},
 	}
 
-	Ok(RunSummary {
-		project_id: project.id().to_owned(),
-		issue_id: issue_run.issue.id.clone(),
-		issue_identifier: issue_run.issue.identifier.clone(),
-		issue_state: issue_run.issue_state.clone(),
-		retry_project_slug: issue_run.retry_project_slug.clone(),
-		dispatch_mode: issue_run.dispatch_mode,
-		branch_name: issue_run.workspace.branch_name.clone(),
-		workspace_path: issue_run.workspace.path.clone(),
-		attempt_number: issue_run.attempt_number,
-		run_id: issue_run.run_id.clone(),
-	})
+	Ok(run_summary_from_issue_run(project.id(), issue_run))
 }
 
 fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> RunSummary {
@@ -2626,7 +2617,29 @@ fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> Run
 		workspace_path: issue_run.workspace.path.clone(),
 		attempt_number: issue_run.attempt_number,
 		run_id: issue_run.run_id.clone(),
+		continuation_pending: false,
 	}
+}
+
+fn continuation_boundary_summary(
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	issue_run: &IssueRunPlan,
+	run_result: &AppServerRunResult,
+) -> RunSummary {
+	tracing::info!(
+		project_id = project.id(),
+		issue_id = issue_run.issue.id,
+		issue = issue_run.issue.identifier,
+		run_id = issue_run.run_id,
+		attempt = issue_run.attempt_number,
+		thread_id = run_result.thread_id,
+		turn_count = run_result.turn_count,
+		max_turns = workflow.frontmatter().execution().max_turns(),
+		"Run reached a clean continuation boundary and will rely on the next bounded re-entry."
+	);
+
+	RunSummary { continuation_pending: true, ..run_summary_from_issue_run(project.id(), issue_run) }
 }
 
 fn planned_issue_state_for_dispatch(
@@ -5491,9 +5504,32 @@ read_first = [{read_first}]
 				workspace_path: Path::new(&config.workspace_root().join("PUB-101")).to_path_buf(),
 				attempt_number: 1,
 				run_id: summary.run_id.clone(),
+				continuation_pending: false,
 			}
 		);
 		assert!(tracker.comments.borrow().is_empty());
+	}
+
+	#[test]
+	fn format_run_once_summary_surfaces_continuation_boundaries() {
+		let summary = RunSummary {
+			project_id: String::from("pubfi"),
+			issue_id: String::from("issue-1"),
+			issue_identifier: String::from("PUB-101"),
+			issue_state: String::from("In Progress"),
+			retry_project_slug: String::from("pubfi"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			branch_name: String::from("x/pubfi-pub-101"),
+			workspace_path: PathBuf::from(".workspaces/PUB-101"),
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1"),
+			continuation_pending: true,
+		};
+		let message = orchestrator::format_run_once_summary(&summary, false);
+
+		assert!(message.contains("run paused at continuation boundary"));
+		assert!(message.contains("next_action=rerun_or_use_daemon"));
+		assert!(!message.contains("run complete"));
 	}
 
 	#[test]
