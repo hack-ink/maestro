@@ -82,15 +82,24 @@ struct RunCommand {
 	/// Run a specific leased or queued issue instead of normal candidate selection.
 	#[arg(long, value_name = "ISSUE_ID")]
 	issue_id: Option<String>,
+	/// Reuse a daemon-planned issue state for an issue-targeted child run.
+	#[arg(long, value_name = "STATE", hide = true, requires = "issue_id")]
+	issue_state: Option<String>,
 	/// Override the dispatch policy for an issue-targeted run.
 	#[arg(long, value_name = "MODE", value_enum, hide = true, requires = "issue_id")]
 	dispatch_mode: Option<RunIssueDispatchMode>,
 	/// Reuse a daemon-held lease for an issue-targeted child run.
 	#[arg(long, hide = true, requires = "issue_id")]
 	lease_preacquired: bool,
+	/// Reuse the daemon-held issue-claim fd for an issue-targeted child run.
+	#[arg(long, value_name = "FD", hide = true, requires = "issue_id")]
+	issue_claim_fd: Option<i32>,
 	/// Reuse the daemon-held dispatch-slot fd for an issue-targeted child run.
 	#[arg(long, value_name = "FD", hide = true, requires = "issue_id")]
 	dispatch_slot_fd: Option<i32>,
+	/// Reuse the daemon-held dispatch-slot index for an issue-targeted child run.
+	#[arg(long, value_name = "INDEX", hide = true, requires = "issue_id")]
+	dispatch_slot_index: Option<usize>,
 	/// Reuse a daemon-planned run identifier for an issue-targeted run.
 	#[arg(long, value_name = "RUN_ID", hide = true, requires = "issue_id")]
 	run_id: Option<String>,
@@ -122,8 +131,11 @@ impl RunCommand {
 			config_path: self.config.as_deref(),
 			dry_run: self.dry_run,
 			preferred_issue_id: self.issue_id.as_deref(),
+			preferred_issue_state: self.issue_state.as_deref(),
 			preferred_lease_acquired: self.lease_preacquired,
+			preferred_issue_claim_fd: self.issue_claim_fd,
 			preferred_dispatch_slot_fd: self.dispatch_slot_fd,
+			preferred_dispatch_slot_index: self.dispatch_slot_index,
 			preferred_dispatch_mode: self.dispatch_mode.map(Into::into),
 			preferred_run_id: self.run_id.as_deref(),
 			preferred_attempt_number: self.attempt_number,
@@ -239,8 +251,11 @@ mod tests {
 				once: true,
 				dry_run: true,
 				issue_id: None,
+				issue_state: None,
 				lease_preacquired: false,
+				issue_claim_fd: None,
 				dispatch_slot_fd: None,
+				dispatch_slot_index: None,
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
@@ -261,8 +276,11 @@ mod tests {
 				once: true,
 				dry_run: false,
 				issue_id: Some(_),
+				issue_state: None,
 				lease_preacquired: false,
+				issue_claim_fd: None,
 				dispatch_slot_fd: None,
+				dispatch_slot_index: None,
 				dispatch_mode: None,
 				run_id: None,
 				attempt_number: None,
@@ -283,6 +301,8 @@ mod tests {
 			"issue-1",
 			"--dispatch-mode",
 			"normal",
+			"--issue-state",
+			"Todo",
 			"--run-id",
 			"mae-1-attempt-2-123",
 			"--attempt-number",
@@ -299,8 +319,11 @@ mod tests {
 				once: true,
 				dry_run: false,
 				issue_id: Some(_),
+				issue_state: Some(_),
 				lease_preacquired: false,
+				issue_claim_fd: None,
 				dispatch_slot_fd: None,
+				dispatch_slot_index: None,
 				dispatch_mode: Some(RunIssueDispatchMode::Normal),
 				run_id: Some(_),
 				attempt_number: Some(2),

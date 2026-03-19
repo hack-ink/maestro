@@ -1,0 +1,145 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-156-concurrency-recovery",
+    "goal": "Recover XY-156 on top of the latest mainline so Maestro can resume self-bootstrap work on repo-configurable global and per-state concurrency limits.",
+    "success_criteria": [
+      "WORKFLOW.md and workflow contract docs define optional global and per-state concurrency settings with canonical defaults.",
+      "Workflow parsing exposes validated concurrency fields without regressing the latest canonical-only parser behavior from main.",
+      "StateStore and orchestrator logic on the recovered lane enforce global and per-state concurrency limits for dispatch, retry, and reconciliation.",
+      "The recovered lane passes repo-native verification and is ready to re-enter the normal review flow.",
+      "The stale retained XY-156 lane is no longer the execution authority for this issue."
+    ],
+    "constraints": [
+      "Base all recovery work on origin/main at adf76d819cf80d6aa4be175227eb968e760b0de8 or a descendant.",
+      "Do not overwrite or reset the retained donor lane until the recovered lane has absorbed the useful implementation.",
+      "Keep WORKFLOW.md frontmatter TOML-based and preserve default single-slot behavior when concurrency fields are unset.",
+      "Do not widen scope into distributed scheduling or tracker contract changes unrelated to concurrency policy.",
+      "Use repo-native verification commands from cargo-make before claiming recovery is complete."
+    ],
+    "defaults": {},
+    "tasks": [
+      {
+        "id": "recover-contract-surface",
+        "title": "Recover workflow contract surface on latest main",
+        "status": "done",
+        "objective": "Port the donor lane changes for WORKFLOW.md, workflow docs, and workflow.rs onto the latest mainline while preserving the current canonical-only contract.",
+        "inputs": [
+          "Retained donor lane diff for WORKFLOW.md, docs/spec/system_workflow_contract.md, and src/workflow.rs",
+          "Latest mainline parser behavior after XY-165 and XY-168"
+        ],
+        "outputs": [
+          "Updated WORKFLOW.md example with concurrency settings",
+          "Updated workflow contract spec",
+          "WorkflowExecution parsing and validation for concurrency settings"
+        ],
+        "verification": [
+          "Targeted workflow parsing tests cover defaults and configured overrides",
+          "No legacy alias or compatibility guidance is reintroduced"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "recover-runtime-concurrency",
+        "title": "Recover state and orchestrator concurrency logic",
+        "status": "done",
+        "objective": "Port and adapt the donor lane changes in state.rs and orchestrator.rs so the latest runtime enforces global and per-state concurrency limits consistently.",
+        "inputs": [
+          "Retained donor lane diff for src/state.rs and src/orchestrator.rs",
+          "Recovered workflow execution surface from the prior task"
+        ],
+        "outputs": [
+          "StateStore lease/state updates needed for multi-lease concurrency accounting",
+          "Orchestrator gating for dispatch, retry, and reconciliation via shared concurrency checks"
+        ],
+        "verification": [
+          "Targeted state/orchestrator tests cover default single-slot behavior and configured concurrency"
+        ],
+        "depends_on": [
+          "recover-contract-surface"
+        ]
+      },
+      {
+        "id": "reverify-recovered-lane",
+        "title": "Verify recovered lane and capture recovery evidence",
+        "status": "done",
+        "objective": "Run repo-native checks on the recovered implementation and record the surviving lane as the new execution authority for XY-156.",
+        "inputs": [
+          "Recovered contract and runtime code",
+          "Repo-native cargo-make verification commands"
+        ],
+        "outputs": [
+          "Passing fmt, lint, and test evidence on the recovered lane",
+          "Updated plan state/evidence showing the surviving lane is review-ready"
+        ],
+        "verification": [
+          "cargo make fmt-check",
+          "cargo make lint",
+          "cargo make test"
+        ],
+        "depends_on": [
+          "recover-daemon-child-pool"
+        ]
+      },
+      {
+        "id": "recover-daemon-child-pool",
+        "title": "Recover daemon multi-child orchestration on latest main",
+        "status": "done",
+        "objective": "Replace the daemon's single active-child slot with orchestration that can hold multiple concurrent child runs up to the configured concurrency limits while preserving reconciliation and retry semantics.",
+        "inputs": [
+          "Recovered StateStore and ConcurrencySnapshot support",
+          "Current daemon tick, child inspection, and retry scheduling logic in src/orchestrator.rs"
+        ],
+        "outputs": [
+          "Daemon tick flow that can track multiple active children",
+          "Spawn, reconciliation, and cleanup logic that respects configured global and per-state concurrency limits"
+        ],
+        "verification": [
+          "Targeted daemon/orchestrator tests cover multi-child spawning and cleanup behavior",
+          "Existing retry and reconciliation tests still pass"
+        ],
+        "depends_on": [
+          "recover-runtime-concurrency"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "The donor patch no longer applies cleanly to the latest mainline in a way that preserves intended semantics.",
+        "Latest mainline changes require a different task split or different concurrency policy semantics.",
+        "Verification exposes regressions that cannot be fixed without reshaping the task graph."
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "Recovered WORKFLOW.md, docs/spec/system_workflow_contract.md, and src/workflow.rs on top of adf76d8 without reintroducing legacy project alias support.",
+      "Verification: cargo test workflow::tests:: -- --nocapture (9 passed).",
+      "Recovered src/state.rs and src/orchestrator.rs on top of adf76d8 with ConcurrencySnapshot gating for dispatch, retry blocking, run targeting, and recovered lease hydration.",
+      "Verification: cargo test state::tests:: -- --nocapture (11 passed).",
+      "Verification: cargo test candidate_selection_ -- --nocapture (7 passed, including multi-slot and per-state concurrency coverage).",
+      "Verification: cargo make fmt-check, cargo make lint, and cargo make test all passed on the surviving recovery lane.",
+      "Live dry-run was not rerun from the recovery lane because tmp/maestro.toml is not tracked in clone-backed workspaces; root local operator config remains intentionally untouched.",
+      "Review-prepare finding: daemon orchestration still tracked a single active_child slot, so configured concurrency above one was not yet realized in daemon mode.",
+      "Recovered daemon orchestration to track multiple active children and keep the parent dispatch guard while child processes inherit clones of the same project-level lock.",
+      "Verification: cargo test exited_retry_child_keeps_queued_claim_when_no_run_attempt_was_persisted -- --nocapture passed after the multi-child daemon refactor.",
+      "Verification: cargo make lint and cargo make test passed again after the daemon child-pool changes."
+    ],
+    "last_updated": "2026-03-18T17:55:15Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "donor_head": "7f7e679f7e19c03ffc4635740e39fc7e85f54172",
+      "donor_patch": "/tmp/xy-156-retained.patch",
+      "donor_plan": "/Users/xavier/code/trusted/y/hack-ink/maestro/.workspaces/XY-156/docs/plans/2026-03-18_maestro-xy-156-concurrency-limits.json",
+      "donor_workspace": "/Users/xavier/code/trusted/y/hack-ink/maestro/.workspaces/XY-156",
+      "recovery_reason": "The retained XY-156 lane plan is invalid under the current plan/1 contract and the donor lane is based on a stale pre-XY-165/XY-168 mainline.",
+      "surviving_base": "adf76d819cf80d6aa4be175227eb968e760b0de8",
+      "surviving_workspace": "/Users/xavier/code/trusted/y/hack-ink/maestro/.workspaces/XY-156-recovery"
+    }
+  }
+}

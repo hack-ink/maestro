@@ -29,7 +29,7 @@ use crate::{
 	prelude::eyre,
 	state::{self, ProjectRunStatus, RunActivityMarker, RunAttempt, StateStore, WorkspaceMapping},
 	tracker::{IssueTracker, TrackerIssue, TrackerProject, linear::LinearClient},
-	workflow::WorkflowDocument,
+	workflow::{WorkflowDocument, WorkflowExecution},
 	workspace::{WorkspaceManager, WorkspaceSpec},
 };
 
@@ -45,8 +45,11 @@ pub(crate) struct RunOnceRequest<'a> {
 	pub(crate) config_path: Option<&'a Path>,
 	pub(crate) dry_run: bool,
 	pub(crate) preferred_issue_id: Option<&'a str>,
+	pub(crate) preferred_issue_state: Option<&'a str>,
 	pub(crate) preferred_lease_acquired: bool,
+	pub(crate) preferred_issue_claim_fd: Option<i32>,
 	pub(crate) preferred_dispatch_slot_fd: Option<i32>,
+	pub(crate) preferred_dispatch_slot_index: Option<usize>,
 	pub(crate) preferred_dispatch_mode: Option<IssueDispatchMode>,
 	pub(crate) preferred_run_id: Option<&'a str>,
 	pub(crate) preferred_attempt_number: Option<i64>,
@@ -59,6 +62,7 @@ struct RunSummary {
 	project_id: String,
 	issue_id: String,
 	issue_identifier: String,
+	issue_state: String,
 	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
 	branch_name: String,
@@ -75,6 +79,7 @@ struct MaterializedDaemonSpawnState {
 #[derive(Clone, Debug)]
 struct IssueRunPlan {
 	issue: TrackerIssue,
+	issue_state: String,
 	workspace: WorkspaceSpec,
 	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
@@ -94,8 +99,11 @@ struct RunCycleRequest<'a> {
 	state_store: &'a StateStore,
 	dry_run: bool,
 	preferred_issue_id: Option<&'a str>,
+	preferred_issue_state: Option<&'a str>,
 	preferred_lease_acquired: bool,
+	preferred_issue_claim_fd: Option<i32>,
 	preferred_dispatch_slot_fd: Option<i32>,
+	preferred_dispatch_slot_index: Option<usize>,
 	preferred_dispatch_mode: Option<IssueDispatchMode>,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -105,12 +113,15 @@ struct RunCycleRequest<'a> {
 struct SpawnRunOnceChildRequest<'a> {
 	config_path: &'a Path,
 	preferred_issue_id: &'a str,
+	preferred_issue_state: &'a str,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_id: &'a str,
 	preferred_attempt_number: i64,
 	preferred_retry_budget_base: i64,
 	workflow: &'a WorkflowDocument,
+	issue_claim_handoff: Option<&'a File>,
 	dispatch_slot_handoff: Option<&'a File>,
+	dispatch_slot_index_handoff: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +245,16 @@ impl RetryQueue {
 			left.ready_at.cmp(&right.ready_at).then_with(|| left.issue_id.cmp(&right.issue_id))
 		})
 	}
+
+	fn ordered_entries(&self) -> Vec<RetryEntry> {
+		let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
+
+		entries.sort_by(|left, right| {
+			left.ready_at.cmp(&right.ready_at).then_with(|| left.issue_id.cmp(&right.issue_id))
+		});
+
+		entries
+	}
 }
 
 struct DaemonTickContext {
@@ -343,9 +364,12 @@ struct TargetIssueRunContext<'a, T> {
 	workflow: &'a WorkflowDocument,
 	state_store: &'a StateStore,
 	issue_id: &'a str,
+	preferred_issue_state: Option<&'a str>,
 	dry_run: bool,
 	lease_preacquired: bool,
+	preferred_issue_claim_fd: Option<i32>,
 	preferred_dispatch_slot_fd: Option<i32>,
+	preferred_dispatch_slot_index: Option<usize>,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
@@ -358,7 +382,7 @@ enum RetryKind {
 }
 
 enum RetryDispatchDecision {
-	Blocked,
+	Blocked { excluded_issue_ids: Vec<String> },
 	Dispatch(RunSummary),
 	Continue,
 }
@@ -368,6 +392,43 @@ enum ActiveRunDisposition {
 	Terminal,
 	NonActive,
 	Stalled { idle_for: Duration },
+}
+
+struct ConcurrencySnapshot {
+	total_active: usize,
+	counts_by_state: HashMap<String, usize>,
+}
+impl ConcurrencySnapshot {
+	fn new(project_id: &str, state_store: &StateStore) -> crate::prelude::Result<Self> {
+		let leases = state_store.list_active_shared_leases(project_id)?;
+		let mut counts_by_state = HashMap::new();
+
+		for lease in &leases {
+			*counts_by_state.entry(lease.issue_state().to_owned()).or_insert(0) += 1;
+		}
+
+		Ok(Self { total_active: leases.len(), counts_by_state })
+	}
+
+	fn has_global_capacity(&self, execution: &WorkflowExecution) -> bool {
+		self.total_active < execution.max_concurrent_agents() as usize
+	}
+
+	fn allows_state(&self, execution: &WorkflowExecution, state_name: &str) -> bool {
+		if !self.has_global_capacity(execution) {
+			return false;
+		}
+
+		if let Some(limit) = execution.state_concurrency_limit(state_name) {
+			let occupied = self.counts_by_state.get(state_name).copied().unwrap_or(0);
+
+			if occupied >= limit as usize {
+				return false;
+			}
+		}
+
+		true
+	}
 }
 
 pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()> {
@@ -396,8 +457,11 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		state_store: &state_store,
 		dry_run: request.dry_run,
 		preferred_issue_id: request.preferred_issue_id,
+		preferred_issue_state: request.preferred_issue_state,
 		preferred_lease_acquired: request.preferred_lease_acquired,
+		preferred_issue_claim_fd: request.preferred_issue_claim_fd,
 		preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
+		preferred_dispatch_slot_index: request.preferred_dispatch_slot_index,
 		preferred_dispatch_mode: request.preferred_dispatch_mode,
 		preferred_run_identity,
 		preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -444,7 +508,7 @@ pub(crate) fn run_daemon(
 		eyre::bail!("No maestro config found. Pass --config or create tmp/maestro.toml.");
 	};
 	let state_store = StateStore::open_in_memory()?;
-	let mut active_child: Option<DaemonRunChild> = None;
+	let mut active_children = Vec::new();
 	let mut retry_queue = RetryQueue::default();
 	let mut workflow_cache: Option<CachedWorkflowDocument> = None;
 
@@ -461,14 +525,18 @@ pub(crate) fn run_daemon(
 			run_daemon_tick(
 				&config_path,
 				&state_store,
-				&mut active_child,
+				&mut active_children,
 				&mut retry_queue,
 				context,
 			)
 		}) {
 			Ok(()) => {},
 			Err(error) => {
-				tracing::warn!(?error, "Daemon tick failed.");
+				let _ = error;
+
+				tracing::warn!(
+					"Daemon tick failed; sensitive runtime details were withheld from daemon logs."
+				);
 			},
 		}
 
@@ -568,12 +636,12 @@ fn load_daemon_tick_workflow(
 fn run_daemon_tick(
 	config_path: &Path,
 	state_store: &StateStore,
-	active_child: &mut Option<DaemonRunChild>,
+	active_children: &mut Vec<DaemonRunChild>,
 	retry_queue: &mut RetryQueue,
 	context: DaemonTickContext,
 ) -> crate::prelude::Result<()> {
-	inspect_or_clear_active_child(
-		active_child,
+	inspect_or_clear_active_children(
+		active_children,
 		retry_queue,
 		&context.tracker,
 		&context.config,
@@ -582,7 +650,7 @@ fn run_daemon_tick(
 		&context.workspace_manager,
 	)?;
 
-	if active_child.is_none() {
+	if active_children.is_empty() {
 		reconcile_project_state(
 			&context.tracker,
 			&context.config,
@@ -590,23 +658,31 @@ fn run_daemon_tick(
 			state_store,
 			&context.workspace_manager,
 		)?;
-		validate_project_contract(&context.config, &context.workflow)?;
-		spawn_next_daemon_child(
+	}
+
+	validate_project_contract(&context.config, &context.workflow)?;
+
+	while active_children.len()
+		< context.workflow.frontmatter().execution().max_concurrent_agents() as usize
+	{
+		if !spawn_next_daemon_child(
 			config_path,
 			state_store,
-			active_child,
+			active_children,
 			retry_queue,
 			&context.tracker,
 			&context.config,
 			&context.workflow,
-		)?;
+		)? {
+			break;
+		}
 	}
 
 	Ok(())
 }
 
-fn inspect_or_clear_active_child<T>(
-	active_child: &mut Option<DaemonRunChild>,
+fn inspect_or_clear_active_children<T>(
+	active_children: &mut Vec<DaemonRunChild>,
 	retry_queue: &mut RetryQueue,
 	tracker: &T,
 	project: &ServiceConfig,
@@ -617,84 +693,137 @@ fn inspect_or_clear_active_child<T>(
 where
 	T: IssueTracker,
 {
-	let Some(daemon_child) = active_child.as_mut() else {
-		return Ok(());
-	};
-	let child_exit_status = daemon_child.child.try_wait()?;
-	let child_exited = child_exit_status.is_some();
+	let mut index = 0;
 
-	if child_exited && child_exit_status.is_some_and(|status| !status.success()) {
-		state_store.update_run_status(&daemon_child.run_id, "failed")?;
-	}
+	while index < active_children.len() {
+		let child_exit_status = active_children[index].child.try_wait()?;
+		let child_exited = child_exit_status.is_some();
 
-	let actions = if child_exited {
-		inspect_exited_daemon_child_reconciliation(
-			tracker,
-			project,
-			workflow,
-			state_store,
-			&daemon_child.issue_id,
-			&daemon_child.run_id,
-		)?
-	} else {
-		inspect_active_run_reconciliation(
-			tracker,
-			project,
-			workflow,
-			state_store,
-			Some(ActiveWorkflowOverride {
-				child: ChildRunRef {
-					issue_id: &daemon_child.issue_id,
-					run_id: &daemon_child.run_id,
-					attempt_number: daemon_child.attempt_number,
-				},
-				workflow: &daemon_child.workflow,
-			}),
-		)?
-	};
-
-	if actions.is_empty() {
-		if child_exited {
-			clear_orphaned_daemon_child_state(
-				state_store,
-				ChildRunRef {
-					issue_id: &daemon_child.issue_id,
-					run_id: &daemon_child.run_id,
-					attempt_number: daemon_child.attempt_number,
-				},
-				false,
-			)?;
-
-			if let Some(exit_status) = child_exit_status {
-				schedule_retry_after_child_exit(
-					ChildExitRetryContext { retry_queue, tracker, project, workflow, state_store },
-					ChildRunRef {
-						issue_id: &daemon_child.issue_id,
-						run_id: &daemon_child.run_id,
-						attempt_number: daemon_child.attempt_number,
-					},
-					&daemon_child.retry_project_slug,
-					exit_status,
-				)?;
-			}
-
-			active_child.take();
+		if child_exited && child_exit_status.is_some_and(|status| !status.success()) {
+			state_store.update_run_status(&active_children[index].run_id, "failed")?;
 		}
 
-		return Ok(());
-	}
-	if daemon_child.from_retry_queue {
-		retry_queue.release(&daemon_child.issue_id);
-	}
-	if !child_exited {
-		stop_daemon_child(&mut daemon_child.child)?;
-	}
+		let child_ref = ChildRunRef {
+			issue_id: &active_children[index].issue_id,
+			run_id: &active_children[index].run_id,
+			attempt_number: active_children[index].attempt_number,
+		};
+		let actions = if child_exited {
+			inspect_exited_daemon_child_reconciliation(
+				tracker,
+				project,
+				workflow,
+				state_store,
+				child_ref.issue_id,
+				child_ref.run_id,
+			)?
+		} else {
+			inspect_active_daemon_child_reconciliation(
+				tracker,
+				project,
+				workflow,
+				state_store,
+				child_ref,
+				&active_children[index].workflow,
+			)?
+		};
 
-	apply_active_run_reconciliation(tracker, project, state_store, workspace_manager, actions)?;
+		if actions.is_empty() {
+			if child_exited {
+				let daemon_child = active_children.swap_remove(index);
+				let child_ref = ChildRunRef {
+					issue_id: &daemon_child.issue_id,
+					run_id: &daemon_child.run_id,
+					attempt_number: daemon_child.attempt_number,
+				};
 
-	active_child.take();
+				clear_orphaned_daemon_child_state(state_store, child_ref, false)?;
+
+				if let Some(exit_status) = child_exit_status {
+					schedule_retry_after_child_exit(
+						ChildExitRetryContext {
+							retry_queue,
+							tracker,
+							project,
+							workflow,
+							state_store,
+						},
+						child_ref,
+						&daemon_child.retry_project_slug,
+						exit_status,
+					)?;
+				}
+
+				continue;
+			}
+
+			index += 1;
+
+			continue;
+		}
+
+		let mut daemon_child = active_children.swap_remove(index);
+
+		if daemon_child.from_retry_queue {
+			retry_queue.release(&daemon_child.issue_id);
+		}
+		if !child_exited {
+			stop_daemon_child(&mut daemon_child.child)?;
+		}
+
+		apply_active_run_reconciliation(tracker, project, state_store, workspace_manager, actions)?;
+	}
 
 	Ok(())
+}
+
+fn inspect_active_daemon_child_reconciliation<T>(
+	tracker: &T,
+	_project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	child: ChildRunRef<'_>,
+	child_workflow: &WorkflowDocument,
+) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
+where
+	T: IssueTracker,
+{
+	let Some(issue) = refresh_issue(tracker, child.issue_id)? else {
+		return Ok(Vec::new());
+	};
+	let Some(run_attempt) = state_store.run_attempt(child.run_id)? else {
+		return Ok(Vec::new());
+	};
+	let workspace_mapping = state_store.workspace_for_issue(&issue.id)?;
+	let action_workflow = active_reconciliation_workflow_for_lease(
+		workflow,
+		Some(ActiveWorkflowOverride { child, workflow: child_workflow }),
+		&issue,
+		&run_attempt,
+	);
+	let disposition = if is_terminal_issue(&issue, action_workflow) {
+		Some(ActiveRunDisposition::Terminal)
+	} else if is_issue_nonactive_for_run(&issue, action_workflow) {
+		Some(ActiveRunDisposition::NonActive)
+	} else {
+		stalled_idle_duration(
+			state_store,
+			&run_attempt,
+			workspace_mapping.as_ref(),
+			OffsetDateTime::now_utc().unix_timestamp(),
+		)?
+		.map(|idle_for| ActiveRunDisposition::Stalled { idle_for })
+	};
+
+	Ok(disposition.map_or_else(Vec::new, |disposition| {
+		vec![ActiveRunReconciliation {
+			issue: issue.clone(),
+			run_attempt,
+			workspace_mapping,
+			disposition,
+			workflow: action_workflow.clone(),
+		}]
+	}))
 }
 fn clear_orphaned_daemon_child_state(
 	state_store: &StateStore,
@@ -739,32 +868,35 @@ fn resolve_child_exit_run_attempt(
 fn spawn_next_daemon_child<T>(
 	config_path: &Path,
 	state_store: &StateStore,
-	active_child: &mut Option<DaemonRunChild>,
+	active_children: &mut Vec<DaemonRunChild>,
 	retry_queue: &mut RetryQueue,
 	tracker: &T,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
-) -> crate::prelude::Result<()>
+) -> crate::prelude::Result<bool>
 where
 	T: IssueTracker,
 {
-	let next_run = match plan_due_retry_run(retry_queue, tracker, project, workflow, state_store) {
-		Ok(RetryDispatchDecision::Dispatch(summary)) => Some((summary, true)),
-		Ok(RetryDispatchDecision::Blocked) => None,
-		Ok(RetryDispatchDecision::Continue) =>
-			run_project_once(tracker, project, workflow, state_store, true)?
-				.map(|summary| (summary, false)),
-		Err(error) => return Err(error),
-	};
+	let next_run = plan_next_daemon_run(retry_queue, tracker, project, workflow, state_store)?;
 
 	match next_run {
 		Some((summary, from_retry_queue)) => {
-			state_store.configure_dispatch_slot_root(project.id(), project.workspace_root())?;
+			state_store.configure_dispatch_slot_policy(
+				project.id(),
+				project.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+			)?;
 
 			validate_review_handoff_runtime(false)?;
 
-			if !state_store.try_acquire_lease(project.id(), &summary.issue_id, &summary.run_id)? {
-				return Ok(());
+			if !state_store.try_acquire_lease(
+				project.id(),
+				&summary.issue_id,
+				&summary.run_id,
+				&summary.issue_state,
+			)? {
+				return Ok(false);
 			}
 
 			let daemon_spawn_state = materialize_daemon_spawn_state(project, state_store, &summary)
@@ -785,24 +917,13 @@ where
 				&daemon_spawn_state.workspace.path.display().to_string(),
 			)?;
 
-			#[cfg(unix)]
-			let dispatch_slot_handoff = Some(state_store.clone_dispatch_slot_for_child(project.id())?);
-			#[cfg(not(unix))]
-			let dispatch_slot_handoff: Option<File> = None;
-			let mut child = spawn_run_once_child(SpawnRunOnceChildRequest {
+			let mut child = spawn_planned_daemon_child(
 				config_path,
-				preferred_issue_id: summary.issue_id.as_str(),
-				dispatch_mode: summary.dispatch_mode,
-				preferred_run_id: summary.run_id.as_str(),
-				preferred_attempt_number: summary.attempt_number,
-				preferred_retry_budget_base: daemon_spawn_state.retry_budget_base,
+				state_store,
 				workflow,
-				dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
-			})
-			.inspect_err(|_error| {
-				let _ = state_store.update_run_status(&summary.run_id, "failed");
-				let _ = state_store.clear_lease(&summary.issue_id);
-			})?;
+				&summary,
+				daemon_spawn_state.retry_budget_base,
+			)?;
 
 			if let Err(error) = state::write_run_activity_marker_for_process(
 				&daemon_spawn_state.workspace.path,
@@ -819,8 +940,6 @@ where
 			}
 
 			state_store.update_run_status(&summary.run_id, "running")?;
-			#[cfg(unix)]
-			state_store.release_dispatch_slot(project.id())?;
 
 			tracing::info!(
 				issue = summary.issue_identifier,
@@ -829,7 +948,7 @@ where
 				"Spawned daemon child for active issue lane."
 			);
 
-			*active_child = Some(DaemonRunChild {
+			active_children.push(DaemonRunChild {
 				child,
 				issue_id: summary.issue_id,
 				run_id: summary.run_id,
@@ -838,16 +957,108 @@ where
 				from_retry_queue,
 				workflow: workflow.clone(),
 			});
+
+			Ok(true)
 		},
-		None =>
+		None => {
 			if retry_queue.is_empty() {
 				tracing::debug!("Daemon tick found no eligible issue.");
 			} else {
 				tracing::debug!("Daemon tick is holding a queued retry claim.");
-			},
-	}
+			}
 
-	Ok(())
+			Ok(false)
+		},
+	}
+}
+
+fn spawn_planned_daemon_child(
+	config_path: &Path,
+	state_store: &StateStore,
+	workflow: &WorkflowDocument,
+	summary: &RunSummary,
+	retry_budget_base: i64,
+) -> crate::prelude::Result<Child> {
+	#[cfg(unix)]
+	let issue_claim_handoff =
+		Some(state_store.clone_issue_claim_for_child(&summary.issue_id).inspect_err(|_error| {
+			let _ = state_store.update_run_status(&summary.run_id, "failed");
+			let _ = state_store.clear_lease(&summary.issue_id);
+		})?);
+	#[cfg(not(unix))]
+	let issue_claim_handoff: Option<File> = None;
+	#[cfg(unix)]
+	let (dispatch_slot_handoff_file, dispatch_slot_index) =
+		state_store.clone_dispatch_slot_for_child(&summary.issue_id)?;
+	#[cfg(unix)]
+	let dispatch_slot_handoff = Some(dispatch_slot_handoff_file);
+	#[cfg(not(unix))]
+	let dispatch_slot_handoff: Option<File> = None;
+	#[cfg(unix)]
+	let dispatch_slot_index_handoff = Some(dispatch_slot_index);
+	#[cfg(not(unix))]
+	let dispatch_slot_index_handoff: Option<usize> = None;
+
+	spawn_run_once_child(SpawnRunOnceChildRequest {
+		config_path,
+		preferred_issue_id: summary.issue_id.as_str(),
+		preferred_issue_state: summary.issue_state.as_str(),
+		dispatch_mode: summary.dispatch_mode,
+		preferred_run_id: summary.run_id.as_str(),
+		preferred_attempt_number: summary.attempt_number,
+		preferred_retry_budget_base: retry_budget_base,
+		workflow,
+		issue_claim_handoff: issue_claim_handoff.as_ref(),
+		dispatch_slot_handoff: dispatch_slot_handoff.as_ref(),
+		dispatch_slot_index_handoff,
+	})
+	.inspect_err(|_error| {
+		let _ = state_store.update_run_status(&summary.run_id, "failed");
+		let _ = state_store.clear_lease(&summary.issue_id);
+	})
+}
+
+fn plan_next_daemon_run<T>(
+	retry_queue: &mut RetryQueue,
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+) -> crate::prelude::Result<Option<(RunSummary, bool)>>
+where
+	T: IssueTracker,
+{
+	match plan_due_retry_run(retry_queue, tracker, project, workflow, state_store)? {
+		RetryDispatchDecision::Dispatch(summary) => Ok(Some((summary, true))),
+		RetryDispatchDecision::Blocked { excluded_issue_ids } => {
+			let excluded_issue_ids =
+				excluded_issue_ids.iter().map(String::as_str).collect::<Vec<_>>();
+			let issue_run = plan_project_issue_run_with_exclusions(
+				tracker,
+				project,
+				workflow,
+				state_store,
+				true,
+				&excluded_issue_ids,
+			)?;
+
+			Ok(issue_run
+				.map(|issue_run| (run_summary_from_issue_run(project.id(), &issue_run), false)))
+		},
+		RetryDispatchDecision::Continue => {
+			let issue_run = plan_project_issue_run_with_exclusions(
+				tracker,
+				project,
+				workflow,
+				state_store,
+				true,
+				&[],
+			)?;
+
+			Ok(issue_run
+				.map(|issue_run| (run_summary_from_issue_run(project.id(), &issue_run), false)))
+		},
+	}
 }
 
 fn materialize_daemon_spawn_state(
@@ -893,7 +1104,8 @@ fn materialize_run_summary_workspace(
 fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude::Result<Child> {
 	let executable = env::current_exe()?;
 	let workflow_snapshot = request.workflow.to_markdown()?;
-	let lease_preacquired = request.dispatch_slot_handoff.is_some();
+	let lease_preacquired =
+		request.issue_claim_handoff.is_some() || request.dispatch_slot_handoff.is_some();
 	let mut command = Command::new(executable);
 
 	command
@@ -903,6 +1115,7 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit())
 		.args(["--issue-id", request.preferred_issue_id])
+		.args(["--issue-state", request.preferred_issue_state])
 		.args([
 			"--dispatch-mode",
 			match request.dispatch_mode {
@@ -920,8 +1133,15 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 	}
 
 	#[cfg(unix)]
+	if let Some(issue_claim_handoff) = request.issue_claim_handoff {
+		command.args(["--issue-claim-fd", &issue_claim_handoff.as_raw_fd().to_string()]);
+	}
+	#[cfg(unix)]
 	if let Some(dispatch_slot_handoff) = request.dispatch_slot_handoff {
 		command.args(["--dispatch-slot-fd", &dispatch_slot_handoff.as_raw_fd().to_string()]);
+	}
+	if let Some(dispatch_slot_index_handoff) = request.dispatch_slot_index_handoff {
+		command.args(["--dispatch-slot-index", &dispatch_slot_index_handoff.to_string()]);
 	}
 
 	let child = command.spawn()?;
@@ -939,63 +1159,93 @@ fn plan_due_retry_run<T>(
 where
 	T: IssueTracker,
 {
-	let Some(entry) = retry_queue.next_entry().cloned() else {
-		return Ok(RetryDispatchDecision::Continue);
-	};
+	let now = Instant::now();
 
-	if Instant::now() < entry.ready_at {
-		let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
-			retry_queue.release(&entry.issue_id);
-
+	loop {
+		let Some(first_entry) = retry_queue.next_entry().cloned() else {
 			return Ok(RetryDispatchDecision::Continue);
+		};
+
+		if now >= first_entry.ready_at {
+			break;
+		}
+
+		let Some(issue) = refresh_issue(tracker, &first_entry.issue_id)? else {
+			retry_queue.release(&first_entry.issue_id);
+
+			continue;
 		};
 
 		if !issue_passes_retry_retention_policy(
 			&issue,
-			&entry.retry_project_slug,
+			&first_entry.retry_project_slug,
 			project,
 			workflow,
 			state_store,
 		)? {
-			retry_queue.release(&entry.issue_id);
+			retry_queue.release(&first_entry.issue_id);
 
-			return Ok(RetryDispatchDecision::Continue);
+			continue;
 		}
 
 		tracing::debug!(
-			issue_id = entry.issue_id,
-			retry_kind = ?entry.kind,
-			retry_attempt = entry.attempt,
+			issue_id = first_entry.issue_id,
+			retry_kind = ?first_entry.kind,
+			retry_attempt = first_entry.attempt,
 			"Retry queue is holding the project claim until the next retry is due."
 		);
 
-		return Ok(RetryDispatchDecision::Blocked);
+		return Ok(RetryDispatchDecision::Blocked {
+			excluded_issue_ids: queued_retry_issue_ids(retry_queue),
+		});
 	}
 
-	let Some(summary) = run_target_issue_once(TargetIssueRunContext {
-		tracker,
-		project,
-		workflow,
-		state_store,
-		issue_id: &entry.issue_id,
-		dry_run: true,
-		lease_preacquired: false,
-		preferred_dispatch_slot_fd: None,
-		dispatch_mode: IssueDispatchMode::Retry,
-		preferred_run_identity: None,
-		preferred_retry_budget_base: None,
-	})?
-	else {
-		if retry_entry_is_temporarily_blocked(tracker, project, workflow, state_store, &entry)? {
-			return Ok(RetryDispatchDecision::Blocked);
+	let mut blocked_issue_id = None;
+
+	for entry in retry_queue.ordered_entries() {
+		if now < entry.ready_at {
+			break;
 		}
 
-		retry_queue.release(&entry.issue_id);
+		let Some(summary) = run_target_issue_once(TargetIssueRunContext {
+			tracker,
+			project,
+			workflow,
+			state_store,
+			issue_id: &entry.issue_id,
+			preferred_issue_state: None,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
+			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
+			dispatch_mode: IssueDispatchMode::Retry,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})?
+		else {
+			if retry_entry_is_temporarily_blocked(tracker, project, workflow, state_store, &entry)?
+			{
+				blocked_issue_id.get_or_insert_with(|| entry.issue_id.clone());
 
-		return Ok(RetryDispatchDecision::Continue);
-	};
+				continue;
+			}
 
-	Ok(RetryDispatchDecision::Dispatch(summary))
+			retry_queue.release(&entry.issue_id);
+
+			continue;
+		};
+
+		return Ok(RetryDispatchDecision::Dispatch(summary));
+	}
+
+	Ok(blocked_issue_id.map_or(RetryDispatchDecision::Continue, |_issue_id| {
+		RetryDispatchDecision::Blocked { excluded_issue_ids: queued_retry_issue_ids(retry_queue) }
+	}))
+}
+
+fn queued_retry_issue_ids(retry_queue: &RetryQueue) -> Vec<String> {
+	retry_queue.ordered_entries().into_iter().map(|entry| entry.issue_id).collect()
 }
 
 fn retry_entry_is_temporarily_blocked<T>(
@@ -1008,21 +1258,27 @@ fn retry_entry_is_temporarily_blocked<T>(
 where
 	T: IssueTracker,
 {
-	if has_available_dispatch_slot(project.id(), state_store)? {
-		return Ok(false);
-	}
-
 	let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
 		return Ok(false);
 	};
-
-	issue_passes_retry_retention_policy(
+	let retained = issue_passes_retry_retention_policy(
 		&issue,
 		&entry.retry_project_slug,
 		project,
 		workflow,
 		state_store,
-	)
+	)?;
+
+	if !retained {
+		return Ok(false);
+	}
+	if state_store.issue_has_active_shared_claim(project.id(), &entry.issue_id)? {
+		return Ok(true);
+	}
+
+	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
+
+	Ok(!concurrency.allows_state(workflow.frontmatter().execution(), &issue.state.name))
 }
 
 fn schedule_retry_after_child_exit<T>(
@@ -1129,26 +1385,7 @@ fn stop_daemon_child(child: &mut Child) -> crate::prelude::Result<()> {
 	Ok(())
 }
 
-fn inspect_active_run_reconciliation<T>(
-	tracker: &T,
-	project: &ServiceConfig,
-	workflow: &WorkflowDocument,
-	state_store: &StateStore,
-	active_workflow_override: Option<ActiveWorkflowOverride<'_>>,
-) -> crate::prelude::Result<Vec<ActiveRunReconciliation>>
-where
-	T: IssueTracker,
-{
-	inspect_active_run_reconciliation_at(
-		tracker,
-		project,
-		workflow,
-		state_store,
-		active_workflow_override,
-		OffsetDateTime::now_utc().unix_timestamp(),
-	)
-}
-
+#[cfg(test)]
 fn inspect_active_run_reconciliation_at<T>(
 	tracker: &T,
 	project: &ServiceConfig,
@@ -1305,7 +1542,7 @@ where
 	T: IssueTracker,
 {
 	for action in actions {
-		match action.disposition {
+		match &action.disposition {
 			ActiveRunDisposition::Terminal => {
 				tracing::info!(
 					project_id = project.id(),
@@ -1325,101 +1562,129 @@ where
 				}
 			},
 			ActiveRunDisposition::NonActive => {
-				tracing::info!(
-					project_id = project.id(),
-					issue_id = action.issue.id,
-					issue = action.issue.identifier,
-					run_id = action.run_attempt.run_id(),
-					disposition = "non_active",
-					"Reconciling non-active run."
-				);
-
-				mark_run_attempt_if_active(
-					state_store,
-					action.run_attempt.run_id(),
-					"interrupted",
-				)?;
-
-				let workspace_path = action.workspace_mapping.as_ref().map_or_else(
-					|| workspace_manager.plan_for_issue(&action.issue.identifier).path,
-					|mapping| mapping.workspace_path().to_path_buf(),
-				);
-
-				if workspace_path.exists() {
-					write_retry_budget_marker(
-						&workspace_path,
-						action.run_attempt.run_id(),
-						action.run_attempt.attempt_number(),
-						retry_budget_base_for_issue_workspace(
-							state_store,
-							&action.issue.id,
-							&workspace_path,
-						)?,
-					)?;
-				}
-
-				state_store.clear_lease(&action.issue.id)?;
+				reconcile_nonactive_active_run(project, state_store, workspace_manager, &action)?;
 			},
 			ActiveRunDisposition::Stalled { idle_for } => {
-				tracing::warn!(
-					project_id = project.id(),
-					issue_id = action.issue.id,
-					issue = action.issue.identifier,
-					run_id = action.run_attempt.run_id(),
-					disposition = "stalled",
-					idle_for_s = idle_for.as_secs(),
-					"Reconciling stalled run."
-				);
-
-				state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
-				state_store.clear_lease(&action.issue.id)?;
-
-				let workspace = action.workspace_mapping.as_ref().map_or_else(
-					|| workspace_manager.plan_for_issue(&action.issue.identifier),
-					|mapping| WorkspaceSpec {
-						branch_name: mapping.branch_name().to_owned(),
-						issue_identifier: action.issue.identifier.clone(),
-						path: mapping.workspace_path().to_path_buf(),
-						reused_existing: true,
-					},
-				);
-				let retry_budget_base = retry_budget_base_for_issue_workspace(
-					state_store,
-					&action.issue.id,
-					&workspace.path,
-				)?;
-				let issue_run = IssueRunPlan {
-					issue: action.issue.clone(),
-					workspace,
-					// Stalled reconciliation can refresh an issue by ID after it has already been
-					// removed from its Linear project. This path always converges via terminal
-					// failure writeback, so keep a stable fallback instead of panicking.
-					retry_project_slug: action
-						.issue
-						.project_slug
-						.clone()
-						.unwrap_or_else(|| project.tracker().project_slug().to_owned()),
-					dispatch_mode: IssueDispatchMode::Retry,
-					attempt_number: action.run_attempt.attempt_number(),
-					run_id: action.run_attempt.run_id().to_owned(),
-					retry_budget_base,
-				};
-
-				handle_failure(
+				reconcile_stalled_active_run(
 					tracker,
 					project,
-					&action.workflow,
 					state_store,
-					&issue_run,
-					&Report::new(StalledRunNeedsAttention {
-						issue_identifier: action.issue.identifier.clone(),
-						run_id: action.run_attempt.run_id().to_owned(),
-						idle_for,
-					}),
+					workspace_manager,
+					&action,
+					*idle_for,
 				)?;
 			},
 		}
 	}
+
+	Ok(())
+}
+
+fn reconcile_nonactive_active_run(
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	workspace_manager: &WorkspaceManager,
+	action: &ActiveRunReconciliation,
+) -> crate::prelude::Result<()> {
+	tracing::info!(
+		project_id = project.id(),
+		issue_id = action.issue.id,
+		issue = action.issue.identifier,
+		run_id = action.run_attempt.run_id(),
+		disposition = "non_active",
+		"Reconciling non-active run."
+	);
+
+	mark_run_attempt_if_active(state_store, action.run_attempt.run_id(), "interrupted")?;
+
+	let workspace_path = action.workspace_mapping.as_ref().map_or_else(
+		|| workspace_manager.plan_for_issue(&action.issue.identifier).path,
+		|mapping| mapping.workspace_path().to_path_buf(),
+	);
+
+	if workspace_path.exists() {
+		write_retry_budget_marker(
+			&workspace_path,
+			action.run_attempt.run_id(),
+			action.run_attempt.attempt_number(),
+			retry_budget_base_for_issue_workspace(state_store, &action.issue.id, &workspace_path)?,
+		)?;
+	}
+
+	state_store.clear_lease(&action.issue.id)?;
+
+	Ok(())
+}
+
+fn reconcile_stalled_active_run<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	workspace_manager: &WorkspaceManager,
+	action: &ActiveRunReconciliation,
+	idle_for: Duration,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	tracing::warn!(
+		project_id = project.id(),
+		issue_id = action.issue.id,
+		issue = action.issue.identifier,
+		run_id = action.run_attempt.run_id(),
+		disposition = "stalled",
+		idle_for_s = idle_for.as_secs(),
+		"Reconciling stalled run."
+	);
+
+	state_store.update_run_status(action.run_attempt.run_id(), "stalled")?;
+	state_store.clear_lease(&action.issue.id)?;
+
+	let workspace = action.workspace_mapping.as_ref().map_or_else(
+		|| workspace_manager.plan_for_issue(&action.issue.identifier),
+		|mapping| WorkspaceSpec {
+			branch_name: mapping.branch_name().to_owned(),
+			issue_identifier: action.issue.identifier.clone(),
+			path: mapping.workspace_path().to_path_buf(),
+			reused_existing: true,
+		},
+	);
+	let retry_budget_base =
+		retry_budget_base_for_issue_workspace(state_store, &action.issue.id, &workspace.path)?;
+	let issue_run = IssueRunPlan {
+		issue: action.issue.clone(),
+		issue_state: planned_issue_state_for_dispatch(
+			&action.workflow,
+			&action.issue,
+			IssueDispatchMode::Retry,
+		),
+		workspace,
+		// Stalled reconciliation can refresh an issue by ID after it has already been
+		// removed from its Linear project. This path always converges via terminal
+		// failure writeback, so keep a stable fallback instead of panicking.
+		retry_project_slug: action
+			.issue
+			.project_slug
+			.clone()
+			.unwrap_or_else(|| project.tracker().project_slug().to_owned()),
+		dispatch_mode: IssueDispatchMode::Retry,
+		attempt_number: action.run_attempt.attempt_number(),
+		run_id: action.run_attempt.run_id().to_owned(),
+		retry_budget_base,
+	};
+
+	handle_failure(
+		tracker,
+		project,
+		&action.workflow,
+		state_store,
+		&issue_run,
+		&Report::new(StalledRunNeedsAttention {
+			issue_identifier: action.issue.identifier.clone(),
+			run_id: action.run_attempt.run_id().to_owned(),
+			idle_for,
+		}),
+	)?;
 
 	Ok(())
 }
@@ -1539,9 +1804,12 @@ fn run_configured_cycle(
 			workflow: &workflow,
 			state_store: request.state_store,
 			issue_id,
+			preferred_issue_state: request.preferred_issue_state,
 			dry_run: request.dry_run,
 			lease_preacquired: request.preferred_lease_acquired,
+			preferred_issue_claim_fd: request.preferred_issue_claim_fd,
 			preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
+			preferred_dispatch_slot_index: request.preferred_dispatch_slot_index,
 			dispatch_mode: request.preferred_dispatch_mode.unwrap_or(IssueDispatchMode::Retry),
 			preferred_run_identity: request.preferred_run_identity,
 			preferred_retry_budget_base: request.preferred_retry_budget_base,
@@ -1573,10 +1841,55 @@ fn run_project_once<T>(
 where
 	T: IssueTracker,
 {
+	run_project_once_with_exclusions(tracker, project, workflow, state_store, dry_run, &[])
+}
+
+fn run_project_once_with_exclusions<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	dry_run: bool,
+	excluded_issue_ids: &[&str],
+) -> crate::prelude::Result<Option<RunSummary>>
+where
+	T: IssueTracker,
+{
+	let Some(issue_run) = plan_project_issue_run_with_exclusions(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		dry_run,
+		excluded_issue_ids,
+	)?
+	else {
+		return Ok(None);
+	};
+
+	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+}
+
+fn plan_project_issue_run_with_exclusions<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	dry_run: bool,
+	excluded_issue_ids: &[&str],
+) -> crate::prelude::Result<Option<IssueRunPlan>>
+where
+	T: IssueTracker,
+{
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 
-	state_store.configure_dispatch_slot_root(project.id(), project.workspace_root())?;
+	state_store.configure_dispatch_slot_policy(
+		project.id(),
+		project.workspace_root(),
+		workflow.frontmatter().execution().max_concurrent_agents(),
+		workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+	)?;
 
 	let recovered_state =
 		recover_runtime_state_from_tracker_and_workspaces(tracker, project, workflow, state_store)?;
@@ -1589,13 +1902,29 @@ where
 	validate_review_handoff_runtime(dry_run)?;
 
 	let issues = tracker.list_project_issues(project.tracker().project_slug())?;
-	let selected_issue = recovered_state
-		.active_issues
-		.into_iter()
-		.next()
-		.map(|issue| (issue, IssueDispatchMode::Retry))
-		.or(select_issue_candidate(issues, workflow, state_store, project.id())?
-			.map(|issue| (issue, IssueDispatchMode::Normal)));
+	let mut selected_retry_issue = None;
+
+	for issue in recovered_state.active_issues {
+		if excluded_issue_ids.contains(&issue.id.as_str()) {
+			continue;
+		}
+		if state_store.issue_has_active_shared_claim(project.id(), &issue.id)? {
+			continue;
+		}
+
+		selected_retry_issue = Some((issue, IssueDispatchMode::Retry));
+
+		break;
+	}
+
+	let selected_issue = selected_retry_issue.or(select_issue_candidate_with_exclusions(
+		issues,
+		workflow,
+		state_store,
+		project.id(),
+		excluded_issue_ids,
+	)?
+	.map(|issue| (issue, IssueDispatchMode::Normal)));
 	let Some((issue, dispatch_mode)) = selected_issue else {
 		let _ = resolve_tracker_project(tracker, project.tracker().project_slug())?;
 
@@ -1605,8 +1934,10 @@ where
 	let Some(issue) = refreshed_issues.pop() else {
 		return Ok(None);
 	};
+	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
+	let issue_state = planned_issue_state_for_dispatch(workflow, &issue, dispatch_mode);
 
-	if !has_available_dispatch_slot(project.id(), state_store)? {
+	if !concurrency.allows_state(workflow.frontmatter().execution(), &issue_state) {
 		return Ok(None);
 	}
 
@@ -1635,7 +1966,7 @@ where
 		return Ok(None);
 	};
 
-	complete_issue_run(tracker, project, workflow, state_store, issue_run, dry_run)
+	Ok(Some(issue_run))
 }
 
 fn run_target_issue_once<T>(
@@ -1650,32 +1981,15 @@ where
 		context.project.workspace_root(),
 	);
 
-	context
-		.state_store
-		.configure_dispatch_slot_root(context.project.id(), context.project.workspace_root())?;
+	context.state_store.configure_dispatch_slot_policy(
+		context.project.id(),
+		context.project.workspace_root(),
+		context.workflow.frontmatter().execution().max_concurrent_agents(),
+		context.workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+	)?;
 
 	if context.lease_preacquired && !context.dry_run {
-		let preferred_run_identity = context.preferred_run_identity.ok_or_else(|| {
-			eyre::eyre!("daemon child lease handoff requires a planned run identifier")
-		})?;
-		let dispatch_slot_fd = context.preferred_dispatch_slot_fd.ok_or_else(|| {
-			eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot fd")
-		})?;
-
-		#[cfg(unix)]
-		{
-			context.state_store.adopt_preacquired_lease(
-				context.project.id(),
-				context.issue_id,
-				preferred_run_identity.run_id,
-				dispatch_slot_fd,
-			)?;
-		}
-
-		#[cfg(not(unix))]
-		{
-			eyre::bail!("daemon child lease handoff is only supported on unix targets");
-		}
+		adopt_preacquired_target_issue_lease(&context)?;
 	}
 	if !context.lease_preacquired {
 		recover_runtime_state_from_tracker_and_workspaces(
@@ -1698,12 +2012,6 @@ where
 
 	validate_project_contract(context.project, context.workflow)?;
 
-	if !context.lease_preacquired
-		&& !has_available_dispatch_slot(context.project.id(), context.state_store)?
-	{
-		return Ok(None);
-	}
-
 	let tracker_project =
 		resolve_tracker_project(context.tracker, context.project.tracker().project_slug())?;
 
@@ -1712,6 +2020,8 @@ where
 	let Some(issue) = refresh_issue(context.tracker, context.issue_id)? else {
 		return Ok(None);
 	};
+	let issue_state =
+		planned_issue_state_for_dispatch(context.workflow, &issue, context.dispatch_mode);
 
 	if !context.dispatch_mode.allows_issue(
 		&issue,
@@ -1721,6 +2031,20 @@ where
 		context.state_store,
 	)? {
 		return Ok(None);
+	}
+	if !context.lease_preacquired
+		&& context
+			.state_store
+			.issue_has_active_shared_claim(context.project.id(), context.issue_id)?
+	{
+		return Ok(None);
+	}
+	if !context.lease_preacquired {
+		let concurrency = ConcurrencySnapshot::new(context.project.id(), context.state_store)?;
+
+		if !concurrency.allows_state(context.workflow.frontmatter().execution(), &issue_state) {
+			return Ok(None);
+		}
 	}
 
 	let Some(issue_run) = prepare_issue_run(
@@ -1750,6 +2074,47 @@ where
 		issue_run,
 		context.dry_run,
 	)
+}
+
+fn adopt_preacquired_target_issue_lease<T>(
+	context: &TargetIssueRunContext<'_, T>,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	let preferred_run_identity = context.preferred_run_identity.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires a planned run identifier")
+	})?;
+	let preferred_issue_state = context
+		.preferred_issue_state
+		.ok_or_else(|| eyre::eyre!("daemon child lease handoff requires a planned issue state"))?;
+	let issue_claim_fd = context.preferred_issue_claim_fd.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires an inherited issue-claim fd")
+	})?;
+	let dispatch_slot_fd = context.preferred_dispatch_slot_fd.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot fd")
+	})?;
+	let dispatch_slot_index = context.preferred_dispatch_slot_index.ok_or_else(|| {
+		eyre::eyre!("daemon child lease handoff requires an inherited dispatch-slot index")
+	})?;
+
+	#[cfg(unix)]
+	{
+		context.state_store.adopt_preacquired_lease(
+			context.project.id(),
+			context.issue_id,
+			preferred_run_identity.run_id,
+			preferred_issue_state,
+			state::PreacquiredLeaseGuards { issue_claim_fd, dispatch_slot_fd, dispatch_slot_index },
+		)?;
+	}
+
+	#[cfg(not(unix))]
+	{
+		eyre::bail!("daemon child lease handoff is only supported on unix targets");
+	}
+
+	Ok(())
 }
 
 fn prepare_issue_run<T>(
@@ -1789,11 +2154,17 @@ where
 		)?,
 	);
 	let lease_issue_id = issue.id.clone();
+	let issue_state =
+		planned_issue_state_for_dispatch(context.workflow, &issue, context.dispatch_mode);
 
 	if !context.dry_run
 		&& !context.lease_preacquired
-		&& !context.state_store.try_acquire_lease(context.project.id(), &issue.id, &run_id)?
-	{
+		&& !context.state_store.try_acquire_lease(
+			context.project.id(),
+			&issue.id,
+			&run_id,
+			&issue_state,
+		)? {
 		return Ok(None);
 	}
 	if !context.dry_run {
@@ -1844,6 +2215,7 @@ where
 
 		Ok(Some(IssueRunPlan {
 			issue: refreshed_issue,
+			issue_state: issue_state.clone(),
 			workspace,
 			retry_project_slug: tracker_project.slug.clone(),
 			dispatch_mode: context.dispatch_mode,
@@ -1882,17 +2254,7 @@ where
 	T: IssueTracker,
 {
 	if dry_run {
-		return Ok(Some(RunSummary {
-			project_id: project.id().to_owned(),
-			issue_id: issue_run.issue.id.clone(),
-			issue_identifier: issue_run.issue.identifier.clone(),
-			retry_project_slug: issue_run.retry_project_slug.clone(),
-			dispatch_mode: issue_run.dispatch_mode,
-			branch_name: issue_run.workspace.branch_name.clone(),
-			workspace_path: issue_run.workspace.path.clone(),
-			attempt_number: issue_run.attempt_number,
-			run_id: issue_run.run_id.clone(),
-		}));
+		return Ok(Some(run_summary_from_issue_run(project.id(), &issue_run)));
 	}
 
 	let summary = execute_issue_run(tracker, project, workflow, state_store, issue_run)?;
@@ -2171,6 +2533,7 @@ where
 		project_id: project.id().to_owned(),
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
+		issue_state: issue_run.issue_state.clone(),
 		retry_project_slug: issue_run.retry_project_slug.clone(),
 		dispatch_mode: issue_run.dispatch_mode,
 		branch_name: issue_run.workspace.branch_name.clone(),
@@ -2178,6 +2541,33 @@ where
 		attempt_number: issue_run.attempt_number,
 		run_id: issue_run.run_id.clone(),
 	})
+}
+
+fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> RunSummary {
+	RunSummary {
+		project_id: project_id.to_owned(),
+		issue_id: issue_run.issue.id.clone(),
+		issue_identifier: issue_run.issue.identifier.clone(),
+		issue_state: issue_run.issue_state.clone(),
+		retry_project_slug: issue_run.retry_project_slug.clone(),
+		dispatch_mode: issue_run.dispatch_mode,
+		branch_name: issue_run.workspace.branch_name.clone(),
+		workspace_path: issue_run.workspace.path.clone(),
+		attempt_number: issue_run.attempt_number,
+		run_id: issue_run.run_id.clone(),
+	}
+}
+
+fn planned_issue_state_for_dispatch(
+	workflow: &WorkflowDocument,
+	issue: &TrackerIssue,
+	dispatch_mode: IssueDispatchMode,
+) -> String {
+	match dispatch_mode {
+		IssueDispatchMode::Normal =>
+			workflow.frontmatter().tracker().in_progress_state().to_owned(),
+		IssueDispatchMode::Retry => issue.state.name.clone(),
+	}
 }
 
 fn preserve_manual_attention_request(
@@ -2246,7 +2636,6 @@ where
 				max_attempts,
 				workspace_path,
 				&issue_run.workspace.branch_name,
-				error,
 			),
 		)?;
 
@@ -2349,7 +2738,8 @@ where
 		guard_with_nonstartable_state,
 		tracker_policy.in_progress_state(),
 	);
-	let error_class = terminal_failure_error_class(manual_attention_requested, error);
+	let (error_class, next_action) =
+		terminal_failure_comment_details(manual_attention_requested, error, &recovery_gate);
 
 	tracker.create_comment(
 		&issue_run.issue.id,
@@ -2358,9 +2748,8 @@ where
 			issue_run.attempt_number,
 			workspace_path.to_owned(),
 			&issue_run.workspace.branch_name,
-			&recovery_gate,
-			manual_attention_requested,
-			error,
+			error_class,
+			&next_action,
 		),
 	)?;
 
@@ -2400,18 +2789,6 @@ where
 	);
 
 	Ok(false)
-}
-
-fn terminal_failure_error_class(manual_attention_requested: bool, error: &Report) -> &'static str {
-	if manual_attention_requested {
-		"human_attention_required"
-	} else if error.downcast_ref::<ReviewHandoffNeedsAttention>().is_some() {
-		"review_handoff_writeback_failed"
-	} else if error.downcast_ref::<StalledRunNeedsAttention>().is_some() {
-		"stalled_run_detected"
-	} else {
-		"retry_budget_exhausted"
-	}
 }
 
 fn validate_project_contract(
@@ -2569,13 +2946,6 @@ fn is_issue_eligible(
 	}
 
 	Ok(state_store.lease_for_issue(&issue.id)?.is_none())
-}
-
-fn has_available_dispatch_slot(
-	project_id: &str,
-	state_store: &StateStore,
-) -> crate::prelude::Result<bool> {
-	Ok(state_store.list_leases(project_id)?.is_empty())
 }
 
 fn todo_blocker_rule_passes(issue: &TrackerIssue, workflow: &WorkflowDocument) -> bool {
@@ -2845,7 +3215,12 @@ where
 						marker.attempt_number(),
 						"running",
 					)?;
-					state_store.upsert_lease(project.id(), &issue.id, marker.run_id())?;
+					state_store.upsert_lease(
+						project.id(),
+						&issue.id,
+						marker.run_id(),
+						&issue.state.name,
+					)?;
 
 					continue;
 				},
@@ -3006,19 +3381,44 @@ fn append_rendered_run(output: &mut String, run: &OperatorRunStatus) {
 	));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn select_issue_candidate(
 	issues: Vec<TrackerIssue>,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	project_id: &str,
 ) -> crate::prelude::Result<Option<TrackerIssue>> {
-	if !has_available_dispatch_slot(project_id, state_store)? {
+	select_issue_candidate_with_exclusions(issues, workflow, state_store, project_id, &[])
+}
+
+fn select_issue_candidate_with_exclusions(
+	issues: Vec<TrackerIssue>,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	project_id: &str,
+	excluded_issue_ids: &[&str],
+) -> crate::prelude::Result<Option<TrackerIssue>> {
+	let concurrency = ConcurrencySnapshot::new(project_id, state_store)?;
+
+	if !concurrency.has_global_capacity(workflow.frontmatter().execution()) {
 		return Ok(None);
 	}
 
 	let mut eligible_issues = Vec::new();
 
 	for issue in issues {
+		if excluded_issue_ids.contains(&issue.id.as_str()) {
+			continue;
+		}
+		if state_store.issue_has_active_shared_claim(project_id, &issue.id)? {
+			continue;
+		}
+		if !concurrency.allows_state(
+			workflow.frontmatter().execution(),
+			workflow.frontmatter().tracker().in_progress_state(),
+		) {
+			continue;
+		}
 		if is_issue_eligible(&issue, workflow, state_store)? {
 			eligible_issues.push(issue);
 		}
@@ -3046,10 +3446,9 @@ fn format_retry_comment(
 	max_attempts: i64,
 	workspace_path: String,
 	branch_name: &str,
-	error: &Report,
 ) -> String {
 	format!(
-		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- retry_budget_attempt: `{retry_budget_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error: `{error}`",
+		"maestro run failed and will retry\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- retry_budget_attempt: `{retry_budget_attempt_number}` / `{max_attempts}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `retryable_execution_failure`\n- next_action: `maestro will retry automatically`\n- error_summary: `Sensitive runtime details were withheld from the tracker comment; inspect the local lane for the full failure context.`",
 		failed_at = current_timestamp(),
 		branch = branch_name,
 		workspace = workspace_path
@@ -3061,11 +3460,23 @@ fn format_terminal_failure_comment(
 	attempt_number: i64,
 	workspace_path: String,
 	branch_name: &str,
-	recovery_gate: &str,
+	error_class: &str,
+	next_action: &str,
+) -> String {
+	format!(
+		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error_summary: `Sensitive runtime details were withheld from the tracker comment; inspect the local lane for the full failure context.`",
+		failed_at = current_timestamp(),
+		branch = branch_name,
+		workspace = workspace_path
+	)
+}
+
+fn terminal_failure_comment_details(
 	manual_attention_requested: bool,
 	error: &Report,
-) -> String {
-	let (error_class, next_action) = if manual_attention_requested {
+	recovery_gate: &str,
+) -> (&'static str, String) {
+	if manual_attention_requested {
 		(
 			"human_attention_required",
 			format!(
@@ -3091,14 +3502,7 @@ fn format_terminal_failure_comment(
 			"retry_budget_exhausted",
 			format!("inspect the workspace, resolve the issue manually, {recovery_gate}"),
 		)
-	};
-
-	format!(
-		"maestro run failed and needs attention\n\n- run_id: `{run_id}`\n- attempt: `{attempt_number}`\n- failed_at: `{failed_at}`\n- branch: `{branch}`\n- workspace_path: `{workspace}`\n- error_class: `{error_class}`\n- next_action: `{next_action}`\n- error: `{error}`",
-		failed_at = current_timestamp(),
-		branch = branch_name,
-		workspace = workspace_path
-	)
+	}
 }
 
 fn terminal_failure_recovery_gate(
@@ -3592,6 +3996,8 @@ approval_policy = "never"
 [execution]
 max_attempts = 3
 max_retry_backoff_ms = 300000
+max_concurrent_agents = 1
+max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
 
 [context]
 read_first = [{read_first}]
@@ -3668,9 +4074,12 @@ read_first = [{read_first}]
 			workflow: &loaded,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3709,13 +4118,13 @@ read_first = [{read_first}]
 			.record_run_attempt("run-child", &child_issue.id, 1, "running")
 			.expect("child run attempt should record");
 		state_store
-			.upsert_lease("pubfi", &child_issue.id, "run-child")
+			.upsert_lease("pubfi", &child_issue.id, "run-child", "In Progress")
 			.expect("child lease should record");
 		state_store
 			.record_run_attempt("run-stale", &stale_issue.id, 1, "running")
 			.expect("stale run attempt should record");
 		state_store
-			.upsert_lease("pubfi", &stale_issue.id, "run-stale")
+			.upsert_lease("pubfi", &stale_issue.id, "run-stale", "In Progress")
 			.expect("stale lease should record");
 
 		let actions = orchestrator::inspect_active_run_reconciliation_at(
@@ -3820,7 +4229,9 @@ read_first = [{read_first}]
 				.expect("eligibility should succeed")
 		);
 
-		state_store.upsert_lease("pubfi", "issue-1", "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", "issue-1", "run-1", "In Progress")
+			.expect("lease should record");
 
 		assert!(
 			!orchestrator::is_issue_eligible(&eligible_issue, &workflow, &state_store)
@@ -3835,7 +4246,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("Todo", &[]);
 
 		state_store
-			.try_acquire_lease("pubfi", &issue.id, "run-1")
+			.try_acquire_lease("pubfi", &issue.id, "run-1", "In Progress")
 			.expect("lease acquisition should succeed");
 
 		assert!(
@@ -3881,9 +4292,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3908,9 +4322,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3938,9 +4355,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -3976,9 +4396,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4016,9 +4439,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4051,9 +4477,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &state_store,
 			issue_id: &issue.id,
+			preferred_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
 			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
@@ -4379,7 +4808,7 @@ read_first = [{read_first}]
 			thread::sleep(Duration::from_millis(10));
 		}
 
-		let mut active_child = Some(orchestrator::DaemonRunChild {
+		let mut active_children = vec![orchestrator::DaemonRunChild {
 			child,
 			issue_id: issue.id.clone(),
 			run_id: String::from("planned-run"),
@@ -4390,7 +4819,7 @@ read_first = [{read_first}]
 				.expect("sample issue should carry a project slug"),
 			from_retry_queue: true,
 			workflow: workflow.clone(),
-		});
+		}];
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		retry_queue.upsert(orchestrator::RetryEntry {
@@ -4404,8 +4833,8 @@ read_first = [{read_first}]
 			ready_at: Instant::now(),
 		});
 
-		orchestrator::inspect_or_clear_active_child(
-			&mut active_child,
+		orchestrator::inspect_or_clear_active_children(
+			&mut active_children,
 			&mut retry_queue,
 			&tracker,
 			&config,
@@ -4415,7 +4844,7 @@ read_first = [{read_first}]
 		)
 		.expect("exited child cleanup should succeed");
 
-		assert!(active_child.is_none(), "exited child should be cleared");
+		assert!(active_children.is_empty(), "exited child should be cleared");
 		assert!(
 			retry_queue.entries.contains_key(&issue.id),
 			"retry claim should remain queued when the child exits before persisting a run attempt"
@@ -4451,7 +4880,11 @@ read_first = [{read_first}]
 		)
 		.expect("retry planning should succeed");
 
-		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
+		assert!(matches!(
+			decision,
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
+		));
 		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
 	}
 
@@ -4485,8 +4918,229 @@ read_first = [{read_first}]
 		)
 		.expect("future retry should not fail on project lookup blips");
 
-		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
+		assert!(matches!(
+			decision,
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
+		));
 		assert!(!retry_queue.is_empty(), "future retry should keep the queued claim");
+	}
+
+	#[test]
+	fn blocked_retry_still_allows_other_daemon_work_when_capacity_remains() {
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
+		)
+		.expect("workflow should parse");
+		let retry_issue = sample_issue("In Progress", &[]);
+		let todo_issue = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:17:17.133Z",
+		);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![retry_issue.clone(), todo_issue.clone()],
+			vec![
+				vec![retry_issue.clone(), todo_issue.clone()],
+				vec![retry_issue.clone(), todo_issue.clone()],
+			],
+		);
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: retry_issue.id.clone(),
+			retry_project_slug: retry_issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let next_run = orchestrator::plan_next_daemon_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("daemon planning should succeed")
+		.expect("an alternate lane should still be selected");
+
+		assert!(!next_run.1, "alternate work should not consume the queued retry claim");
+		assert_eq!(next_run.0.issue_id, todo_issue.id);
+		assert_eq!(next_run.0.issue_identifier, todo_issue.identifier);
+		assert_eq!(next_run.0.issue_state, "In Progress");
+		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Normal);
+		assert!(
+			retry_queue.entries.contains_key(&retry_issue.id),
+			"the blocked retry claim should remain queued while another lane fills capacity"
+		);
+	}
+
+	#[test]
+	fn blocked_future_retry_excludes_all_queued_retries_before_normal_fallback() {
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
+		)
+		.expect("workflow should parse");
+		let first_future_retry = sample_issue_with_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let second_future_retry = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"In Progress",
+			&[],
+			Some(2),
+			"2026-03-13T04:17:17.133Z",
+		);
+		let todo_issue = sample_issue_with_sort_fields(
+			"issue-3",
+			"PUB-103",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:18:17.133Z",
+		);
+		let listed_issues =
+			vec![first_future_retry.clone(), second_future_retry.clone(), todo_issue.clone()];
+		let tracker = FakeTracker::with_refresh_snapshots(
+			listed_issues.clone(),
+			vec![listed_issues.clone(), listed_issues.clone(), listed_issues],
+		);
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let retained_workspace = workspace_manager.plan_for_issue(&second_future_retry.identifier);
+
+		fs::create_dir_all(&retained_workspace.path)
+			.expect("retained future retry workspace should exist for recovery");
+
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: first_future_retry.id.clone(),
+			retry_project_slug: first_future_retry
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: second_future_retry.id.clone(),
+			retry_project_slug: second_future_retry
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now() + Duration::from_secs(120),
+		});
+
+		let next_run = orchestrator::plan_next_daemon_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("daemon planning should succeed")
+		.expect("normal work should still fill open capacity");
+
+		assert!(!next_run.1, "alternate work should not dispatch from the retry queue");
+		assert_eq!(next_run.0.issue_id, todo_issue.id);
+		assert_eq!(next_run.0.issue_identifier, todo_issue.identifier);
+		assert_eq!(next_run.0.issue_state, "In Progress");
+		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Normal);
+		assert!(
+			retry_queue.entries.contains_key(&first_future_retry.id)
+				&& retry_queue.entries.contains_key(&second_future_retry.id),
+			"all queued retries should stay queued instead of bypassing their ready_at through retained recovery"
+		);
+	}
+
+	#[test]
+	fn due_retry_releases_stale_entry_and_dispatches_next_due_retry() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let stale_issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"other-project",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let runnable_issue = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:17:17.133Z",
+		);
+		let tracker = FakeTracker::new(vec![stale_issue.clone(), runnable_issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: stale_issue.id.clone(),
+			retry_project_slug: String::from("pubfi"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now(),
+		});
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: runnable_issue.id.clone(),
+			retry_project_slug: runnable_issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 2,
+			ready_at: Instant::now(),
+		});
+
+		let next_run = orchestrator::plan_next_daemon_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("daemon planning should succeed")
+		.expect("the later due retry should still be dispatched");
+
+		assert!(next_run.1, "selected work should still come from the retry queue");
+		assert_eq!(next_run.0.issue_id, runnable_issue.id);
+		assert_eq!(next_run.0.issue_identifier, runnable_issue.identifier);
+		assert_eq!(next_run.0.issue_state, "In Progress");
+		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+		assert!(
+			!retry_queue.entries.contains_key(&stale_issue.id),
+			"released stale retry entries should not remain queued"
+		);
+		assert!(
+			retry_queue.entries.contains_key(&runnable_issue.id),
+			"the dispatched retry remains queued until the daemon child is reconciled"
+		);
 	}
 
 	#[test]
@@ -4639,7 +5293,7 @@ read_first = [{read_first}]
 		let mut retry_queue = orchestrator::RetryQueue::default();
 
 		state_store
-			.upsert_lease("pubfi", "issue-other", "run-other")
+			.upsert_lease("pubfi", "issue-other", "run-other", "In Progress")
 			.expect("temporary competing lease should record");
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
@@ -4661,10 +5315,78 @@ read_first = [{read_first}]
 		)
 		.expect("retry planning should succeed");
 
-		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Blocked));
+		assert!(matches!(
+			decision,
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
+		));
 		assert!(
 			retry_queue.entries.contains_key(&issue.id),
 			"active retry entry should remain queued while another lease temporarily holds the slot"
+		);
+	}
+
+	#[test]
+	fn due_retry_claim_stays_queued_when_issue_is_claimed_by_another_process() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let local_store = StateStore::open_in_memory().expect("local state store should open");
+		let remote_store = StateStore::open_in_memory().expect("remote state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		local_store
+			.configure_dispatch_slot_policy(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+			)
+			.expect("local dispatch policy should configure");
+		remote_store
+			.configure_dispatch_slot_policy(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
+			)
+			.expect("remote dispatch policy should configure");
+
+		assert!(
+			remote_store
+				.try_acquire_lease(config.id(), &issue.id, "run-foreign", "In Progress")
+				.expect("foreign process should acquire the shared issue claim")
+		);
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now(),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&local_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(
+			decision,
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
+		));
+		assert!(
+			retry_queue.entries.contains_key(&issue.id),
+			"retry queue should keep the claim until the foreign issue claim clears"
 		);
 	}
 
@@ -4684,6 +5406,7 @@ read_first = [{read_first}]
 				project_id: String::from("pubfi"),
 				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
+				issue_state: String::from("In Progress"),
 				retry_project_slug: String::from("pubfi"),
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				branch_name: String::from("x/pubfi-pub-101"),
@@ -4713,6 +5436,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
+			issue_state: String::from("In Progress"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -4758,6 +5482,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue,
+			issue_state: String::from("In Progress"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: String::from("PUB-101"),
@@ -4900,7 +5625,9 @@ read_first = [{read_first}]
 		let (_temp_dir, _config, workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 
-		state_store.upsert_lease("pubfi", "issue-active", "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", "issue-active", "run-1", "In Progress")
+			.expect("lease should record");
 
 		let selected = orchestrator::select_issue_candidate(
 			vec![sample_issue("Todo", &[])],
@@ -4911,6 +5638,152 @@ read_first = [{read_first}]
 		.expect("candidate selection should succeed");
 
 		assert!(selected.is_none(), "project-level dispatch slot should block new selection");
+	}
+
+	#[test]
+	fn candidate_selection_allows_multi_slot_dispatch_when_configured() {
+		let workflow_source =
+			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot workflow policy.\n");
+
+		assert!(workflow_source.contains("max_concurrent_agents = 1"));
+
+		let workflow = WorkflowDocument::parse_markdown(
+			&workflow_source
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2")
+				.replace(
+					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
+					r#"max_concurrent_agents_by_state = { "In Progress" = 2 }"#,
+				),
+		)
+		.expect("workflow should parse");
+
+		assert_eq!(workflow.frontmatter().execution().max_concurrent_agents(), 2);
+		assert_eq!(
+			workflow.frontmatter().execution().state_concurrency_limit("In Progress"),
+			Some(2)
+		);
+
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+
+		state_store
+			.upsert_lease("pubfi", "issue-active", "run-1", "In Progress")
+			.expect("existing lease should record");
+
+		let selected = orchestrator::select_issue_candidate(
+			vec![sample_issue("Todo", &[])],
+			&workflow,
+			&state_store,
+			"pubfi",
+		)
+		.expect("candidate selection should succeed")
+		.expect("one issue should be selected");
+
+		assert_eq!(selected.identifier, "PUB-101");
+	}
+
+	#[test]
+	fn candidate_selection_honors_per_state_concurrency_overrides_for_projected_in_progress_state()
+	{
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "State-scoped workflow policy.\n")
+				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 3")
+				.replace(
+					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
+					r#"max_concurrent_agents_by_state = { "Backlog" = 2, "In Progress" = 1 }"#,
+				),
+		)
+		.expect("workflow should parse");
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+
+		state_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("dispatch-slot root should configure");
+		state_store
+			.upsert_lease("pubfi", "issue-active", "run-1", "In Progress")
+			.expect("existing lease should record");
+
+		let selected = orchestrator::select_issue_candidate(
+			vec![sample_issue("Backlog", &[])],
+			&workflow,
+			&state_store,
+			"pubfi",
+		)
+		.expect("candidate selection should succeed");
+
+		assert!(
+			selected.is_none(),
+			"per-state admission should count the projected in-progress state for normal dispatch"
+		);
+	}
+
+	#[test]
+	fn candidate_selection_skips_issue_claimed_by_another_process() {
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Claim-aware workflow policy.\n")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2")
+				.replace(
+					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
+					r#"max_concurrent_agents_by_state = { "In Progress" = 2 }"#,
+				),
+		)
+		.expect("workflow should parse");
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let remote_store = StateStore::open_in_memory().expect("remote state store should open");
+		let local_store = StateStore::open_in_memory().expect("local state store should open");
+		let claimed_issue = sample_issue_with_sort_fields(
+			"issue-claimed",
+			"PUB-100",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let free_issue = sample_issue_with_sort_fields(
+			"issue-free",
+			"PUB-101",
+			"Todo",
+			&[],
+			Some(2),
+			"2026-03-13T04:16:18.133Z",
+		);
+
+		remote_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("remote dispatch-slot root should configure");
+		local_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("local dispatch-slot root should configure");
+
+		assert!(
+			remote_store
+				.try_acquire_lease(config.id(), &claimed_issue.id, "run-claimed", "In Progress")
+				.expect("remote issue claim should succeed")
+		);
+
+		let selected = orchestrator::select_issue_candidate(
+			vec![claimed_issue, free_issue.clone()],
+			&workflow,
+			&local_store,
+			config.id(),
+		)
+		.expect("candidate selection should succeed")
+		.expect("the unclaimed issue should still be selected");
+
+		assert_eq!(selected.id, free_issue.id);
 	}
 
 	#[test]
@@ -4945,7 +5818,9 @@ read_first = [{read_first}]
 			.record_run_attempt("run-1", &issue.id, 1, "running")
 			.expect("run attempt should record");
 		state_store.update_run_thread("run-1", "thread-1").expect("thread id should attach");
-		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-1", "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -4999,7 +5874,9 @@ read_first = [{read_first}]
 			state_store
 				.record_run_attempt(run_id, &issue.id, 1, "running")
 				.expect("run attempt should record");
-			state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+			state_store
+				.upsert_lease("pubfi", &issue.id, run_id, "In Progress")
+				.expect("lease should record");
 			state_store
 				.upsert_workspace(
 					"pubfi",
@@ -5092,24 +5969,20 @@ read_first = [{read_first}]
 
 	#[test]
 	fn human_required_terminal_failure_comments_use_manual_attention_error_class() {
-		let error = Report::new(super::ManualAttentionRequested {
-			issue_identifier: String::from("PUB-101"),
-			label: String::from("maestro:needs-attention"),
-			run_id: String::from("pub-101-attempt-1-123"),
-		});
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
 			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
-			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
-			true,
-			&error,
+			"human_attention_required",
+			"inspect the issue comment and workspace, resolve the blocker manually, clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 		);
 
 		assert!(comment.contains("- error_class: `human_attention_required`"));
-		assert!(comment.contains("stop automatic retries and hand off manually"));
+		assert!(comment.contains("inspect the issue comment and workspace"));
+		assert!(comment.contains("resolve the blocker manually"));
 		assert!(comment.contains("clear label `maestro:needs-attention`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
 	}
 
 	#[test]
@@ -5118,6 +5991,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("In Progress", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
+			issue_state: issue.state.name.clone(),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
@@ -5146,45 +6020,52 @@ read_first = [{read_first}]
 
 	#[test]
 	fn review_handoff_writeback_failures_use_nonretryable_terminal_failure_comment() {
-		let error = Report::new(super::ReviewHandoffNeedsAttention {
-			issue_identifier: String::from("PUB-101"),
-			run_id: String::from("pub-101-attempt-1-123"),
-		});
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
 			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
-			"clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
-			false,
-			&error,
+			"review_handoff_writeback_failed",
+			"inspect the tracker state, PR, and workspace, repair the incomplete review handoff manually, clear label `maestro:needs-attention`, then move the issue back to a startable state if another automated run is desired",
 		);
 
 		assert!(comment.contains("- error_class: `review_handoff_writeback_failed`"));
 		assert!(comment.contains("repair the incomplete review handoff manually"));
 		assert!(comment.contains("clear label `maestro:needs-attention`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
 	}
 
 	#[test]
 	fn terminal_failure_comments_explain_state_guard_when_needs_attention_label_is_unavailable() {
-		let error = Report::new(super::StalledRunNeedsAttention {
-			issue_identifier: String::from("PUB-101"),
-			run_id: String::from("pub-101-attempt-1-123"),
-			idle_for: ACTIVE_RUN_IDLE_TIMEOUT,
-		});
 		let comment = orchestrator::format_terminal_failure_comment(
 			"pub-101-attempt-1-123",
 			1,
 			String::from(".workspaces/PUB-101"),
 			"x/pubfi-pub-101",
-			"`maestro:needs-attention` could not be applied because it does not exist on the team; the issue remains in `In Progress` to block automatic retries, so move it back to a startable state manually if another automated run is desired",
-			false,
-			&error,
+			"stalled_run_detected",
+			"inspect the workspace and app-server activity for the stalled lane, resolve the blocker manually, `maestro:needs-attention` could not be applied because it does not exist on the team; the issue remains in `In Progress` to block automatic retries, so move it back to a startable state manually if another automated run is desired",
 		);
 
 		assert!(comment.contains("- error_class: `stalled_run_detected`"));
 		assert!(comment.contains("does not exist on the team"));
 		assert!(comment.contains("remains in `In Progress`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
+	}
+
+	#[test]
+	fn retry_failure_comments_withhold_raw_error_text() {
+		let comment = orchestrator::format_retry_comment(
+			"pub-101-attempt-1-123",
+			1,
+			1,
+			3,
+			String::from(".workspaces/PUB-101"),
+			"x/pubfi-pub-101",
+		);
+
+		assert!(comment.contains("- error_class: `retryable_execution_failure`"));
+		assert!(comment.contains("Sensitive runtime details were withheld"));
+		assert!(!comment.contains("error:"));
 	}
 
 	#[test]
@@ -5217,7 +6098,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-1", "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -5265,7 +6148,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-1", "In Progress")
+			.expect("lease should record");
 
 		let error =
 			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
@@ -5293,7 +6178,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-1", "In Progress")
+			.expect("lease should record");
 
 		orchestrator::clear_orphaned_daemon_child_state(
 			&state_store,
@@ -5330,7 +6217,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("other-run", &issue.id, 1, "running")
 			.expect("other run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "other-run").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "other-run", "In Progress")
+			.expect("lease should record");
 
 		orchestrator::clear_orphaned_daemon_child_state(
 			&state_store,
@@ -5369,7 +6258,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("run-1", &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "run-1").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-1", "In Progress")
+			.expect("lease should record");
 
 		orchestrator::clear_orphaned_daemon_child_state(
 			&state_store,
@@ -5575,20 +6466,31 @@ read_first = [{read_first}]
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
 
 		parent_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("parent dispatch-slot root should configure");
 		child_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("child dispatch-slot root should configure");
 
 		assert!(
 			parent_store
-				.try_acquire_lease(config.id(), &issue.id, "planned-run")
+				.try_acquire_lease(config.id(), &issue.id, "planned-run", "In Progress")
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child(config.id())
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -5596,7 +6498,12 @@ read_first = [{read_first}]
 				config.id(),
 				&issue.id,
 				"planned-run",
-				child_guard.into_raw_fd(),
+				"In Progress",
+				state::PreacquiredLeaseGuards {
+					issue_claim_fd: child_issue_claim.into_raw_fd(),
+					dispatch_slot_fd: child_guard.into_raw_fd(),
+					dispatch_slot_index: child_slot_index,
+				},
 			)
 			.expect("child should adopt the inherited lease guard");
 
@@ -5646,20 +6553,31 @@ read_first = [{read_first}]
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
 
 		parent_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("parent dispatch-slot root should configure");
 		child_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("child dispatch-slot root should configure");
 
 		assert!(
 			parent_store
-				.try_acquire_lease(config.id(), &issue.id, "planned-run")
+				.try_acquire_lease(config.id(), &issue.id, "planned-run", "In Progress")
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child(config.id())
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -5667,7 +6585,12 @@ read_first = [{read_first}]
 				config.id(),
 				&issue.id,
 				"planned-run",
-				child_guard.into_raw_fd(),
+				"In Progress",
+				state::PreacquiredLeaseGuards {
+					issue_claim_fd: child_issue_claim.into_raw_fd(),
+					dispatch_slot_fd: child_guard.into_raw_fd(),
+					dispatch_slot_index: child_slot_index,
+				},
 			)
 			.expect("child should adopt the inherited lease guard");
 		child_store
@@ -5718,20 +6641,31 @@ read_first = [{read_first}]
 		let child_store = StateStore::open_in_memory().expect("child state store should open");
 
 		parent_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("parent dispatch-slot root should configure");
 		child_store
-			.configure_dispatch_slot_root(config.id(), config.workspace_root())
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
 			.expect("child dispatch-slot root should configure");
 
 		assert!(
 			parent_store
-				.try_acquire_lease(config.id(), &issue.id, "planned-run")
+				.try_acquire_lease(config.id(), &issue.id, "planned-run", "In Progress")
 				.expect("parent should acquire the shared dispatch slot")
 		);
 
-		let child_guard = parent_store
-			.clone_dispatch_slot_for_child(config.id())
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
 			.expect("child should inherit the shared dispatch-slot fd");
 
 		child_store
@@ -5744,9 +6678,12 @@ read_first = [{read_first}]
 			workflow: &workflow,
 			state_store: &child_store,
 			issue_id: &issue.id,
+			preferred_issue_state: Some("In Progress"),
 			dry_run: false,
 			lease_preacquired: true,
+			preferred_issue_claim_fd: Some(child_issue_claim.into_raw_fd()),
 			preferred_dispatch_slot_fd: Some(child_guard.into_raw_fd()),
+			preferred_dispatch_slot_index: Some(child_slot_index),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 				run_id: "planned-run",
@@ -5854,7 +6791,12 @@ read_first = [{read_first}]
 				.record_run_attempt(&format!("run-{}", issue.identifier), &issue.id, 1, "running")
 				.expect("run attempt should record");
 			state_store
-				.upsert_lease("pubfi", &issue.id, &format!("run-{}", issue.identifier))
+				.upsert_lease(
+					"pubfi",
+					&issue.id,
+					&format!("run-{}", issue.identifier),
+					"In Progress",
+				)
 				.expect("lease should record");
 		}
 
@@ -5921,7 +6863,12 @@ read_first = [{read_first}]
 			)
 			.expect("run attempt should record");
 		state_store
-			.upsert_lease("pubfi", &stalled_issue.id, &format!("run-{}", stalled_issue.identifier))
+			.upsert_lease(
+				"pubfi",
+				&stalled_issue.id,
+				&format!("run-{}", stalled_issue.identifier),
+				"In Progress",
+			)
 			.expect("lease should record");
 
 		let now = OffsetDateTime::now_utc().unix_timestamp()
@@ -5991,7 +6938,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, run_id, "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -6082,7 +7031,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("run-startable", &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, "run-startable").expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-startable", "In Progress")
+			.expect("lease should record");
 
 		let now = OffsetDateTime::now_utc().unix_timestamp() + 1;
 		let actions = orchestrator::inspect_active_run_reconciliation_at(
@@ -6115,7 +7066,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, run_id, "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -6183,7 +7136,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, run_id, "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -6260,7 +7215,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt(run_id, &issue.id, 1, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, run_id, "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -6331,7 +7288,9 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt(run_id, &issue.id, 3, "running")
 			.expect("run attempt should record");
-		state_store.upsert_lease("pubfi", &issue.id, run_id).expect("lease should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, run_id, "In Progress")
+			.expect("lease should record");
 		state_store
 			.upsert_workspace(
 				"pubfi",
@@ -6382,6 +7341,7 @@ read_first = [{read_first}]
 		let issue = sample_issue_without_needs_attention_team_label("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
+			issue_state: String::from("In Progress"),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),
@@ -6491,6 +7451,7 @@ read_first = [{read_first}]
 		let issue = sample_issue("In Progress", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
 			issue: issue.clone(),
+			issue_state: issue.state.name.clone(),
 			workspace: WorkspaceSpec {
 				branch_name: String::from("x/pubfi-pub-101"),
 				issue_identifier: issue.identifier.clone(),

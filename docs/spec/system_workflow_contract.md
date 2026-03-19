@@ -133,6 +133,16 @@ Supported keys:
   - optional
   - default: `300000`
   - note: caps daemon-owned failure retry backoff in milliseconds; clean continuation retries use a separate short fixed delay in runtime policy
+- `max_concurrent_agents`
+  - type: integer
+  - optional
+  - default: `1`
+  - note: upper-bounds concurrent `maestro` runs per repository; values must be greater than or equal to `1`
+- `max_concurrent_agents_by_state`
+  - type: table of `state_name = integer`
+  - optional
+  - default: `{}` (no per-state overrides)
+  - note: further limits concurrency for specific tracker states; each configured state must use a positive value that does not exceed `max_concurrent_agents`
 - `validation_commands`
   - type: array of string
   - optional
@@ -190,6 +200,8 @@ personality = "pragmatic"
 [execution]
 max_attempts = 3
 max_retry_backoff_ms = 300000
+max_concurrent_agents = 2
+max_concurrent_agents_by_state = { "In Progress" = 2, "Todo" = 1 }
 validation_commands = [
   "cargo make fmt-check",
   "cargo make lint",
