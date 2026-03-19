@@ -14,6 +14,7 @@ use crate::{
 		},
 		tracker_tool_bridge::{
 			DynamicToolCallResponse, DynamicToolContentItem, DynamicToolHandler, DynamicToolSpec,
+			TurnCompletionStatus,
 		},
 	},
 	prelude::{Result, eyre},
@@ -31,6 +32,13 @@ const DEFAULT_TURN_EFFORT: &str = "high";
 const PROBE_DEVELOPER_INSTRUCTIONS: &str = "You are a protocol probe. You must call the dynamic tool `echo_probe` exactly once with the JSON argument `{\"text\":\"PROBE_OK\"}`. Do not use shell. Do not inspect files. After the tool response is returned, reply with the exact text PROBE_OK and nothing else.";
 const PROBE_USER_INPUT: &str = "Call `echo_probe` with `{\\\"text\\\":\\\"PROBE_OK\\\"}`. After the tool succeeds, reply with the exact text PROBE_OK.";
 
+pub(crate) trait TurnContinuationGuard {
+	fn should_continue_turn(&self) -> Result<bool>;
+	fn validate_continuation_boundary(&self, _turn_count: u32) -> Result<()> {
+		Ok(())
+	}
+}
+
 #[derive(Clone)]
 pub(crate) struct AppServerRunRequest<'a> {
 	pub(crate) run_id: String,
@@ -45,9 +53,12 @@ pub(crate) struct AppServerRunRequest<'a> {
 	pub(crate) model: Option<String>,
 	pub(crate) personality: Option<String>,
 	pub(crate) service_tier: Option<String>,
+	pub(crate) max_turns: u32,
 	pub(crate) timeout: Duration,
+	pub(crate) continuation_user_input: Option<String>,
 	pub(crate) activity_marker_path: Option<PathBuf>,
 	pub(crate) dynamic_tool_handler: Option<&'a dyn DynamicToolHandler>,
+	pub(crate) continuation_guard: Option<&'a dyn TurnContinuationGuard>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,8 +66,10 @@ pub(crate) struct AppServerRunResult {
 	pub(crate) user_agent: String,
 	pub(crate) thread_id: String,
 	pub(crate) turn_id: String,
+	pub(crate) turn_count: u32,
 	pub(crate) event_count: i64,
 	pub(crate) final_output: String,
+	pub(crate) continuation_pending: bool,
 }
 
 struct AppServerClient {
@@ -137,7 +150,7 @@ impl<'a> RunRecorder<'a> {
 	fn mark_activity(&self) -> Result<()> {
 		if let Some(marker_path) = self.activity_marker_path {
 			write_activity_marker_best_effort(marker_path, self.run_id, self.attempt_number);
-		}
+		};
 
 		Ok(())
 	}
@@ -409,9 +422,12 @@ pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
 			model: None,
 			personality: None,
 			service_tier: None,
+			max_turns: 1,
 			timeout: PROBE_TIMEOUT,
+			continuation_user_input: None,
 			activity_marker_path: None,
 			dynamic_tool_handler: Some(&probe_tool_handler),
+			continuation_guard: None,
 		},
 		&state_store,
 	)?;
@@ -491,10 +507,6 @@ fn execute_app_server_run_inner(
 
 	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
 
-	let turn_response =
-		client.start_turn(build_turn_start_request(&thread_id, &request.user_input))?;
-	let turn_id = turn_response.turn.id.clone();
-
 	state_store.record_run_attempt(
 		&request.run_id,
 		&request.issue_id,
@@ -503,18 +515,49 @@ fn execute_app_server_run_inner(
 	)?;
 	recorder.mark_activity()?;
 
-	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
+	let mut next_input = request.user_input.clone();
+	let mut turn_count = 0_u32;
+	let (last_turn_id, last_output, continuation_pending) = loop {
+		let turn_response = client.start_turn(build_turn_start_request(&thread_id, &next_input))?;
+		let turn_id = turn_response.turn.id.clone();
 
-	let run_outcome = wait_for_turn_completion(
-		&mut client,
-		&mut recorder,
-		&thread_id,
-		&turn_id,
-		request.timeout,
-		request.dynamic_tool_handler,
-	)?;
+		turn_count = turn_count.saturating_add(1);
 
-	validate_turn_completion(request.dynamic_tool_handler, &run_outcome.final_output)?;
+		flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;
+
+		let run_outcome = wait_for_turn_completion(
+			&mut client,
+			&mut recorder,
+			&thread_id,
+			&turn_id,
+			request.timeout,
+			request.dynamic_tool_handler,
+		)?;
+		let final_output = run_outcome.final_output;
+
+		match classify_turn_completion(request.dynamic_tool_handler, &final_output)? {
+			TurnCompletionStatus::Complete => break (turn_id, final_output, false),
+			TurnCompletionStatus::Continue => {
+				if request.max_turns <= 1 {
+					reject_nonterminal_single_turn_completion(
+						request.dynamic_tool_handler,
+						&final_output,
+					)?;
+				}
+				if turn_count >= request.max_turns {
+					break (turn_id, final_output, true);
+				}
+				if continuation_boundary_reached(request.continuation_guard, turn_count)? {
+					break (turn_id, final_output, true);
+				}
+
+				next_input = request
+					.continuation_user_input
+					.clone()
+					.unwrap_or_else(|| request.user_input.clone());
+			},
+		}
+	};
 
 	state_store.record_run_attempt(
 		&request.run_id,
@@ -527,13 +570,26 @@ fn execute_app_server_run_inner(
 	Ok(AppServerRunResult {
 		user_agent: initialize_response.user_agent,
 		thread_id,
-		turn_id,
+		turn_id: last_turn_id,
+		turn_count,
 		event_count: state_store.event_count(&request.run_id)?,
-		final_output: run_outcome.final_output,
+		final_output: last_output,
+		continuation_pending,
 	})
 }
 
-fn validate_turn_completion(
+fn classify_turn_completion(
+	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
+	final_output: &str,
+) -> Result<TurnCompletionStatus> {
+	if let Some(dynamic_tool_handler) = dynamic_tool_handler {
+		return dynamic_tool_handler.classify_turn_completion(final_output);
+	}
+
+	Ok(TurnCompletionStatus::Complete)
+}
+
+fn reject_nonterminal_single_turn_completion(
 	dynamic_tool_handler: Option<&dyn DynamicToolHandler>,
 	final_output: &str,
 ) -> Result<()> {
@@ -541,7 +597,26 @@ fn validate_turn_completion(
 		dynamic_tool_handler.validate_turn_completion(final_output)?;
 	}
 
-	Ok(())
+	eyre::bail!(
+		"Turn completed without a terminal completion path while same-thread continuation is disabled."
+	);
+}
+
+fn continuation_boundary_reached(
+	continuation_guard: Option<&dyn TurnContinuationGuard>,
+	turn_count: u32,
+) -> Result<bool> {
+	let Some(continuation_guard) = continuation_guard else {
+		return Ok(false);
+	};
+
+	if continuation_guard.should_continue_turn()? {
+		return Ok(false);
+	}
+
+	continuation_guard.validate_continuation_boundary(turn_count)?;
+
+	Ok(true)
 }
 
 fn build_turn_start_request(thread_id: &str, user_input: &str) -> TurnStartRequest {
@@ -800,7 +875,9 @@ mod tests {
 		agent::{
 			app_server::{AppServerRunResult, ProbeDynamicToolHandler},
 			json_rpc::{JsonRpcMessage, JsonRpcNotification, WireMessage},
-			tracker_tool_bridge::{DynamicToolCallResponse, DynamicToolHandler, DynamicToolSpec},
+			tracker_tool_bridge::{
+				DynamicToolCallResponse, DynamicToolHandler, DynamicToolSpec, TurnCompletionStatus,
+			},
 		},
 		state::StateStore,
 	};
@@ -821,6 +898,52 @@ mod tests {
 
 		fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
 			Err(crate::prelude::eyre::eyre!("terminal finalization missing"))
+		}
+	}
+
+	struct ContinuingCompletionHandler;
+	impl DynamicToolHandler for ContinuingCompletionHandler {
+		fn tool_specs(&self) -> Vec<DynamicToolSpec> {
+			Vec::new()
+		}
+
+		fn handle_call(
+			&self,
+			_tool_name: &str,
+			_arguments: serde_json::Value,
+		) -> DynamicToolCallResponse {
+			DynamicToolCallResponse::failure(String::from("unused"))
+		}
+
+		fn classify_turn_completion(
+			&self,
+			_final_output: &str,
+		) -> crate::prelude::Result<TurnCompletionStatus> {
+			Ok(TurnCompletionStatus::Continue)
+		}
+
+		fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
+			Err(crate::prelude::eyre::eyre!("terminal finalization missing"))
+		}
+	}
+
+	struct YieldingContinuationGuard;
+	impl super::TurnContinuationGuard for YieldingContinuationGuard {
+		fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+			Ok(false)
+		}
+	}
+
+	struct RejectingContinuationGuard;
+	impl super::TurnContinuationGuard for RejectingContinuationGuard {
+		fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+			Ok(false)
+		}
+
+		fn validate_continuation_boundary(&self, turn_count: u32) -> crate::prelude::Result<()> {
+			Err(crate::prelude::eyre::eyre!(
+				"turn {turn_count} hit an invalid continuation boundary"
+			))
 		}
 	}
 
@@ -873,11 +996,14 @@ mod tests {
 			user_agent: String::from("ua"),
 			thread_id: String::from("thread"),
 			turn_id: String::from("turn"),
+			turn_count: 1,
 			event_count: 3,
 			final_output: String::from("PROBE_OK"),
+			continuation_pending: false,
 		};
 
 		assert_eq!(result.final_output, "PROBE_OK");
+		assert_eq!(result.turn_count, 1);
 	}
 
 	#[test]
@@ -928,22 +1054,55 @@ mod tests {
 	}
 
 	#[test]
-	fn completion_validation_uses_dynamic_tool_handler() {
-		let error = super::validate_turn_completion(Some(&RejectingCompletionHandler), "finished")
-			.expect_err("completion validator should be consulted");
+	fn completion_classification_uses_dynamic_tool_handler() {
+		let error = super::classify_turn_completion(Some(&RejectingCompletionHandler), "finished")
+			.expect_err("completion classifier should be consulted");
 
 		assert!(error.to_string().contains("terminal finalization missing"));
 	}
 
 	#[test]
-	fn completion_validation_defaults_to_noop_without_handler() {
-		super::validate_turn_completion(None, "finished")
-			.expect("missing dynamic handler should not fail completion");
+	fn completion_classification_defaults_to_complete_without_handler() {
+		assert_eq!(
+			super::classify_turn_completion(None, "finished")
+				.expect("missing dynamic handler should not fail completion"),
+			TurnCompletionStatus::Complete
+		);
 	}
 
 	#[test]
-	fn probe_handler_allows_completion_validation() {
-		super::validate_turn_completion(Some(&ProbeDynamicToolHandler), "PROBE_OK")
-			.expect("probe handler should not override completion validation");
+	fn probe_handler_allows_completion_classification() {
+		assert_eq!(
+			super::classify_turn_completion(Some(&ProbeDynamicToolHandler), "PROBE_OK")
+				.expect("probe handler should not override completion validation"),
+			TurnCompletionStatus::Complete
+		);
+	}
+
+	#[test]
+	fn nonterminal_single_turn_completion_stays_invalid() {
+		let error = super::reject_nonterminal_single_turn_completion(
+			Some(&ContinuingCompletionHandler),
+			"unfinished",
+		)
+		.expect_err("single-turn mode should preserve terminal completion validation");
+
+		assert!(error.to_string().contains("terminal finalization missing"));
+	}
+
+	#[test]
+	fn continuation_boundary_reached_yields_when_guard_allows_it() {
+		assert!(
+			super::continuation_boundary_reached(Some(&YieldingContinuationGuard), 2)
+				.expect("yielding guard should allow a clean continuation boundary")
+		);
+	}
+
+	#[test]
+	fn continuation_boundary_reached_rejects_invalid_boundary() {
+		let error = super::continuation_boundary_reached(Some(&RejectingContinuationGuard), 1)
+			.expect_err("invalid continuation boundaries should surface as errors");
+
+		assert!(error.to_string().contains("turn 1 hit an invalid continuation boundary"));
 	}
 }

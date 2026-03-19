@@ -29,6 +29,14 @@ static LOCAL_GIT_REPO_INSPECTOR: LocalGitRepoInspector = LocalGitRepoInspector;
 pub(crate) trait DynamicToolHandler {
 	fn tool_specs(&self) -> Vec<DynamicToolSpec>;
 	fn handle_call(&self, tool_name: &str, arguments: Value) -> DynamicToolCallResponse;
+	fn classify_turn_completion(
+		&self,
+		final_output: &str,
+	) -> crate::prelude::Result<TurnCompletionStatus> {
+		self.validate_turn_completion(final_output)?;
+
+		Ok(TurnCompletionStatus::Complete)
+	}
 	fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
 		Ok(())
 	}
@@ -66,6 +74,7 @@ pub(crate) struct TrackerToolBridge<'a> {
 	local_repo_inspector: &'a dyn LocalRepoInspector,
 	manual_attention_requested: RefCell<bool>,
 	manual_attention_comment_recorded: RefCell<bool>,
+	continuation_blocking_tracker_write: RefCell<Option<String>>,
 	pending_review_handoff: RefCell<Option<PendingReviewHandoff>>,
 	finalized_completion_path: RefCell<Option<RunCompletionDisposition>>,
 }
@@ -85,6 +94,7 @@ impl<'a> TrackerToolBridge<'a> {
 			local_repo_inspector: &LOCAL_GIT_REPO_INSPECTOR,
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
+			continuation_blocking_tracker_write: RefCell::new(None),
 			pending_review_handoff: RefCell::new(None),
 			finalized_completion_path: RefCell::new(None),
 		}
@@ -107,6 +117,7 @@ impl<'a> TrackerToolBridge<'a> {
 			local_repo_inspector,
 			manual_attention_requested: RefCell::new(false),
 			manual_attention_comment_recorded: RefCell::new(false),
+			continuation_blocking_tracker_write: RefCell::new(None),
 			pending_review_handoff: RefCell::new(None),
 			finalized_completion_path: RefCell::new(None),
 		}
@@ -310,10 +321,14 @@ impl<'a> TrackerToolBridge<'a> {
 		};
 
 		match self.tracker.update_issue_state(&self.issue.id, state_id) {
-			Ok(()) => DynamicToolCallResponse::success(format!(
-				"Issue `{}` moved to `{}`.",
-				self.issue.identifier, parsed.state
-			)),
+			Ok(()) => {
+				self.record_continuation_blocking_transition(&parsed.state);
+
+				DynamicToolCallResponse::success(format!(
+					"Issue `{}` moved to `{}`.",
+					self.issue.identifier, parsed.state
+				))
+			},
 			Err(error) => DynamicToolCallResponse::failure(format!(
 				"Failed to move issue `{}` to `{}`: {error}",
 				self.issue.identifier, parsed.state
@@ -441,20 +456,40 @@ impl<'a> TrackerToolBridge<'a> {
 			));
 		}
 
+		let current_issue = match self.refreshed_issue_snapshot() {
+			Ok(Some(issue)) => issue,
+			Ok(None) => {
+				return DynamicToolCallResponse::failure(format!(
+					"Failed to refresh issue `{}` before updating labels: tracker returned no current snapshot.",
+					self.issue.identifier
+				));
+			},
+			Err(error) => {
+				return DynamicToolCallResponse::failure(format!(
+					"Failed to refresh issue `{}` before updating labels: {error}",
+					self.issue.identifier
+				));
+			},
+		};
 		let manual_attention_label =
 			parsed.label == self.workflow.frontmatter().tracker().needs_attention_label();
-		let Some(label_id) = self.issue.label_id_for_name(&parsed.label) else {
+		let Some(label_id) = current_issue.label_id_for_name(&parsed.label) else {
 			return DynamicToolCallResponse::failure(format!(
 				"Label `{}` does not exist on issue `{}`.",
 				parsed.label, self.issue.identifier
 			));
 		};
 		let mut label_ids =
-			self.issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
+			current_issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
 
 		if label_ids.iter().any(|existing| existing == label_id) {
 			if manual_attention_label {
 				self.manual_attention_requested.replace(true);
+			} else if parsed.label == self.workflow.frontmatter().tracker().opt_out_label() {
+				self.record_continuation_blocking_write(format!(
+					"`{ISSUE_LABEL_ADD_TOOL_NAME}` with label `{}`",
+					parsed.label
+				));
 			}
 
 			return DynamicToolCallResponse::success(format!(
@@ -469,6 +504,11 @@ impl<'a> TrackerToolBridge<'a> {
 			Ok(()) => {
 				if manual_attention_label {
 					self.manual_attention_requested.replace(true);
+				} else if parsed.label == self.workflow.frontmatter().tracker().opt_out_label() {
+					self.record_continuation_blocking_write(format!(
+						"`{ISSUE_LABEL_ADD_TOOL_NAME}` with label `{}`",
+						parsed.label
+					));
 				}
 
 				DynamicToolCallResponse::success(format!(
@@ -568,6 +608,13 @@ impl<'a> TrackerToolBridge<'a> {
 		states
 	}
 
+	fn refreshed_issue_snapshot(&self) -> crate::prelude::Result<Option<TrackerIssue>> {
+		let issue_ids = [self.issue.id.clone()];
+		let mut refreshed_issues = self.tracker.refresh_issues(&issue_ids)?;
+
+		Ok(refreshed_issues.pop())
+	}
+
 	fn validate_review_handoff_pr(
 		&self,
 		review_context: &ReviewHandoffContext,
@@ -615,6 +662,38 @@ impl<'a> TrackerToolBridge<'a> {
 		}
 
 		Ok(pull_request)
+	}
+
+	fn record_continuation_blocking_transition(&self, state: &str) {
+		if state != self.workflow.frontmatter().tracker().in_progress_state() {
+			self.record_continuation_blocking_write(format!(
+				"`{ISSUE_TRANSITION_TOOL_NAME}` to state `{state}`"
+			));
+		}
+	}
+
+	fn record_continuation_blocking_write(&self, reason: String) {
+		self.continuation_blocking_tracker_write.replace(Some(reason));
+	}
+
+	fn continuation_blocking_write_reason(&self) -> crate::prelude::Result<Option<String>> {
+		let Some(reason) = self.continuation_blocking_tracker_write.borrow().clone() else {
+			return Ok(None);
+		};
+		let issue = match self.refreshed_issue_snapshot()? {
+			Some(issue) => issue,
+			None => return Ok(Some(reason)),
+		};
+		let tracker_policy = self.workflow.frontmatter().tracker();
+		let issue_still_active = issue.state.name == tracker_policy.in_progress_state()
+			&& !issue.has_label(tracker_policy.opt_out_label())
+			&& !issue.has_label(tracker_policy.needs_attention_label());
+
+		if issue_still_active {
+			return Ok(None);
+		}
+
+		Ok(Some(reason))
 	}
 
 	pub(crate) fn completion_disposition(
@@ -726,6 +805,62 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 		self.handle_call_inner(tool_name, arguments)
 	}
 
+	fn classify_turn_completion(
+		&self,
+		_final_output: &str,
+	) -> crate::prelude::Result<TurnCompletionStatus> {
+		let Some(review_context) = self.review_context.as_ref() else {
+			eyre::bail!(
+				"Review handoff context is unavailable for issue `{}`.",
+				self.issue.identifier
+			);
+		};
+		let manual_attention_requested = *self.manual_attention_requested.borrow();
+		let manual_attention_comment_recorded = *self.manual_attention_comment_recorded.borrow();
+		let review_handoff_recorded = self.pending_review_handoff.borrow().is_some();
+
+		match (
+			manual_attention_requested,
+			manual_attention_comment_recorded,
+			review_handoff_recorded,
+		) {
+			(false, false, false) => {
+				if let Some(reason) = self.continuation_blocking_write_reason()? {
+					eyre::bail!(
+						"Run `{}` changed issue `{}` via {} without recording a terminal path. Continuation turns may only yield cleanly while the leased issue remains active.",
+						review_context.run_id,
+						self.issue.identifier,
+						reason
+					);
+				}
+
+				Ok(TurnCompletionStatus::Continue)
+			},
+			(false, false, true) | (true, true, false) => {
+				self.validate_turn_completion("")?;
+
+				Ok(TurnCompletionStatus::Complete)
+			},
+			(true, false, false) => eyre::bail!(
+				"Run `{}` requested human attention with label `{}`, but issue `{}` never recorded the required explanatory comment.",
+				review_context.run_id,
+				self.workflow.frontmatter().tracker().needs_attention_label(),
+				self.issue.identifier
+			),
+			(true, _, true) => eyre::bail!(
+				"Run `{}` recorded both `issue_review_handoff` and label `{}`. Use exactly one final handoff path.",
+				review_context.run_id,
+				self.workflow.frontmatter().tracker().needs_attention_label()
+			),
+			(false, true, false) | (false, true, true) => eyre::bail!(
+				"Run `{}` recorded a human-attention comment for issue `{}`, but never recorded label `{}`.",
+				review_context.run_id,
+				self.issue.identifier,
+				self.workflow.frontmatter().tracker().needs_attention_label()
+			),
+		}
+	}
+
 	fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
 		let completion_path = self.completion_disposition()?;
 		let Some(finalized_path) = *self.finalized_completion_path.borrow() else {
@@ -763,6 +898,12 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 
 		Ok(())
 	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnCompletionStatus {
+	Continue,
+	Complete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1167,7 +1308,7 @@ mod tests {
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 			ISSUE_TRANSITION_TOOL_NAME, LocalRepoDetails, LocalRepoInspector, PullRequestDetails,
 			PullRequestInspector, ReviewHandoffContext, RunCompletionDisposition,
-			TrackerToolBridge,
+			TrackerToolBridge, TurnCompletionStatus,
 		},
 		prelude::{Result, eyre},
 		tracker::{
@@ -1180,6 +1321,7 @@ mod tests {
 		state_updates: RefCell<Vec<String>>,
 		label_updates: RefCell<Vec<Vec<String>>>,
 		comments: RefCell<Vec<String>>,
+		refresh_snapshots: RefCell<Vec<Vec<TrackerIssue>>>,
 		fail_state_update: RefCell<Option<String>>,
 		fail_label_update: RefCell<Option<String>>,
 		fail_comment: RefCell<Option<String>>,
@@ -1221,10 +1363,19 @@ mod tests {
 				state_updates: RefCell::new(Vec::new()),
 				label_updates: RefCell::new(Vec::new()),
 				comments: RefCell::new(Vec::new()),
+				refresh_snapshots: RefCell::new(Vec::new()),
 				fail_state_update: RefCell::new(None),
 				fail_label_update: RefCell::new(None),
 				fail_comment: RefCell::new(None),
 			}
+		}
+
+		fn with_refresh_snapshots(refresh_snapshots: Vec<Vec<TrackerIssue>>) -> Self {
+			let tracker = Self::new();
+
+			tracker.refresh_snapshots.replace(refresh_snapshots);
+
+			tracker
 		}
 
 		fn with_state_update_error(message: &str) -> Self {
@@ -1261,7 +1412,11 @@ mod tests {
 		}
 
 		fn refresh_issues(&self, _issue_ids: &[String]) -> Result<Vec<TrackerIssue>> {
-			Ok(Vec::new())
+			if self.refresh_snapshots.borrow().is_empty() {
+				return Ok(Vec::new());
+			}
+
+			Ok(self.refresh_snapshots.borrow_mut().remove(0))
 		}
 
 		fn update_issue_state(&self, _issue_id: &str, state_id: &str) -> Result<()> {
@@ -1333,6 +1488,10 @@ mod tests {
 			labels: Vec::new(),
 			blockers: Vec::new(),
 		}
+	}
+
+	fn tracker_with_current_issue_snapshot(issue: &TrackerIssue) -> FakeTracker {
+		FakeTracker::with_refresh_snapshots(vec![vec![issue.clone()]])
 	}
 
 	fn sample_workflow() -> WorkflowDocument {
@@ -1644,8 +1803,8 @@ Use the tracker tools.
 
 	#[test]
 	fn adds_allowed_workflow_label() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
 		let response = DynamicToolHandler::handle_call(
@@ -1709,8 +1868,8 @@ Use the tracker tools.
 
 	#[test]
 	fn completion_disposition_allows_manual_attention_exit_without_review_handoff() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
@@ -1766,9 +1925,113 @@ Use the tracker tools.
 	}
 
 	#[test]
-	fn manual_attention_requires_explanatory_comment() {
+	fn turn_classification_allows_continuation_without_terminal_tracker_action() {
 		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+
+		assert_eq!(
+			DynamicToolHandler::classify_turn_completion(
+				&bridge,
+				"Still implementing; no terminal tracker action has been recorded yet."
+			)
+			.expect("missing terminal action should request continuation"),
+			TurnCompletionStatus::Continue
+		);
+	}
+
+	#[test]
+	fn turn_classification_rejects_opt_out_label_without_terminal_path() {
+		let mut opted_out_issue = sample_issue();
+
+		opted_out_issue.labels.push(TrackerLabel {
+			id: String::from("label-manual"),
+			name: String::from("maestro:manual-only"),
+		});
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![opted_out_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:manual-only" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"The lane opted out, but no terminal path was recorded.",
+		)
+		.expect_err("opt-out writes must not exit via a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_LABEL_ADD_TOOL_NAME));
+	}
+
+	#[test]
+	fn turn_classification_rejects_non_in_progress_transition_without_terminal_path() {
+		let mut todo_issue = sample_issue();
+
+		todo_issue.state =
+			TrackerState { id: String::from("state-todo"), name: String::from("Todo") };
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![todo_issue]]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "Todo" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"The issue moved back to Todo without a terminal path.",
+		)
+		.expect_err("non-In-Progress transitions must not exit via a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_TRANSITION_TOOL_NAME));
+	}
+
+	#[test]
+	fn manual_attention_requires_explanatory_comment() {
+		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
@@ -1827,9 +2090,100 @@ Use the tracker tools.
 	}
 
 	#[test]
-	fn completion_disposition_rejects_conflicting_review_handoff_and_manual_attention() {
-		let tracker = FakeTracker::new();
+	fn label_add_refreshes_issue_snapshot_before_merging_label_ids() {
+		let initial_issue = sample_issue();
+		let mut refreshed_issue = initial_issue.clone();
+
+		refreshed_issue.labels.push(TrackerLabel {
+			id: String::from("label-manual"),
+			name: String::from("maestro:manual-only"),
+		});
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![refreshed_issue]]);
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &initial_issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:needs-attention" }),
+		);
+
+		assert!(response.success);
+		assert_eq!(
+			tracker.label_updates.borrow().as_slice(),
+			[vec![String::from("label-manual"), String::from("label-needs")]]
+		);
+	}
+
+	#[test]
+	fn label_add_fails_when_refresh_returns_no_snapshot() {
+		let tracker = FakeTracker::with_refresh_snapshots(vec![Vec::new()]);
+		let workflow = sample_workflow();
 		let issue = sample_issue();
+		let bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:needs-attention" }),
+		);
+
+		assert!(!response.success);
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: format!(
+					"Failed to refresh issue `{}` before updating labels: tracker returned no current snapshot.",
+					issue.identifier
+				),
+			}]
+		);
+		assert!(tracker.label_updates.borrow().is_empty());
+	}
+
+	#[test]
+	fn turn_classification_rejects_continuation_blocking_write_when_refresh_returns_no_snapshot() {
+		let mut opted_out_issue = sample_issue();
+
+		opted_out_issue.labels.push(TrackerLabel {
+			id: String::from("label-manual"),
+			name: String::from("maestro:manual-only"),
+		});
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![opted_out_issue], Vec::new()]);
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:manual-only" }),
+		);
+
+		assert!(response.success);
+
+		let error = DynamicToolHandler::classify_turn_completion(
+			&bridge,
+			"The lane recorded a continuation-blocking tracker write without a terminal path.",
+		)
+		.expect_err("missing refresh snapshots must not allow a clean continuation boundary");
+
+		assert!(error.to_string().contains("without recording a terminal path"));
+		assert!(error.to_string().contains(ISSUE_LABEL_ADD_TOOL_NAME));
+	}
+
+	#[test]
+	fn completion_disposition_rejects_conflicting_review_handoff_and_manual_attention() {
+		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(vec![Ok(PullRequestDetails {
 			head_ref_name: String::from("x/maestro-pub-618"),
@@ -2066,8 +2420,8 @@ Use the tracker tools.
 
 	#[test]
 	fn terminal_finalize_accepts_matching_manual_attention_path() {
-		let tracker = FakeTracker::new();
 		let issue = sample_issue();
+		let tracker = tracker_with_current_issue_snapshot(&issue);
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
