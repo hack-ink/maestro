@@ -152,6 +152,8 @@ impl StateStore {
 			)?;
 
 			if state_gate_guard.blocked {
+				issue_claim_guard.unlock()?;
+
 				return Ok(false);
 			}
 
@@ -191,6 +193,8 @@ impl StateStore {
 			}
 
 			let Some(dispatch_slot_guard) = acquired_guard else {
+				issue_claim_guard.unlock()?;
+
 				return Ok(false);
 			};
 
@@ -356,8 +360,12 @@ impl StateStore {
 			return Ok(());
 		}
 
-		state.issue_claim_guards.remove(issue_id);
-		state.dispatch_slot_guards.remove(issue_id);
+		if let Some(guard) = state.issue_claim_guards.remove(issue_id) {
+			guard.unlock()?;
+		}
+		if let Some(guard) = state.dispatch_slot_guards.remove(issue_id) {
+			guard.unlock()?;
+		}
 
 		Ok(())
 	}
@@ -958,11 +966,25 @@ struct DispatchSlotConfig {
 struct IssueClaimGuard {
 	lock_file: File,
 }
+impl IssueClaimGuard {
+	fn unlock(self) -> Result<()> {
+		self.lock_file.unlock()?;
+
+		Ok(())
+	}
+}
 
 struct DispatchSlotGuard {
 	project_id: String,
 	slot_index: usize,
 	lock_file: File,
+}
+impl DispatchSlotGuard {
+	fn unlock(self) -> Result<()> {
+		self.lock_file.unlock()?;
+
+		Ok(())
+	}
 }
 
 #[derive(Default)]
@@ -1635,6 +1657,39 @@ mod tests {
 	}
 
 	#[test]
+	fn failed_shared_slot_attempt_releases_issue_claim_before_retry() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let store_one = StateStore::open_in_memory().expect("first store should open");
+		let store_two = StateStore::open_in_memory().expect("second store should open");
+
+		store_one
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 1)
+			.expect("first store should configure dispatch slot root");
+		store_two
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 1)
+			.expect("second store should configure dispatch slot root");
+
+		assert!(
+			store_one
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+				.expect("first store should acquire the only shared slot")
+		);
+		assert!(
+			!store_two
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
+				.expect("second store should fail while the only slot is busy")
+		);
+
+		store_one.clear_lease("PUB-101").expect("shared lease should clear");
+
+		assert!(
+			store_two
+				.try_acquire_lease("pubfi", "PUB-102", "run-2", IN_PROGRESS_STATE)
+				.expect("retry should succeed after the failed contender releases its issue claim")
+		);
+	}
+
+	#[test]
 	fn shared_issue_claim_blocks_duplicate_issue_across_process_local_stores() {
 		let temp_dir = TempDir::new().expect("tempdir should create");
 		let store_one = StateStore::open_in_memory().expect("first store should open");
@@ -1661,6 +1716,39 @@ mod tests {
 			store_two
 				.try_acquire_lease("pubfi", "PUB-102", "run-3", IN_PROGRESS_STATE)
 				.expect("another issue should still be able to use the remaining slot")
+		);
+	}
+
+	#[test]
+	fn shared_issue_claim_reopens_same_issue_after_clear_across_process_local_stores() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let store_one = StateStore::open_in_memory().expect("first store should open");
+		let store_two = StateStore::open_in_memory().expect("second store should open");
+
+		store_one
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
+			.expect("first store should configure dispatch slot root");
+		store_two
+			.configure_dispatch_slot_root("pubfi", temp_dir.path(), 2)
+			.expect("second store should configure dispatch slot root");
+
+		assert!(
+			store_one
+				.try_acquire_lease("pubfi", "PUB-101", "run-1", IN_PROGRESS_STATE)
+				.expect("first issue claim should succeed")
+		);
+		assert!(
+			!store_two
+				.try_acquire_lease("pubfi", "PUB-101", "run-2", IN_PROGRESS_STATE)
+				.expect("duplicate issue claim should be rejected while the first lease is active")
+		);
+
+		store_one.clear_lease("PUB-101").expect("shared issue claim should clear");
+
+		assert!(
+			store_two
+				.try_acquire_lease("pubfi", "PUB-101", "run-2", IN_PROGRESS_STATE)
+				.expect("same issue claim should reopen after the first lease clears")
 		);
 	}
 
