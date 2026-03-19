@@ -114,9 +114,11 @@
       "2026-03-19: review-prepare found and fixed one default-behavior regression: max_turns = 1 now preserves the pre-XY-157 invalid-completion failure path for nonterminal turns instead of silently converting them into clean continuation exits.",
       "2026-03-19: After that self-review repair, cargo make fmt, cargo make fmt-check, cargo make lint, cargo make test, cargo test continuation -- --nocapture, and git diff --check all passed in .workspaces/XY-157.",
       "2026-03-19: CI reproduced a merge-base drift against current origin/main: RunSummary gained issue_state and retry_project_slug on main after the lane branched from 5f261f2, so the continuation-boundary early return had to be rebased onto origin/main and switched to run_summary_from_issue_run(...) instead of a stale hand-written initializer.",
-      "2026-03-19: After rebasing XY-157 onto origin/main, cargo make fmt-check, cargo make lint, and cargo make test all passed again on the repaired head."
+      "2026-03-19: After rebasing XY-157 onto origin/main, cargo make fmt-check, cargo make lint, and cargo make test all passed again on the repaired head.",
+      "2026-03-19: review-repair for head 07633a8 reconciled the continuation prompt contract, rejected turn-1 clean yields when the startup tracker transition never happened, compared continuation eligibility against the resolved retry project slug, and refreshed tracker issue labels before cross-turn label writes.",
+      "2026-03-19: Fresh repair verification passed on the current working tree: cargo test continuation -- --nocapture, cargo test label_add_refreshes_issue_snapshot_before_merging_label_ids -- --nocapture, cargo make fmt-check, cargo make lint, cargo make test, and git diff --check."
     ],
-    "last_updated": "2026-03-19T03:39:00Z",
+    "last_updated": "2026-03-19T05:49:35Z",
     "replan_reason": null,
     "context_snapshot": {
       "issue_url": "https://linear.app/hack-ink/issue/XY-157/support-same-thread-continuation-turns-and-max-turns-in-maestro-agent",

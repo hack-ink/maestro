@@ -34,6 +34,9 @@ const PROBE_USER_INPUT: &str = "Call `echo_probe` with `{\\\"text\\\":\\\"PROBE_
 
 pub(crate) trait TurnContinuationGuard {
 	fn should_continue_turn(&self) -> Result<bool>;
+	fn validate_continuation_boundary(&self, _turn_count: u32) -> Result<()> {
+		Ok(())
+	}
 }
 
 #[derive(Clone)]
@@ -544,10 +547,7 @@ fn execute_app_server_run_inner(
 				if turn_count >= request.max_turns {
 					break (turn_id, final_output, true);
 				}
-
-				if let Some(continuation_guard) = request.continuation_guard
-					&& !continuation_guard.should_continue_turn()?
-				{
+				if continuation_boundary_reached(request.continuation_guard, turn_count)? {
 					break (turn_id, final_output, true);
 				}
 
@@ -600,6 +600,23 @@ fn reject_nonterminal_single_turn_completion(
 	eyre::bail!(
 		"Turn completed without a terminal completion path while same-thread continuation is disabled."
 	);
+}
+
+fn continuation_boundary_reached(
+	continuation_guard: Option<&dyn TurnContinuationGuard>,
+	turn_count: u32,
+) -> Result<bool> {
+	let Some(continuation_guard) = continuation_guard else {
+		return Ok(false);
+	};
+
+	if continuation_guard.should_continue_turn()? {
+		return Ok(false);
+	}
+
+	continuation_guard.validate_continuation_boundary(turn_count)?;
+
+	Ok(true)
 }
 
 fn build_turn_start_request(thread_id: &str, user_input: &str) -> TurnStartRequest {
@@ -910,6 +927,26 @@ mod tests {
 		}
 	}
 
+	struct YieldingContinuationGuard;
+	impl super::TurnContinuationGuard for YieldingContinuationGuard {
+		fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+			Ok(false)
+		}
+	}
+
+	struct RejectingContinuationGuard;
+	impl super::TurnContinuationGuard for RejectingContinuationGuard {
+		fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+			Ok(false)
+		}
+
+		fn validate_continuation_boundary(&self, turn_count: u32) -> crate::prelude::Result<()> {
+			Err(crate::prelude::eyre::eyre!(
+				"turn {turn_count} hit an invalid continuation boundary"
+			))
+		}
+	}
+
 	fn notification_message(method: &str, params: serde_json::Value) -> WireMessage {
 		WireMessage {
 			raw: params.to_string(),
@@ -1051,5 +1088,21 @@ mod tests {
 		.expect_err("single-turn mode should preserve terminal completion validation");
 
 		assert!(error.to_string().contains("terminal finalization missing"));
+	}
+
+	#[test]
+	fn continuation_boundary_reached_yields_when_guard_allows_it() {
+		assert!(
+			super::continuation_boundary_reached(Some(&YieldingContinuationGuard), 2)
+				.expect("yielding guard should allow a clean continuation boundary")
+		);
+	}
+
+	#[test]
+	fn continuation_boundary_reached_rejects_invalid_boundary() {
+		let error = super::continuation_boundary_reached(Some(&RejectingContinuationGuard), 1)
+			.expect_err("invalid continuation boundaries should surface as errors");
+
+		assert!(error.to_string().contains("turn 1 hit an invalid continuation boundary"));
 	}
 }

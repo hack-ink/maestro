@@ -449,16 +449,25 @@ impl<'a> TrackerToolBridge<'a> {
 			));
 		}
 
+		let current_issue = match self.refreshed_issue_snapshot() {
+			Ok(issue) => issue,
+			Err(error) => {
+				return DynamicToolCallResponse::failure(format!(
+					"Failed to refresh issue `{}` before updating labels: {error}",
+					self.issue.identifier
+				));
+			},
+		};
 		let manual_attention_label =
 			parsed.label == self.workflow.frontmatter().tracker().needs_attention_label();
-		let Some(label_id) = self.issue.label_id_for_name(&parsed.label) else {
+		let Some(label_id) = current_issue.label_id_for_name(&parsed.label) else {
 			return DynamicToolCallResponse::failure(format!(
 				"Label `{}` does not exist on issue `{}`.",
 				parsed.label, self.issue.identifier
 			));
 		};
 		let mut label_ids =
-			self.issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
+			current_issue.labels.iter().map(|label| label.id.clone()).collect::<Vec<_>>();
 
 		if label_ids.iter().any(|existing| existing == label_id) {
 			if manual_attention_label {
@@ -574,6 +583,13 @@ impl<'a> TrackerToolBridge<'a> {
 		}
 
 		states
+	}
+
+	fn refreshed_issue_snapshot(&self) -> crate::prelude::Result<TrackerIssue> {
+		let issue_ids = [self.issue.id.clone()];
+		let mut refreshed_issues = self.tracker.refresh_issues(&issue_ids)?;
+
+		Ok(refreshed_issues.pop().unwrap_or_else(|| self.issue.clone()))
 	}
 
 	fn validate_review_handoff_pr(
@@ -1239,6 +1255,7 @@ mod tests {
 		state_updates: RefCell<Vec<String>>,
 		label_updates: RefCell<Vec<Vec<String>>>,
 		comments: RefCell<Vec<String>>,
+		refresh_snapshots: RefCell<Vec<Vec<TrackerIssue>>>,
 		fail_state_update: RefCell<Option<String>>,
 		fail_label_update: RefCell<Option<String>>,
 		fail_comment: RefCell<Option<String>>,
@@ -1280,10 +1297,19 @@ mod tests {
 				state_updates: RefCell::new(Vec::new()),
 				label_updates: RefCell::new(Vec::new()),
 				comments: RefCell::new(Vec::new()),
+				refresh_snapshots: RefCell::new(Vec::new()),
 				fail_state_update: RefCell::new(None),
 				fail_label_update: RefCell::new(None),
 				fail_comment: RefCell::new(None),
 			}
+		}
+
+		fn with_refresh_snapshots(refresh_snapshots: Vec<Vec<TrackerIssue>>) -> Self {
+			let tracker = Self::new();
+
+			tracker.refresh_snapshots.replace(refresh_snapshots);
+
+			tracker
 		}
 
 		fn with_state_update_error(message: &str) -> Self {
@@ -1320,7 +1346,11 @@ mod tests {
 		}
 
 		fn refresh_issues(&self, _issue_ids: &[String]) -> Result<Vec<TrackerIssue>> {
-			Ok(Vec::new())
+			if self.refresh_snapshots.borrow().is_empty() {
+				return Ok(Vec::new());
+			}
+
+			Ok(self.refresh_snapshots.borrow_mut().remove(0))
 		}
 
 		fn update_issue_state(&self, _issue_id: &str, state_id: &str) -> Result<()> {
@@ -1909,6 +1939,32 @@ Use the tracker tools.
 			.expect_err("failed label writes must not count as manual attention");
 
 		assert!(error.to_string().contains("recorded neither"));
+	}
+
+	#[test]
+	fn label_add_refreshes_issue_snapshot_before_merging_label_ids() {
+		let initial_issue = sample_issue();
+		let mut refreshed_issue = initial_issue.clone();
+
+		refreshed_issue.labels.push(TrackerLabel {
+			id: String::from("label-manual"),
+			name: String::from("maestro:manual-only"),
+		});
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![refreshed_issue]]);
+		let workflow = sample_workflow();
+		let bridge = TrackerToolBridge::new(&tracker, &initial_issue, &workflow);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_LABEL_ADD_TOOL_NAME,
+			serde_json::json!({ "label": "maestro:needs-attention" }),
+		);
+
+		assert!(response.success);
+		assert_eq!(
+			tracker.label_updates.borrow().as_slice(),
+			[vec![String::from("label-manual"), String::from("label-needs")]]
+		);
 	}
 
 	#[test]

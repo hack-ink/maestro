@@ -141,9 +141,10 @@ struct PrepareIssueRunContext<'a, T> {
 
 struct IssueTurnContinuationGuard<'a, T> {
 	tracker: &'a T,
-	project: &'a ServiceConfig,
 	workflow: &'a WorkflowDocument,
 	issue_id: &'a str,
+	issue_identifier: &'a str,
+	retry_project_slug: &'a str,
 }
 impl<T> TurnContinuationGuard for IssueTurnContinuationGuard<'_, T>
 where
@@ -155,10 +156,31 @@ where
 		};
 		let tracker_policy = self.workflow.frontmatter().tracker();
 
-		Ok(issue.project_slug.as_deref() == Some(self.project.tracker().project_slug())
+		Ok(issue.project_slug.as_deref() == Some(self.retry_project_slug)
 			&& issue.state.name == tracker_policy.in_progress_state()
 			&& !issue.has_label(tracker_policy.opt_out_label())
 			&& !issue.has_label(tracker_policy.needs_attention_label()))
+	}
+
+	fn validate_continuation_boundary(&self, turn_count: u32) -> crate::prelude::Result<()> {
+		if turn_count != 1 {
+			return Ok(());
+		}
+
+		let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
+			return Ok(());
+		};
+		let in_progress = self.workflow.frontmatter().tracker().in_progress_state();
+
+		if issue.state.name != in_progress {
+			eyre::bail!(
+				"Turn 1 for issue `{}` ended without moving the tracker issue to `{}`; a clean continuation boundary is only valid after the startup transition succeeds.",
+				self.issue_identifier,
+				in_progress
+			);
+		}
+
+		Ok(())
 	}
 }
 
@@ -2494,8 +2516,13 @@ where
 			cwd: issue_run.workspace.path.clone(),
 		},
 	);
-	let continuation_guard =
-		IssueTurnContinuationGuard { tracker, project, workflow, issue_id: &issue_run.issue.id };
+	let continuation_guard = IssueTurnContinuationGuard {
+		tracker,
+		workflow,
+		issue_id: &issue_run.issue.id,
+		issue_identifier: &issue_run.issue.identifier,
+		retry_project_slug: &issue_run.retry_project_slug,
+	};
 	let run_result = agent::execute_app_server_run(
 		&AppServerRunRequest {
 			run_id: issue_run.run_id.clone(),
@@ -3092,7 +3119,7 @@ fn build_developer_instructions(
 	));
 
 	sections.push(format!(
-		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete, end the turn, or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- Never write to any other issue.",
+		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn.\n- Never write to any other issue.",
 		issue = issue_run.issue.identifier,
 		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 		comment_tool = ISSUE_COMMENT_TOOL_NAME,
@@ -3116,7 +3143,7 @@ fn build_user_input(
 	issue_run: &IssueRunPlan,
 ) -> String {
 	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not end the turn or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.",
+		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- If more work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` will decide whether to continue the lane.",
 		identifier = issue.identifier,
 		title = issue.title,
 		description = if issue.description.trim().is_empty() {
@@ -3637,7 +3664,7 @@ mod tests {
 	use time::OffsetDateTime;
 
 	use crate::{
-		agent::ACTIVE_RUN_IDLE_TIMEOUT,
+		agent::{ACTIVE_RUN_IDLE_TIMEOUT, TurnContinuationGuard},
 		config::ServiceConfig,
 		orchestrator::{
 			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
@@ -4220,7 +4247,7 @@ read_first = [{read_first}]
 		));
 
 		sections.push(format!(
-			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete, end the turn, or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- Never write to any other issue.",
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn.\n- Never write to any other issue.",
 			issue = issue_run.issue.identifier,
 			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
 			comment_tool = ISSUE_COMMENT_TOOL_NAME,
@@ -5516,8 +5543,36 @@ read_first = [{read_first}]
 		assert!(instructions.contains(ISSUE_REVIEW_HANDOFF_TOOL_NAME));
 		assert!(instructions.contains(ISSUE_TERMINAL_FINALIZE_TOOL_NAME));
 		assert!(instructions.contains("mark a saved plan `phase = \"done\"`"));
+		assert!(instructions.contains("you may end the turn without"));
 		assert!(!instructions.contains("WORKFLOW.md\n"));
 		assert!(!instructions.contains("Follow the repository policy."));
+	}
+
+	#[test]
+	fn initial_and_continuation_prompts_agree_on_nonterminal_yield_boundary() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			issue_state: String::from("In Progress"),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: String::from("PUB-101"),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: false,
+			},
+			retry_project_slug: String::from("pubfi"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+			attempt_number: 1,
+			run_id: String::from("pub-101-attempt-1-123"),
+			retry_budget_base: 0,
+		};
+		let user_input = orchestrator::build_user_input(&issue, &workflow, &issue_run);
+		let continuation_input = orchestrator::build_continuation_user_input(&issue);
+
+		assert!(user_input.contains("you may end the turn without"));
+		assert!(continuation_input.contains("you may end the turn without terminal finalization"));
+		assert!(!user_input.contains("Do not end the turn"));
 	}
 
 	#[test]
@@ -5553,6 +5608,63 @@ read_first = [{read_first}]
 		assert_eq!(
 			instructions,
 			expected_developer_instructions(&read_first_files, &workflow, &issue_run)
+		);
+	}
+
+	#[test]
+	fn continuation_guard_uses_resolved_retry_project_slug() {
+		let configured_project_slug = "maestro-pilot-ops-hardening-1a216b6d7100";
+		let resolved_project_slug = "1a216b6d7100";
+		let (_temp_dir, _config, workflow) =
+			temp_project_layout_with_tracker_project_slug(configured_project_slug);
+		let issue = sample_issue_with_project_slug_and_sort_fields(
+			"issue-1",
+			"PUB-101",
+			resolved_project_slug,
+			"In Progress",
+			&[],
+			Some(3),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let guard = orchestrator::IssueTurnContinuationGuard {
+			tracker: &tracker,
+			workflow: &workflow,
+			issue_id: &issue.id,
+			issue_identifier: &issue.identifier,
+			retry_project_slug: resolved_project_slug,
+		};
+
+		assert!(
+			guard
+				.should_continue_turn()
+				.expect("resolved project slug should keep the continuation active")
+		);
+	}
+
+	#[test]
+	fn continuation_guard_rejects_first_turn_without_startup_transition() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let guard = orchestrator::IssueTurnContinuationGuard {
+			tracker: &tracker,
+			workflow: &workflow,
+			issue_id: &issue.id,
+			issue_identifier: &issue.identifier,
+			retry_project_slug: issue
+				.project_slug
+				.as_deref()
+				.expect("sample issue should carry a project slug"),
+		};
+		let error = guard
+			.validate_continuation_boundary(1)
+			.expect_err("turn 1 should fail if the startup transition never happened");
+
+		assert!(
+			error.to_string().contains("ended without moving the tracker issue to `In Progress`")
 		);
 	}
 
