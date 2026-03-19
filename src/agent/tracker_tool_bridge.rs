@@ -689,22 +689,10 @@ impl<'a> TrackerToolBridge<'a> {
 		self.continuation_blocking_tracker_write.replace(Some(reason));
 	}
 
-	fn local_issue_remains_active(&self) -> bool {
-		self.local_issue_state_name.borrow().as_str()
-			== self.workflow.frontmatter().tracker().in_progress_state()
-			&& !*self.local_opt_out_requested.borrow()
-			&& !*self.manual_attention_requested.borrow()
-	}
-
 	fn continuation_blocking_write_reason(&self) -> crate::prelude::Result<Option<String>> {
 		let Some(reason) = self.continuation_blocking_tracker_write.borrow().clone() else {
 			return Ok(None);
 		};
-
-		if !self.local_issue_remains_active() {
-			return Ok(Some(reason));
-		}
-
 		let issue = match self.refreshed_issue_snapshot()? {
 			Some(issue) => issue,
 			None => return Ok(Some(reason)),
@@ -1520,6 +1508,15 @@ mod tests {
 		}
 	}
 
+	fn sample_in_progress_issue() -> TrackerIssue {
+		let mut issue = sample_issue();
+
+		issue.state =
+			TrackerState { id: String::from("state-progress"), name: String::from("In Progress") };
+
+		issue
+	}
+
 	fn tracker_with_current_issue_snapshot(issue: &TrackerIssue) -> FakeTracker {
 		FakeTracker::with_refresh_snapshots(vec![vec![issue.clone()]])
 	}
@@ -2059,10 +2056,13 @@ Use the tracker tools.
 	}
 
 	#[test]
-	fn turn_classification_rejects_opt_out_label_when_refresh_is_stale_active() {
-		let active_issue = sample_issue();
-		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![active_issue]]);
-		let issue = sample_issue();
+	fn turn_classification_allows_opt_out_label_when_refresh_reactivates_issue() {
+		let active_issue = sample_in_progress_issue();
+		let tracker = FakeTracker::with_refresh_snapshots(vec![
+			vec![active_issue.clone()],
+			vec![active_issue],
+		]);
+		let issue = sample_in_progress_issue();
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
@@ -2081,24 +2081,24 @@ Use the tracker tools.
 		);
 
 		assert!(response.success);
-
-		let error = DynamicToolHandler::classify_turn_completion(
-			&bridge,
-			"Tracker reread is stale, but the local opt-out write should still block continuation.",
-		)
-		.expect_err(
-			"local opt-out writes must remain blocking until the tracker reread catches up",
+		assert_eq!(
+			DynamicToolHandler::classify_turn_completion(
+				&bridge,
+				"Tracker reread reactivated the issue, so the continuation block should clear."
+			)
+			.expect("fresh active rereads should clear an opt-out continuation block"),
+			TurnCompletionStatus::Continue
 		);
-
-		assert!(error.to_string().contains("without recording a terminal path"));
-		assert!(error.to_string().contains(ISSUE_LABEL_ADD_TOOL_NAME));
 	}
 
 	#[test]
-	fn turn_classification_rejects_non_in_progress_transition_when_refresh_is_stale_active() {
-		let active_issue = sample_issue();
-		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![active_issue]]);
-		let issue = sample_issue();
+	fn turn_classification_allows_non_in_progress_transition_when_refresh_reactivates_issue() {
+		let active_issue = sample_in_progress_issue();
+		let tracker = FakeTracker::with_refresh_snapshots(vec![
+			vec![active_issue.clone()],
+			vec![active_issue],
+		]);
+		let issue = sample_in_progress_issue();
 		let workflow = sample_workflow();
 		let inspector = FakePullRequestInspector::new(Vec::new());
 		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
@@ -2117,17 +2117,14 @@ Use the tracker tools.
 		);
 
 		assert!(response.success);
-
-		let error = DynamicToolHandler::classify_turn_completion(
-			&bridge,
-			"Tracker reread is stale, but the local non-active transition should still block continuation.",
-		)
-		.expect_err(
-			"local stop transitions must remain blocking until the tracker reread catches up",
+		assert_eq!(
+			DynamicToolHandler::classify_turn_completion(
+				&bridge,
+				"Tracker reread reactivated the issue, so the local non-active transition no longer blocks continuation."
+			)
+			.expect("fresh active rereads should clear a local non-active transition block"),
+			TurnCompletionStatus::Continue
 		);
-
-		assert!(error.to_string().contains("without recording a terminal path"));
-		assert!(error.to_string().contains(ISSUE_TRANSITION_TOOL_NAME));
 	}
 
 	#[test]
