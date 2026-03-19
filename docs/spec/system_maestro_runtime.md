@@ -93,14 +93,19 @@ The runtime state machine is local to `maestro`. It is not a replacement for Lin
 | `discovered` | The issue was listed from Linear and passed the eligibility filter. | Acquire lease or skip on conflict. |
 | `leased` | `maestro` created the local lease and reserved the issue for one attempt. | Workspace bootstrap starts or lease fails. |
 | `workspace_ready` | The issue lane exists locally and is ready for execution. | `app-server` session starts. |
-| `running` | `maestro` has an active `app-server` thread and turn for the issue. | Turn completes, transport fails, or policy violation occurs. |
+| `running` | `maestro` has an active `app-server` thread for the issue and may start one or more bounded turns on that thread. | A terminal completion path resolves, the bounded continuation budget is exhausted, the issue becomes non-active, transport fails, or policy violation occurs. |
 | `validating` | Agent execution finished and post-run validation commands are running. | Validation passes or fails. |
 | `retry_wait` | The daemon is holding a queued retry entry for the leased lane after a clean continuation exit or a failure with remaining retry budget. | The queued retry revalidates and starts, the queued issue becomes non-active and the claim is released, or operator intervention cancels retries. |
 | `needs_attention` | Retry budget is exhausted or human intervention is required. | Human updates the issue and it becomes eligible again. |
 | `succeeded` | The attempt finished, validations passed, and the success writeback was committed to Linear. | Local cleanup begins. |
 | `closed` | Local cleanup finished and the lease is gone. | None. |
 
-After the `app-server` turn completes, `maestro` must resolve exactly one completion disposition before deciding whether the lane enters `validating`, `needs_attention`, or a retry path:
+After each `app-server` turn completes, `maestro` must resolve one continuation or completion outcome before deciding whether to start another turn on the same thread, enter `validating`, enter `needs_attention`, or yield to a retry path:
+
+- `continue`
+  - The turn ended without a terminal tracker path.
+  - If the repo-owned `execution.max_turns` budget still has room and the issue remains active for the leased lane, `maestro` starts another turn on the same thread and workspace.
+  - If the issue is no longer active or the turn budget is exhausted, the worker exits cleanly and the daemon-level continuation path decides whether to re-enter later or release the claim.
 
 - `review_handoff`
   - The agent recorded a valid PR-backed review handoff and did not request human attention.
@@ -109,7 +114,7 @@ After the `app-server` turn completes, `maestro` must resolve exactly one comple
   - The agent explicitly requested human attention by adding `maestro:needs-attention` and did not also record review handoff.
   - `maestro` skips success writeback and post-run validation commands, then enters the human-required failure flow immediately.
 - invalid completion signaling
-  - If the turn records both signals or neither signal, the attempt is invalid and must fail rather than guessing a completion path.
+  - If the turn records both signals, or records one terminal path but fails to finalize it explicitly, the attempt is invalid and must fail rather than guessing a completion path.
 
 ## Tracker write ownership
 
@@ -196,7 +201,7 @@ Retryable failures with remaining budget:
 
 - Keep the issue in `In Progress`, typically through an agent-authored retry comment.
 - Queue the retry in daemon memory rather than immediately redispatching inside the same poll tick.
-- Clean worker exits schedule a short continuation retry.
+- Clean worker exits after a nonterminal continuation boundary schedule a short continuation retry.
 - Abnormal worker exits schedule exponential backoff capped by `execution.max_retry_backoff_ms`.
 - When the queued issue disappears, reaches a terminal state, or otherwise becomes non-active before the retry fires, release the queued claim instead of redispatching it.
 

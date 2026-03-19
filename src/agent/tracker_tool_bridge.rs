@@ -29,6 +29,14 @@ static LOCAL_GIT_REPO_INSPECTOR: LocalGitRepoInspector = LocalGitRepoInspector;
 pub(crate) trait DynamicToolHandler {
 	fn tool_specs(&self) -> Vec<DynamicToolSpec>;
 	fn handle_call(&self, tool_name: &str, arguments: Value) -> DynamicToolCallResponse;
+	fn classify_turn_completion(
+		&self,
+		final_output: &str,
+	) -> crate::prelude::Result<TurnCompletionStatus> {
+		self.validate_turn_completion(final_output)?;
+
+		Ok(TurnCompletionStatus::Complete)
+	}
 	fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
 		Ok(())
 	}
@@ -726,6 +734,51 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 		self.handle_call_inner(tool_name, arguments)
 	}
 
+	fn classify_turn_completion(
+		&self,
+		_final_output: &str,
+	) -> crate::prelude::Result<TurnCompletionStatus> {
+		let Some(review_context) = self.review_context.as_ref() else {
+			eyre::bail!(
+				"Review handoff context is unavailable for issue `{}`.",
+				self.issue.identifier
+			);
+		};
+		let manual_attention_requested = *self.manual_attention_requested.borrow();
+		let manual_attention_comment_recorded = *self.manual_attention_comment_recorded.borrow();
+		let review_handoff_recorded = self.pending_review_handoff.borrow().is_some();
+
+		match (
+			manual_attention_requested,
+			manual_attention_comment_recorded,
+			review_handoff_recorded,
+		) {
+			(false, false, false) => Ok(TurnCompletionStatus::Continue),
+			(false, false, true) | (true, true, false) => {
+				self.validate_turn_completion("")?;
+
+				Ok(TurnCompletionStatus::Complete)
+			},
+			(true, false, false) => eyre::bail!(
+				"Run `{}` requested human attention with label `{}`, but issue `{}` never recorded the required explanatory comment.",
+				review_context.run_id,
+				self.workflow.frontmatter().tracker().needs_attention_label(),
+				self.issue.identifier
+			),
+			(true, _, true) => eyre::bail!(
+				"Run `{}` recorded both `issue_review_handoff` and label `{}`. Use exactly one final handoff path.",
+				review_context.run_id,
+				self.workflow.frontmatter().tracker().needs_attention_label()
+			),
+			(false, true, false) | (false, true, true) => eyre::bail!(
+				"Run `{}` recorded a human-attention comment for issue `{}`, but never recorded label `{}`.",
+				review_context.run_id,
+				self.issue.identifier,
+				self.workflow.frontmatter().tracker().needs_attention_label()
+			),
+		}
+	}
+
 	fn validate_turn_completion(&self, _final_output: &str) -> crate::prelude::Result<()> {
 		let completion_path = self.completion_disposition()?;
 		let Some(finalized_path) = *self.finalized_completion_path.borrow() else {
@@ -763,6 +816,12 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 
 		Ok(())
 	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnCompletionStatus {
+	Continue,
+	Complete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1167,7 +1226,7 @@ mod tests {
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 			ISSUE_TRANSITION_TOOL_NAME, LocalRepoDetails, LocalRepoInspector, PullRequestDetails,
 			PullRequestInspector, ReviewHandoffContext, RunCompletionDisposition,
-			TrackerToolBridge,
+			TrackerToolBridge, TurnCompletionStatus,
 		},
 		prelude::{Result, eyre},
 		tracker::{
@@ -1763,6 +1822,32 @@ Use the tracker tools.
 		.expect_err("turn completion should reject missing terminal tracker actions");
 
 		assert!(error.to_string().contains("recorded neither a PR-backed review handoff"));
+	}
+
+	#[test]
+	fn turn_classification_allows_continuation_without_terminal_tracker_action() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context(),
+			&inspector,
+			&local_repo_inspector,
+		);
+
+		assert_eq!(
+			DynamicToolHandler::classify_turn_completion(
+				&bridge,
+				"Still implementing; no terminal tracker action has been recorded yet."
+			)
+			.expect("missing terminal action should request continuation"),
+			TurnCompletionStatus::Continue
+		);
 	}
 
 	#[test]

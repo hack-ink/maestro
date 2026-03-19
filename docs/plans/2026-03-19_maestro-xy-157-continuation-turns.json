@@ -1,0 +1,126 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-157-continuation-turns",
+    "goal": "Implement Symphony-aligned same-thread continuation turns for Maestro-owned runs so one active issue can advance through multiple turns in the same thread and workspace under an explicit repo-owned turn budget.",
+    "success_criteria": [
+      "The workflow contract accepts a repo-owned max_turns setting with the current single-turn behavior preserved by default.",
+      "The runtime can continue an active issue in the same thread and workspace across multiple turns without reopening a fresh issue lane for every turn.",
+      "Between continuation turns, Maestro re-checks tracker state and orchestration guards and stops cleanly when the issue becomes inactive, the turn budget is exhausted, or existing completion or failure rules fire.",
+      "Specs, operator docs, and targeted tests cover continuation-turn behavior, stop conditions, and defaulting."
+    ],
+    "constraints": [
+      "Use openai/symphony README and SPEC as the only external design standard.",
+      "Keep the lifecycle boundary at the current PR-backed In Review handoff; do not fold post-review automation into this issue.",
+      "Preserve current behavior when max_turns is unset or set to 1.",
+      "Use cargo make for repo-native verification commands."
+    ],
+    "defaults": {
+      "external_reference": "openai/symphony",
+      "issue": "XY-157",
+      "workspace": ".workspaces/XY-157"
+    },
+    "tasks": [
+      {
+        "id": "task-1",
+        "title": "Pin the continuation-turn contract",
+        "status": "done",
+        "objective": "Capture the exact local code paths and spec surfaces that currently enforce one-thread-one-turn execution, then translate the relevant Symphony continuation semantics into a concrete Maestro contract for max_turns, same-thread reuse, and stop conditions.",
+        "inputs": [
+          "src/agent/app_server.rs",
+          "src/orchestrator.rs",
+          "src/workflow.rs",
+          "docs/spec/system_maestro_runtime.md",
+          "docs/spec/system_app_server_contract.md",
+          "WORKFLOW.md",
+          "openai/symphony README.md and SPEC.md"
+        ],
+        "outputs": [
+          "A stable implementation target for max_turns and continuation-turn boundaries",
+          "A confirmed list of local files that must change"
+        ],
+        "verification": [
+          "The target contract distinguishes same-thread continuation from retry-driven fresh dispatch.",
+          "The target contract keeps the current In Review handoff boundary unchanged."
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "task-2",
+        "title": "Implement same-thread continuation turns",
+        "status": "done",
+        "objective": "Extend the workflow and runtime so one issue run can reuse the same app-server thread and workspace across multiple turns, with explicit turn-budget handling and guard checks between turns.",
+        "inputs": [
+          "task-1 outputs"
+        ],
+        "outputs": [
+          "Updated workflow contract and parser",
+          "Updated app-server run loop and orchestrator logic",
+          "Updated tests for same-thread continuation and stop conditions"
+        ],
+        "verification": [
+          "Default behavior remains single-turn when max_turns is unset or 1.",
+          "Continuation runs stop when the issue becomes inactive, the turn budget is exhausted, or existing completion or failure rules fire."
+        ],
+        "depends_on": [
+          "task-1"
+        ]
+      },
+      {
+        "id": "task-3",
+        "title": "Sync docs and validate the lane",
+        "status": "done",
+        "objective": "Update the runtime and operator docs to reflect continuation turns, then run the repo-native verification stack and record the resulting evidence.",
+        "inputs": [
+          "task-2 outputs"
+        ],
+        "outputs": [
+          "Updated docs/spec and operator guidance",
+          "Verification evidence recorded in the saved plan"
+        ],
+        "verification": [
+          "cargo make fmt-check",
+          "cargo make lint",
+          "cargo make test"
+        ],
+        "depends_on": [
+          "task-2"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "Symphony alignment requires changing the continuation model shape or stop conditions materially.",
+        "The implementation needs lifecycle semantics beyond the current In Review boundary.",
+        "The saved task graph proves insufficient once the runtime hooks for same-thread continuation are inspected in detail."
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-19: Created clone-backed lane .workspaces/XY-157 because the root checkout still has a user-owned WORKFLOW.md modification.",
+      "2026-03-19: Baseline cargo make fmt-check passed in .workspaces/XY-157.",
+      "2026-03-19: Probed the current runtime and app-server surfaces; execute_app_server_run_inner still performs exactly one thread/start and one turn/start per run, while current docs describe retry-driven continuation rather than same-thread turn continuation.",
+      "2026-03-19: Reconfirmed openai/symphony README.md and SPEC.md as the sole external design standard for the continuation-turn contract.",
+      "2026-03-19: Added execution.max_turns to the workflow contract with a default of 1, explicit validation against zero, and checked-in documentation/examples covering the new setting.",
+      "2026-03-19: Extended the app-server run loop to support bounded same-thread multi-turn execution, with continuation classification delegated through the dynamic tool handler and guarded between-turn continuation checks.",
+      "2026-03-19: Updated tracker completion signaling so nonterminal same-thread continuation is distinct from terminal review-handoff or needs-attention completion, preserving XY-162 terminal finalization requirements.",
+      "2026-03-19: Updated Maestro runtime, app-server, workflow, and pilot docs to describe same-thread continuation turns and clean continuation-boundary exits.",
+      "2026-03-19: review-prepare found and fixed one default-behavior regression: max_turns = 1 now preserves the pre-XY-157 invalid-completion failure path for nonterminal turns instead of silently converting them into clean continuation exits.",
+      "2026-03-19: After that self-review repair, cargo make fmt, cargo make fmt-check, cargo make lint, cargo make test, cargo test continuation -- --nocapture, and git diff --check all passed in .workspaces/XY-157.",
+      "2026-03-19: CI reproduced a merge-base drift against current origin/main: RunSummary gained issue_state and retry_project_slug on main after the lane branched from 5f261f2, so the continuation-boundary early return had to be rebased onto origin/main and switched to run_summary_from_issue_run(...) instead of a stale hand-written initializer.",
+      "2026-03-19: After rebasing XY-157 onto origin/main, cargo make fmt-check, cargo make lint, and cargo make test all passed again on the repaired head."
+    ],
+    "last_updated": "2026-03-19T03:39:00Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "issue_url": "https://linear.app/hack-ink/issue/XY-157/support-same-thread-continuation-turns-and-max-turns-in-maestro-agent",
+      "design_standard": "openai/symphony README.md + SPEC.md"
+    }
+  }
+}

@@ -24,6 +24,7 @@ use crate::{
 		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 		ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
 		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,
+		TurnContinuationGuard,
 	},
 	config::{self, ServiceConfig},
 	prelude::eyre,
@@ -136,6 +137,29 @@ struct PrepareIssueRunContext<'a, T> {
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
+}
+
+struct IssueTurnContinuationGuard<'a, T> {
+	tracker: &'a T,
+	project: &'a ServiceConfig,
+	workflow: &'a WorkflowDocument,
+	issue_id: &'a str,
+}
+impl<T> TurnContinuationGuard for IssueTurnContinuationGuard<'_, T>
+where
+	T: IssueTracker,
+{
+	fn should_continue_turn(&self) -> crate::prelude::Result<bool> {
+		let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
+			return Ok(false);
+		};
+		let tracker_policy = self.workflow.frontmatter().tracker();
+
+		Ok(issue.project_slug.as_deref() == Some(self.project.tracker().project_slug())
+			&& issue.state.name == tracker_policy.in_progress_state()
+			&& !issue.has_label(tracker_policy.opt_out_label())
+			&& !issue.has_label(tracker_policy.needs_attention_label()))
+	}
 }
 
 #[derive(Debug)]
@@ -2470,8 +2494,9 @@ where
 			cwd: issue_run.workspace.path.clone(),
 		},
 	);
-
-	agent::execute_app_server_run(
+	let continuation_guard =
+		IssueTurnContinuationGuard { tracker, project, workflow, issue_id: &issue_run.issue.id };
+	let run_result = agent::execute_app_server_run(
 		&AppServerRunRequest {
 			run_id: issue_run.run_id.clone(),
 			issue_id: issue_run.issue.id.clone(),
@@ -2485,9 +2510,12 @@ where
 			model: model.clone(),
 			personality: workflow.frontmatter().agent().personality().map(str::to_owned),
 			service_tier: workflow.frontmatter().agent().service_tier().map(str::to_owned),
+			max_turns: workflow.frontmatter().execution().max_turns(),
 			timeout: ACTIVE_RUN_IDLE_TIMEOUT,
+			continuation_user_input: Some(build_continuation_user_input(&issue_run.issue)),
 			activity_marker_path: Some(issue_run.workspace.path.clone()),
 			dynamic_tool_handler: Some(&tracker_tool_bridge),
+			continuation_guard: Some(&continuation_guard),
 		},
 		state_store,
 	)
@@ -2499,6 +2527,22 @@ where
 			error,
 		)
 	})?;
+
+	if run_result.continuation_pending {
+		tracing::info!(
+			project_id = project.id(),
+			issue_id = issue_run.issue.id,
+			issue = issue_run.issue.identifier,
+			run_id = issue_run.run_id,
+			attempt = issue_run.attempt_number,
+			thread_id = run_result.thread_id,
+			turn_count = run_result.turn_count,
+			max_turns = workflow.frontmatter().execution().max_turns(),
+			"Run reached a clean continuation boundary and will rely on the next bounded re-entry."
+		);
+
+		return Ok(run_summary_from_issue_run(project.id(), issue_run));
+	}
 
 	match tracker_tool_bridge.completion_disposition()? {
 		RunCompletionDisposition::ReviewHandoff => {
@@ -3091,6 +3135,13 @@ fn build_user_input(
 		branch = issue_run.workspace.branch_name,
 		success = workflow.frontmatter().tracker().success_state(),
 		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+	)
+}
+
+fn build_continuation_user_input(issue: &TrackerIssue) -> String {
+	format!(
+		"Continue working on Linear issue {identifier} in the current thread and workspace.\n\nContinuation checklist:\n- Resume from the current repository state instead of restarting broad discovery.\n- Keep changes scoped to the same issue lane.\n- If the implementation is review-ready, finish the PR-backed tracker handoff before ending the turn.\n- If the issue requires manual attention, record the manual-attention tracker path before ending the turn.\n- If more work still remains after this turn, you may end the turn without terminal finalization and Maestro will decide whether to continue.",
+		identifier = issue.identifier
 	)
 }
 

@@ -107,6 +107,9 @@ impl WorkflowFrontmatter {
 		if self.execution.max_attempts == 0 {
 			eyre::bail!("`execution.max_attempts` must be greater than zero.");
 		}
+		if self.execution.max_turns == 0 {
+			eyre::bail!("`execution.max_turns` must be greater than zero.");
+		}
 		if self.execution.max_retry_backoff_ms == 0 {
 			eyre::bail!("`execution.max_retry_backoff_ms` must be greater than zero.");
 		}
@@ -256,6 +259,8 @@ impl Default for WorkflowAgent {
 pub struct WorkflowExecution {
 	#[serde(default = "default_max_attempts")]
 	max_attempts: u32,
+	#[serde(default = "default_max_turns")]
+	max_turns: u32,
 	#[serde(default = "default_max_retry_backoff_ms")]
 	max_retry_backoff_ms: u64,
 	max_concurrent_agents: Option<u32>,
@@ -268,6 +273,11 @@ impl WorkflowExecution {
 	/// Maximum automatic attempts before human attention is required.
 	pub fn max_attempts(&self) -> u32 {
 		self.max_attempts
+	}
+
+	/// Maximum same-thread turns per bounded run before Maestro yields cleanly.
+	pub fn max_turns(&self) -> u32 {
+		self.max_turns
 	}
 
 	/// Maximum failure-retry backoff in milliseconds.
@@ -326,6 +336,7 @@ impl Default for WorkflowExecution {
 	fn default() -> Self {
 		Self {
 			max_attempts: default_max_attempts(),
+			max_turns: default_max_turns(),
 			max_retry_backoff_ms: default_max_retry_backoff_ms(),
 			max_concurrent_agents: None,
 			max_concurrent_agents_by_state: HashMap::new(),
@@ -431,6 +442,10 @@ fn default_max_attempts() -> u32 {
 	3
 }
 
+fn default_max_turns() -> u32 {
+	1
+}
+
 fn default_max_retry_backoff_ms() -> u64 {
 	300_000
 }
@@ -464,6 +479,7 @@ project_slug = "pubfi"
 
 [execution]
 max_attempts = 3
+max_turns = 4
 max_retry_backoff_ms = 300000
 max_concurrent_agents = 2
 max_concurrent_agents_by_state = { "In Progress" = 1 }
@@ -480,6 +496,7 @@ Use `cargo make`.
 		assert_eq!(document.frontmatter().tracker().provider(), TrackerProvider::Linear);
 		assert_eq!(document.frontmatter().tracker().project_slug(), "pubfi");
 		assert_eq!(document.frontmatter().execution().max_attempts(), 3);
+		assert_eq!(document.frontmatter().execution().max_turns(), 4);
 		assert_eq!(document.frontmatter().execution().max_retry_backoff_ms(), 300_000);
 		assert_eq!(document.frontmatter().execution().max_concurrent_agents(), 2);
 		assert_eq!(
@@ -582,6 +599,7 @@ approval_policy = "never"
 
 [execution]
 max_attempts = 5
+max_turns = 6
 max_retry_backoff_ms = 120000
 validation_commands = ["cargo make test"]
 

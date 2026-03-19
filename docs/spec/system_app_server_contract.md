@@ -4,7 +4,7 @@ Purpose: Define the direct `codex app-server` protocol boundary used by the `mae
 Status: normative
 Read this when: You are implementing or validating `maestro`'s direct `codex app-server` integration, including transport, handshake, request flow, or dynamic tools.
 Not this document: The runtime state machine, downstream `WORKFLOW.md` policy, or operator runbooks.
-Defines: The supported transport, protocol source-of-truth boundary, required request and notification flow, and the MVP contract for `initialize`, `thread/start`, and `turn/start`.
+Defines: The supported transport, protocol source-of-truth boundary, required request and notification flow, and the MVP contract for `initialize`, `thread/start`, and repeated `turn/start` calls on one thread.
 
 ## Transport
 
@@ -67,8 +67,9 @@ The follow-up alignment phase should also record tool-related requests and notif
 2. Send `initialize`.
 3. Send `thread/start`.
 4. Send `turn/start`.
-5. Consume notifications until the turn reaches a terminal outcome.
-6. Persist the local run journal and classify the result.
+5. Consume notifications until that turn reaches a terminal outcome.
+6. If the repo-owned continuation policy allows another same-thread turn, send another `turn/start` on the same thread.
+7. Persist the local run journal and classify the bounded run result.
 
 When dynamic tools are enabled, `maestro` must also:
 
@@ -136,6 +137,8 @@ The MVP turn start request owns these fields:
 `maestro` should send an explicit supported `effort` value instead of inheriting a potentially incompatible desktop default from the parent Codex runtime.
 
 `TurnStartResponse` returns the accepted turn object.
+
+Within one bounded Maestro run attempt, the runtime may start multiple turns on the same thread. Thread-level settings remain stable from `thread/start`; continuation policy such as `execution.max_turns` and between-turn tracker revalidation stays in Maestro, not in the app-server protocol.
 
 ## Notification handling
 

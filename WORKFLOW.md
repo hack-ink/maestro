@@ -20,6 +20,7 @@ personality = "pragmatic"
 
 [execution]
 max_attempts = 3
+max_turns = 3
 max_retry_backoff_ms = 300000
 max_concurrent_agents = 1
 max_concurrent_agents_by_state = { "In Progress" = 1 }

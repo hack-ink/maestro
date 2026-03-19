@@ -128,6 +128,11 @@ Supported keys:
   - type: integer
   - optional
   - default: `3`
+- `max_turns`
+  - type: integer
+  - optional
+  - default: `1`
+  - note: caps same-thread continuation turns inside one bounded run attempt; when omitted or set to `1`, Maestro preserves the current single-turn behavior
 - `max_retry_backoff_ms`
   - type: integer
   - optional

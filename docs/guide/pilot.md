@@ -246,7 +246,8 @@ Use tracker comments for run ids, attempts, and failure class; use the retained 
 ## Re-running after failure
 
 - If the run is still retryable, leave the issue in `In Progress` and let `maestro` retry.
-- Retryable daemon retries now split into a short continuation retry after a clean worker exit and a capped exponential failure backoff after an abnormal worker exit.
+- If `execution.max_turns` is greater than `1`, one bounded worker may now reuse the same app-server thread for multiple turns before it yields.
+- Retryable daemon retries now split into a short continuation retry after a clean nonterminal worker exit and a capped exponential failure backoff after an abnormal worker exit.
 - If the run moved back to `Todo` with `maestro:needs-attention`, inspect the workspace, fix the blocking problem, clear `maestro:needs-attention`, and then move the issue back into a startable state for another automated attempt.
 - If the issue should never be automated again, add `maestro:manual-only`.
 
