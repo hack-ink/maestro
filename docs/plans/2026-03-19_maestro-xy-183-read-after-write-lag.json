@@ -6,6 +6,8 @@
     "success_criteria": [
       "Turn-1 continuation validation accepts a locally successful startup transition even when the immediate tracker reread is stale.",
       "Continuation-blocking local stop writes remain blocking until tracker rereads confirm the issue is active again.",
+      "Daemon retry scheduling distinguishes a clean continuation boundary from other successful exits, so completed review handoffs never enqueue continuation retries.",
+      "Continuation retry retention matches only the exact original stale startable state instead of any configured startable state.",
       "Targeted tests cover stale reread cases for both startup-transition and stop-write paths.",
       "Repo-native verification passes on the repaired lane."
     ],
@@ -78,6 +80,46 @@
         "depends_on": [
           "task-2"
         ]
+      },
+      {
+        "id": "task-4",
+        "title": "Separate continuation outcome from generic success",
+        "status": "done",
+        "objective": "Carry an explicit continuation outcome signal through the daemon child-exit path so continuation retries are only scheduled for clean continuation boundaries.",
+        "inputs": [
+          "PR #19 review thread discussion_r2959424049",
+          "Current RunSummary / child-exit retry scheduling flow"
+        ],
+        "outputs": [
+          "A dedicated continuation outcome signal used by child-exit retry scheduling",
+          "Regression coverage proving review-handoff success does not reopen the same thread"
+        ],
+        "verification": [
+          "Targeted cargo tests for child-exit continuation scheduling versus completed review handoff"
+        ],
+        "depends_on": [
+          "task-3"
+        ]
+      },
+      {
+        "id": "task-5",
+        "title": "Narrow stale continuation snapshot matching",
+        "status": "done",
+        "objective": "Retain continuation retries only when the tracker reread still matches the exact original startable state captured at continuation start.",
+        "inputs": [
+          "PR #19 review thread discussion_r2959424054",
+          "Current retry retention policy and queued retry fallback logic"
+        ],
+        "outputs": [
+          "A persisted exact stale-state token for continuation retries",
+          "Regression coverage proving later moves to other startable states do not reopen the old thread"
+        ],
+        "verification": [
+          "Targeted cargo tests for continuation retry retention across multiple configured startable states"
+        ],
+        "depends_on": [
+          "task-4"
+        ]
       }
     ],
     "replan_policy": {
@@ -109,9 +151,14 @@
       "2026-03-19: A later Codex review on PR #19 flagged that continuation retries still only preserved stale-startable tracker snapshots through turn 1, so long-lived read-after-write lag could fall back to a fresh attempt/run_id instead of a retained continuation retry.",
       "2026-03-19: Extended continuation tolerance across turns and reused `preferred_issue_state = In Progress` as the retry-retention signal so continuation retries still queue and dispatch when the tracker reread remains in a configured startable state.",
       "2026-03-19: Hardened `retry_entry_is_temporarily_blocked()` to apply concurrency gating against the continuation's planned dispatch state rather than the stale tracker state, which keeps stale-startable continuation retries queued when an `In Progress` per-state cap blocks dispatch.",
-      "2026-03-19: Added regressions for schedule_retry_after_child_exit_retains_continuation_retry_for_stale_startable_issue, due_continuation_retry_dispatches_when_issue_still_reflects_startable_state, due_continuation_retry_stays_queued_when_stale_startable_issue_hits_in_progress_state_cap, and continuation_guard_allows_turn_two_after_local_startup_transition_on_stale_reread; reran cargo make fmt-check, cargo make lint, cargo make test, and git diff --check on the repaired diff."
+      "2026-03-19: Added regressions for schedule_retry_after_child_exit_retains_continuation_retry_for_stale_startable_issue, due_continuation_retry_dispatches_when_issue_still_reflects_startable_state, due_continuation_retry_stays_queued_when_stale_startable_issue_hits_in_progress_state_cap, and continuation_guard_allows_turn_two_after_local_startup_transition_on_stale_reread; reran cargo make fmt-check, cargo make lint, cargo make test, and git diff --check on the repaired diff.",
+      "2026-03-19: A later Codex review on PR #19 exposed two deeper contract bugs on head `18a7492`: child-exit retry scheduling still inferred continuation from any successful exit, and stale continuation retention still treated any configured startable state as the original snapshot.",
+      "2026-03-19: Reopened execution on XY-183 to separate continuation outcome signaling from generic success and to persist the exact original startable state for stale continuation retry retention.",
+      "2026-03-19: Added explicit `continuation_pending` run status plumbing through child-exit retry scheduling so only clean continuation boundaries enqueue `RetryKind::Continuation`; completed successful exits now release their retry claim instead of reopening the same thread.",
+      "2026-03-19: Persisted `continuation_initial_issue_state` on queued continuation retries and narrowed stale continuation retention to exact startable-state matches, so a move from `Todo` to another configured startable state like `Backlog` no longer resurrects the old thread.",
+      "2026-03-19: Fresh verification on the repaired diff passed: cargo make fmt-check, cargo make lint, cargo make test, git diff --check, plus targeted continuation scheduling/retention regressions."
     ],
-    "last_updated": "2026-03-19T11:13:31Z",
+    "last_updated": "2026-03-19T15:48:55Z",
     "replan_reason": null,
     "context_snapshot": {
       "late_review_head": "7908d7b4f642aeadf374b6eb71ba5d5c4d13ce15",

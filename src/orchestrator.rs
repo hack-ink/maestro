@@ -38,6 +38,7 @@ pub(crate) const DEFAULT_STATUS_RUN_LIMIT: usize = 10;
 
 const CONTINUATION_RETRY_DELAY_MS: u64 = 1_000;
 const FAILURE_RETRY_BASE_DELAY_MS: u64 = 10_000;
+const CONTINUATION_PENDING_RUN_STATUS: &str = "continuation_pending";
 const TERMINAL_GUARDED_RUN_STATUS: &str = "terminal_guarded";
 const TERMINAL_GUARD_MARKER_FILE: &str = ".maestro-terminal-guarded";
 
@@ -47,6 +48,7 @@ pub(crate) struct RunOnceRequest<'a> {
 	pub(crate) dry_run: bool,
 	pub(crate) preferred_issue_id: Option<&'a str>,
 	pub(crate) preferred_issue_state: Option<&'a str>,
+	pub(crate) preferred_initial_issue_state: Option<&'a str>,
 	pub(crate) preferred_lease_acquired: bool,
 	pub(crate) preferred_issue_claim_fd: Option<i32>,
 	pub(crate) preferred_dispatch_slot_fd: Option<i32>,
@@ -64,6 +66,7 @@ struct RunSummary {
 	issue_id: String,
 	issue_identifier: String,
 	issue_state: String,
+	initial_issue_state: String,
 	retry_project_slug: String,
 	dispatch_mode: IssueDispatchMode,
 	branch_name: String,
@@ -102,6 +105,7 @@ struct RunCycleRequest<'a> {
 	dry_run: bool,
 	preferred_issue_id: Option<&'a str>,
 	preferred_issue_state: Option<&'a str>,
+	preferred_initial_issue_state: Option<&'a str>,
 	preferred_lease_acquired: bool,
 	preferred_issue_claim_fd: Option<i32>,
 	preferred_dispatch_slot_fd: Option<i32>,
@@ -116,6 +120,7 @@ struct SpawnRunOnceChildRequest<'a> {
 	config_path: &'a Path,
 	preferred_issue_id: &'a str,
 	preferred_issue_state: &'a str,
+	preferred_initial_issue_state: Option<&'a str>,
 	dispatch_mode: IssueDispatchMode,
 	preferred_run_id: &'a str,
 	preferred_attempt_number: i64,
@@ -137,6 +142,7 @@ struct PrepareIssueRunContext<'a, T> {
 	lease_preacquired: bool,
 	dispatch_mode: IssueDispatchMode,
 	preferred_issue_state: Option<&'a str>,
+	preferred_initial_issue_state: Option<&'a str>,
 	preferred_run_identity: Option<PreferredRunIdentity<'a>>,
 	preferred_retry_budget_base: Option<i64>,
 }
@@ -273,6 +279,7 @@ struct DaemonRunChild {
 	issue_id: String,
 	run_id: String,
 	attempt_number: i64,
+	initial_issue_state: String,
 	retry_project_slug: String,
 	from_retry_queue: bool,
 	workflow: WorkflowDocument,
@@ -295,6 +302,7 @@ struct PreferredRunIdentity<'a> {
 struct RetryEntry {
 	issue_id: String,
 	retry_project_slug: String,
+	continuation_initial_issue_state: Option<String>,
 	kind: RetryKind,
 	attempt: u32,
 	ready_at: Instant,
@@ -399,6 +407,12 @@ struct OperatorWorkspaceStatus {
 	workspace_path: String,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RetryIssueStateHint<'a> {
+	preferred_issue_state: Option<&'a str>,
+	preferred_initial_issue_state: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IssueDispatchMode {
 	Normal,
@@ -412,7 +426,7 @@ impl IssueDispatchMode {
 		project: &ServiceConfig,
 		workflow: &WorkflowDocument,
 		state_store: &StateStore,
-		preferred_issue_state: Option<&str>,
+		hint: RetryIssueStateHint<'_>,
 	) -> crate::prelude::Result<bool> {
 		match self {
 			Self::Normal => Ok(issue_passes_dispatch_policy(issue, workflow)),
@@ -422,7 +436,7 @@ impl IssueDispatchMode {
 				project,
 				workflow,
 				state_store,
-				preferred_issue_state,
+				hint,
 			),
 		}
 	}
@@ -444,6 +458,7 @@ struct TargetIssueRunContext<'a, T> {
 	state_store: &'a StateStore,
 	issue_id: &'a str,
 	preferred_issue_state: Option<&'a str>,
+	preferred_initial_issue_state: Option<&'a str>,
 	dry_run: bool,
 	lease_preacquired: bool,
 	preferred_issue_claim_fd: Option<i32>,
@@ -462,7 +477,7 @@ enum RetryKind {
 
 enum RetryDispatchDecision {
 	Blocked { excluded_issue_ids: Vec<String> },
-	Dispatch(RunSummary),
+	Dispatch(Box<RunSummary>),
 	Continue,
 }
 
@@ -537,6 +552,7 @@ pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()
 		dry_run: request.dry_run,
 		preferred_issue_id: request.preferred_issue_id,
 		preferred_issue_state: request.preferred_issue_state,
+		preferred_initial_issue_state: request.preferred_initial_issue_state,
 		preferred_lease_acquired: request.preferred_lease_acquired,
 		preferred_issue_claim_fd: request.preferred_issue_claim_fd,
 		preferred_dispatch_slot_fd: request.preferred_dispatch_slot_fd,
@@ -842,6 +858,7 @@ where
 						},
 						child_ref,
 						&daemon_child.retry_project_slug,
+						&daemon_child.initial_issue_state,
 						exit_status,
 					)?;
 				}
@@ -1045,6 +1062,7 @@ where
 				issue_id: summary.issue_id,
 				run_id: summary.run_id,
 				attempt_number: summary.attempt_number,
+				initial_issue_state: summary.initial_issue_state,
 				retry_project_slug: summary.retry_project_slug,
 				from_retry_queue,
 				workflow: workflow.clone(),
@@ -1095,6 +1113,7 @@ fn spawn_planned_daemon_child(
 		config_path,
 		preferred_issue_id: summary.issue_id.as_str(),
 		preferred_issue_state: summary.issue_state.as_str(),
+		preferred_initial_issue_state: Some(summary.initial_issue_state.as_str()),
 		dispatch_mode: summary.dispatch_mode,
 		preferred_run_id: summary.run_id.as_str(),
 		preferred_attempt_number: summary.attempt_number,
@@ -1121,7 +1140,7 @@ where
 	T: IssueTracker,
 {
 	match plan_due_retry_run(retry_queue, tracker, project, workflow, state_store)? {
-		RetryDispatchDecision::Dispatch(summary) => Ok(Some((summary, true))),
+		RetryDispatchDecision::Dispatch(summary) => Ok(Some((*summary, true))),
 		RetryDispatchDecision::Blocked { excluded_issue_ids } => {
 			let excluded_issue_ids =
 				excluded_issue_ids.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1208,6 +1227,12 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 		.stderr(Stdio::inherit())
 		.args(["--issue-id", request.preferred_issue_id])
 		.args(["--issue-state", request.preferred_issue_state])
+		.args(
+			request
+				.preferred_initial_issue_state
+				.map(|state| vec!["--initial-issue-state", state])
+				.unwrap_or_default(),
+		)
 		.args([
 			"--dispatch-mode",
 			match request.dispatch_mode {
@@ -1274,8 +1299,13 @@ where
 			project,
 			workflow,
 			state_store,
-			(first_entry.kind == RetryKind::Continuation)
-				.then_some(workflow.frontmatter().tracker().in_progress_state()),
+			RetryIssueStateHint {
+				preferred_issue_state: (first_entry.kind == RetryKind::Continuation)
+					.then_some(workflow.frontmatter().tracker().in_progress_state()),
+				preferred_initial_issue_state: first_entry
+					.continuation_initial_issue_state
+					.as_deref(),
+			},
 		)? {
 			retry_queue.release(&first_entry.issue_id);
 
@@ -1310,6 +1340,7 @@ where
 			state_store,
 			issue_id: &entry.issue_id,
 			preferred_issue_state,
+			preferred_initial_issue_state: entry.continuation_initial_issue_state.as_deref(),
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -1332,7 +1363,7 @@ where
 			continue;
 		};
 
-		return Ok(RetryDispatchDecision::Dispatch(summary));
+		return Ok(RetryDispatchDecision::Dispatch(Box::new(summary)));
 	}
 
 	Ok(blocked_issue_id.map_or(RetryDispatchDecision::Continue, |_issue_id| {
@@ -1365,7 +1396,10 @@ where
 		project,
 		workflow,
 		state_store,
-		preferred_issue_state,
+		RetryIssueStateHint {
+			preferred_issue_state,
+			preferred_initial_issue_state: entry.continuation_initial_issue_state.as_deref(),
+		},
 	)?;
 
 	if !retained {
@@ -1390,6 +1424,7 @@ fn schedule_retry_after_child_exit<T>(
 	context: ChildExitRetryContext<'_, T>,
 	child: ChildRunRef<'_>,
 	retry_project_slug: &str,
+	initial_issue_state: &str,
 	exit_status: ExitStatus,
 ) -> crate::prelude::Result<()>
 where
@@ -1411,8 +1446,9 @@ where
 
 		return Ok(());
 	};
-	let preferred_issue_state = exit_status
-		.success()
+	let continuation_pending =
+		exit_status.success() && run_attempt.status() == CONTINUATION_PENDING_RUN_STATUS;
+	let preferred_issue_state = continuation_pending
 		.then_some(context.workflow.frontmatter().tracker().in_progress_state());
 
 	if !issue_passes_retry_retention_policy(
@@ -1421,18 +1457,26 @@ where
 		context.project,
 		context.workflow,
 		context.state_store,
-		preferred_issue_state,
+		RetryIssueStateHint {
+			preferred_issue_state,
+			preferred_initial_issue_state: continuation_pending.then_some(initial_issue_state),
+		},
 	)? {
 		context.retry_queue.release(issue_id);
 
 		return Ok(());
 	}
 
-	let (kind, attempt) = if exit_status.success() {
+	let (kind, attempt, continuation_initial_issue_state) = if continuation_pending {
 		(
 			RetryKind::Continuation,
 			u32::try_from(run_attempt.attempt_number()).unwrap_or(u32::MAX).max(1),
+			Some(initial_issue_state.to_owned()),
 		)
+	} else if exit_status.success() {
+		context.retry_queue.release(issue_id);
+
+		return Ok(());
 	} else {
 		let retry_budget_attempts =
 			u32::try_from(context.state_store.retry_budget_attempt_count(issue_id)?)
@@ -1445,7 +1489,7 @@ where
 			return Ok(());
 		}
 
-		(RetryKind::Failure, retry_budget_attempts)
+		(RetryKind::Failure, retry_budget_attempts, None)
 	};
 	let delay = retry_delay(kind, attempt.max(1), context.workflow);
 
@@ -1460,6 +1504,7 @@ where
 	context.retry_queue.upsert(RetryEntry {
 		issue_id: issue_id.to_owned(),
 		retry_project_slug: retry_project_slug.to_owned(),
+		continuation_initial_issue_state,
 		kind,
 		attempt: attempt.max(1),
 		ready_at: Instant::now() + delay,
@@ -1915,6 +1960,7 @@ fn run_configured_cycle(
 			state_store: request.state_store,
 			issue_id,
 			preferred_issue_state: request.preferred_issue_state,
+			preferred_initial_issue_state: request.preferred_initial_issue_state,
 			dry_run: request.dry_run,
 			lease_preacquired: request.preferred_lease_acquired,
 			preferred_issue_claim_fd: request.preferred_issue_claim_fd,
@@ -2059,7 +2105,7 @@ where
 		project,
 		workflow,
 		state_store,
-		None,
+		RetryIssueStateHint::default(),
 	)? {
 		return Ok(None);
 	}
@@ -2075,6 +2121,7 @@ where
 			lease_preacquired: false,
 			dispatch_mode,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
 		},
@@ -2151,7 +2198,10 @@ where
 		context.project,
 		context.workflow,
 		context.state_store,
-		context.preferred_issue_state,
+		RetryIssueStateHint {
+			preferred_issue_state: context.preferred_issue_state,
+			preferred_initial_issue_state: context.preferred_initial_issue_state,
+		},
 	)? {
 		return Ok(None);
 	}
@@ -2181,6 +2231,7 @@ where
 			lease_preacquired: context.lease_preacquired,
 			dispatch_mode: context.dispatch_mode,
 			preferred_issue_state: context.preferred_issue_state,
+			preferred_initial_issue_state: context.preferred_initial_issue_state,
 			preferred_run_identity: context.preferred_run_identity,
 			preferred_retry_budget_base: context.preferred_retry_budget_base,
 		},
@@ -2307,7 +2358,10 @@ where
 			context.project,
 			context.workflow,
 			context.state_store,
-			context.preferred_issue_state,
+			RetryIssueStateHint {
+				preferred_issue_state: context.preferred_issue_state,
+				preferred_initial_issue_state: context.preferred_initial_issue_state,
+			},
 		)?;
 
 		if !dispatch_allowed {
@@ -2555,7 +2609,7 @@ where
 
 	match result {
 		Ok(summary) => {
-			persist_issue_run_outcome(state_store, &issue_run.run_id, true)?;
+			persist_issue_run_outcome(state_store, &issue_run.run_id, &summary)?;
 
 			tracing::info!(
 				project_id = project.id(),
@@ -2571,7 +2625,8 @@ where
 			Ok(summary)
 		},
 		Err(error) => {
-			persist_issue_run_outcome(state_store, &issue_run.run_id, false)?;
+			state_store.update_run_status(&issue_run.run_id, "failed")?;
+
 			handle_failure(tracker, project, workflow, state_store, &issue_run, &error)?;
 
 			Err(error)
@@ -2582,9 +2637,12 @@ where
 fn persist_issue_run_outcome(
 	state_store: &StateStore,
 	run_id: &str,
-	succeeded: bool,
+	summary: &RunSummary,
 ) -> crate::prelude::Result<()> {
-	state_store.update_run_status(run_id, if succeeded { "succeeded" } else { "failed" })
+	state_store.update_run_status(
+		run_id,
+		if summary.continuation_pending { CONTINUATION_PENDING_RUN_STATUS } else { "succeeded" },
+	)
 }
 
 fn execute_issue_run_inner<T>(
@@ -2699,6 +2757,7 @@ fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> Run
 		issue_id: issue_run.issue.id.clone(),
 		issue_identifier: issue_run.issue.identifier.clone(),
 		issue_state: issue_run.issue_state.clone(),
+		initial_issue_state: issue_run.issue.state.name.clone(),
 		retry_project_slug: issue_run.retry_project_slug.clone(),
 		dispatch_mode: issue_run.dispatch_mode,
 		branch_name: issue_run.workspace.branch_name.clone(),
@@ -3022,7 +3081,7 @@ fn issue_passes_retry_dispatch_policy(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
-	preferred_issue_state: Option<&str>,
+	hint: RetryIssueStateHint<'_>,
 ) -> crate::prelude::Result<bool> {
 	issue_passes_retry_retention_policy(
 		issue,
@@ -3030,7 +3089,7 @@ fn issue_passes_retry_dispatch_policy(
 		project,
 		workflow,
 		state_store,
-		preferred_issue_state,
+		hint,
 	)
 }
 
@@ -3040,11 +3099,13 @@ fn issue_passes_retry_retention_policy(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
-	preferred_issue_state: Option<&str>,
+	hint: RetryIssueStateHint<'_>,
 ) -> crate::prelude::Result<bool> {
 	let tracker_policy = workflow.frontmatter().tracker();
-	let continuation_startable_snapshot = preferred_issue_state
+	let continuation_startable_snapshot = hint
+		.preferred_issue_state
 		.is_some_and(|state| state == tracker_policy.in_progress_state())
+		&& hint.preferred_initial_issue_state.is_some_and(|state| state == issue.state.name)
 		&& tracker_policy.startable_states().iter().any(|candidate| candidate == &issue.state.name);
 
 	Ok(issue.project_slug.as_deref() == Some(retry_project_slug)
@@ -3427,7 +3488,7 @@ where
 			project,
 			workflow,
 			state_store,
-			None,
+			RetryIssueStateHint::default(),
 		)? {
 			match state::read_run_activity_marker_snapshot(&workspace.path)? {
 				Some(marker) if workspace_activity_marker_is_fresh(&marker, now_unix_epoch) => {
@@ -4326,6 +4387,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4550,6 +4612,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4580,6 +4643,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4613,6 +4677,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4654,6 +4719,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4697,6 +4763,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4735,6 +4802,7 @@ read_first = [{read_first}]
 			state_store: &state_store,
 			issue_id: &issue.id,
 			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
 			dry_run: true,
 			lease_preacquired: false,
 			preferred_issue_claim_fd: None,
@@ -4779,6 +4847,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("failure retry should schedule");
@@ -4826,6 +4895,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 4 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("first failure after continuations should still schedule");
@@ -4874,6 +4944,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 3 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -4894,7 +4965,7 @@ read_first = [{read_first}]
 		let run_id = "run-1";
 
 		state_store
-			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.record_run_attempt(run_id, &issue.id, 1, orchestrator::CONTINUATION_PENDING_RUN_STATUS)
 			.expect("run attempt should record");
 
 		let exit_status =
@@ -4911,6 +4982,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("continuation retry should schedule");
@@ -4932,7 +5004,7 @@ read_first = [{read_first}]
 		let run_id = "run-1";
 
 		state_store
-			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.record_run_attempt(run_id, &issue.id, 1, orchestrator::CONTINUATION_PENDING_RUN_STATUS)
 			.expect("run attempt should record");
 
 		let exit_status =
@@ -4949,6 +5021,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("continuation retry should tolerate a stale startable tracker reread");
@@ -4958,6 +5031,44 @@ read_first = [{read_first}]
 
 		assert_eq!(entry.kind, orchestrator::RetryKind::Continuation);
 		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_skips_retry_for_completed_successful_run() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-1";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "succeeded")
+			.expect("completed run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 0"]).status().expect("success exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
+			exit_status,
+		)
+		.expect("completed successful runs should not schedule another retry");
+
+		assert!(
+			!retry_queue.entries.contains_key(&issue.id),
+			"successful review-handoff style exits must not reopen the same run as a continuation"
+		);
 	}
 
 	#[test]
@@ -4971,7 +5082,7 @@ read_first = [{read_first}]
 		let run_id = "run-1";
 
 		state_store
-			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.record_run_attempt(run_id, &issue.id, 1, orchestrator::CONTINUATION_PENDING_RUN_STATUS)
 			.expect("run attempt should record");
 
 		let exit_status =
@@ -4988,6 +5099,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("retry scheduling should stay resilient to project lookup blips");
@@ -5016,7 +5128,7 @@ read_first = [{read_first}]
 		let run_id = "run-1";
 
 		state_store
-			.record_run_attempt(run_id, &issue.id, 1, "running")
+			.record_run_attempt(run_id, &issue.id, 1, orchestrator::CONTINUATION_PENDING_RUN_STATUS)
 			.expect("run attempt should record");
 
 		let exit_status =
@@ -5033,6 +5145,7 @@ read_first = [{read_first}]
 			},
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			"pubfi",
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("retry scheduling should release lanes that moved to another project");
@@ -5073,6 +5186,7 @@ read_first = [{read_first}]
 				attempt_number: 1,
 			},
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -5108,6 +5222,7 @@ read_first = [{read_first}]
 			issue_id: issue.id.clone(),
 			run_id: String::from("planned-run"),
 			attempt_number: 1,
+			initial_issue_state: issue.state.name.clone(),
 			retry_project_slug: issue
 				.project_slug
 				.clone()
@@ -5123,6 +5238,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -5161,6 +5277,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5199,6 +5316,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5254,6 +5372,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5334,6 +5453,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5344,6 +5464,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(120),
@@ -5398,6 +5519,7 @@ read_first = [{read_first}]
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: stale_issue.id.clone(),
 			retry_project_slug: String::from("pubfi"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now(),
@@ -5408,6 +5530,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now(),
@@ -5458,6 +5581,7 @@ read_first = [{read_first}]
 		retry_queue.upsert(orchestrator::RetryEntry {
 			issue_id: issue.id.clone(),
 			retry_project_slug: String::from("pubfi"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5494,6 +5618,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5526,6 +5651,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: Some(issue.state.name.clone()),
 			kind: orchestrator::RetryKind::Continuation,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -5546,6 +5672,50 @@ read_first = [{read_first}]
 		assert_eq!(next_run.0.issue_identifier, issue.identifier);
 		assert_eq!(next_run.0.issue_state, "In Progress");
 		assert_eq!(next_run.0.dispatch_mode, orchestrator::IssueDispatchMode::Retry);
+	}
+
+	#[test]
+	fn due_continuation_retry_releases_when_issue_moves_to_different_startable_state() {
+		let workflow = WorkflowDocument::parse_markdown(
+			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Continuation retry policy.\n", 1)
+				.replace(
+					"startable_states = [\"Todo\"]",
+					"startable_states = [\"Todo\", \"Backlog\"]",
+				),
+		)
+		.expect("workflow should parse");
+		let (_temp_dir, config, _default_workflow) = temp_project_layout();
+		let issue = sample_issue("Backlog", &[]);
+		let tracker = FakeTracker::new(vec![issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: Some(String::from("Todo")),
+			kind: orchestrator::RetryKind::Continuation,
+			attempt: 1,
+			ready_at: Instant::now(),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
+		assert!(
+			retry_queue.is_empty(),
+			"continuation retention should reject a different startable state instead of reopening the old thread"
+		);
 	}
 
 	#[test]
@@ -5579,6 +5749,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: Some(issue.state.name.clone()),
 			kind: orchestrator::RetryKind::Continuation,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -5619,6 +5790,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -5652,6 +5824,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -5688,6 +5861,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -5752,6 +5926,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -5794,6 +5969,7 @@ read_first = [{read_first}]
 				issue_id: String::from("issue-1"),
 				issue_identifier: String::from("PUB-101"),
 				issue_state: String::from("In Progress"),
+				initial_issue_state: String::from("Todo"),
 				retry_project_slug: String::from("pubfi"),
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				branch_name: String::from("x/pubfi-pub-101"),
@@ -5813,6 +5989,7 @@ read_first = [{read_first}]
 			issue_id: String::from("issue-1"),
 			issue_identifier: String::from("PUB-101"),
 			issue_state: String::from("In Progress"),
+			initial_issue_state: String::from("In Progress"),
 			retry_project_slug: String::from("pubfi"),
 			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 			branch_name: String::from("x/pubfi-pub-101"),
@@ -6922,6 +7099,7 @@ read_first = [{read_first}]
 				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: None,
 				preferred_retry_budget_base: None,
 			},
@@ -6975,6 +7153,7 @@ read_first = [{read_first}]
 				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: None,
 				preferred_retry_budget_base: None,
 			},
@@ -7016,6 +7195,7 @@ read_first = [{read_first}]
 				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: None,
 				preferred_retry_budget_base: Some(0),
 			},
@@ -7050,6 +7230,7 @@ read_first = [{read_first}]
 				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 					run_id: "planned-run",
 					attempt_number: 1,
@@ -7138,6 +7319,7 @@ read_first = [{read_first}]
 				lease_preacquired: true,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 					run_id: "planned-run",
 					attempt_number: 1,
@@ -7229,6 +7411,7 @@ read_first = [{read_first}]
 				lease_preacquired: true,
 				dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 					run_id: "planned-run",
 					attempt_number: 1,
@@ -7301,6 +7484,7 @@ read_first = [{read_first}]
 			state_store: &child_store,
 			issue_id: &issue.id,
 			preferred_issue_state: Some("In Progress"),
+			preferred_initial_issue_state: None,
 			dry_run: false,
 			lease_preacquired: true,
 			preferred_issue_claim_fd: Some(child_issue_claim.into_raw_fd()),
@@ -7359,6 +7543,7 @@ read_first = [{read_first}]
 				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
 					run_id: "planned-run",
 					attempt_number: 1,
@@ -8052,6 +8237,7 @@ read_first = [{read_first}]
 				lease_preacquired: false,
 				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
 				preferred_run_identity: None,
 				preferred_retry_budget_base: None,
 			},
@@ -8134,9 +8320,7 @@ read_first = [{read_first}]
 		state_store
 			.record_run_attempt("run-1", "issue-1", 1, "succeeded")
 			.expect("run attempt should record");
-
-		orchestrator::persist_issue_run_outcome(&state_store, "run-1", false)
-			.expect("failed outcome should persist");
+		state_store.update_run_status("run-1", "failed").expect("failed outcome should persist");
 
 		assert_eq!(
 			state_store

@@ -85,6 +85,9 @@ struct RunCommand {
 	/// Reuse a daemon-planned issue state for an issue-targeted child run.
 	#[arg(long, value_name = "STATE", hide = true, requires = "issue_id")]
 	issue_state: Option<String>,
+	/// Reuse the original tracker state captured when the daemon planned the run.
+	#[arg(long, value_name = "STATE", hide = true, requires = "issue_id")]
+	initial_issue_state: Option<String>,
 	/// Override the dispatch policy for an issue-targeted run.
 	#[arg(long, value_name = "MODE", value_enum, hide = true, requires = "issue_id")]
 	dispatch_mode: Option<RunIssueDispatchMode>,
@@ -132,6 +135,7 @@ impl RunCommand {
 			dry_run: self.dry_run,
 			preferred_issue_id: self.issue_id.as_deref(),
 			preferred_issue_state: self.issue_state.as_deref(),
+			preferred_initial_issue_state: self.initial_issue_state.as_deref(),
 			preferred_lease_acquired: self.lease_preacquired,
 			preferred_issue_claim_fd: self.issue_claim_fd,
 			preferred_dispatch_slot_fd: self.dispatch_slot_fd,
@@ -252,6 +256,7 @@ mod tests {
 				dry_run: true,
 				issue_id: None,
 				issue_state: None,
+				initial_issue_state: None,
 				lease_preacquired: false,
 				issue_claim_fd: None,
 				dispatch_slot_fd: None,
@@ -277,6 +282,7 @@ mod tests {
 				dry_run: false,
 				issue_id: Some(_),
 				issue_state: None,
+				initial_issue_state: None,
 				lease_preacquired: false,
 				issue_claim_fd: None,
 				dispatch_slot_fd: None,
@@ -303,6 +309,8 @@ mod tests {
 			"normal",
 			"--issue-state",
 			"Todo",
+			"--initial-issue-state",
+			"Todo",
 			"--run-id",
 			"mae-1-attempt-2-123",
 			"--attempt-number",
@@ -320,6 +328,7 @@ mod tests {
 				dry_run: false,
 				issue_id: Some(_),
 				issue_state: Some(_),
+				initial_issue_state: Some(_),
 				lease_preacquired: false,
 				issue_claim_fd: None,
 				dispatch_slot_fd: None,
