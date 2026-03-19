@@ -67,8 +67,8 @@ The post-`In Review` lifecycle is expressed in lane phases. These phases refine,
 | `review_repair` | `resume_retained_lane` | Actionable review feedback exists and the retained lane still belongs to the same issue and PR lineage | A new repaired head is pushed and review is re-requested for that head, human intervention becomes required, or cancellation is explicit |
 | `ready_to_land` | `ready_to_land` | Required approvals are satisfied, blocking review work is absent, checks are green, and the PR is mergeable | Landing begins, signals fall back to wait or repair, or human intervention becomes required |
 | `landing` | `continue` | The runtime has committed to executing the merge for the current lane | Merge is recorded, landing fails into a resumable deterministic tail step, or human intervention becomes required |
-| `delivery_closeout` | `continue` | Merge already happened for the lane's authoritative anchor and tracker closeout has not yet completed | Tracker closeout succeeds, the lane blocks on contradictory closeout state, or cancellation is explicit |
-| `cleanup` | `continue` | Merge and delivery closeout are authoritative and only workspace or branch cleanup remains | The retained workspace and lane branch state are clean, or cleanup blocks on conflicting local evidence |
+| `delivery_closeout` | `continue` | Merge already happened for the lane's authoritative anchor and tracker closeout has not yet completed | Tracker closeout succeeds, the lane blocks on contradictory closeout state, or human intervention becomes required |
+| `cleanup` | `continue` | Either (a) merge and delivery closeout are authoritative and only workspace or branch cleanup remains, or (b) explicit pre-merge cancellation is authoritative and only deterministic retained-lane cleanup remains | The retained workspace and lane branch state are clean, or cleanup blocks on conflicting local evidence |
 
 `manual_intervention_required` is not a normal progress phase. It is the mandatory stop outcome whenever the owned-lane policy says automation must stop.
 
@@ -134,19 +134,29 @@ While in `delivery_closeout`:
 
 - the merge anchor is authoritative
 - tracker closeout runs before GitHub mirror updates
-- the tracker issue transitions from `In Review` to the completed state
+- the tracker issue transitions from `In Review` to the successful completed state
+
+Successful completed-state resolution must be deterministic:
+
+1. If repository workflow policy exposes exactly one terminal state intended for successful completion, use it.
+2. Otherwise, if the terminal-state set contains an exact `Done` state, use `Done`.
+3. Otherwise, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target.
 
 If merge is authoritative but closeout fails due to a deterministic infrastructure problem with no contradictory state, the runtime may resume `delivery_closeout` later within the same owned lane. If state is contradictory, the runtime must stop for human intervention.
 
 ### `cleanup`
 
-`cleanup` is the final deterministic tail stage. It removes retained workspace and lane branch state only after merge and closeout are already authoritative.
+`cleanup` is the final deterministic tail stage. It removes retained workspace and lane branch state only after one of these terminal ownership conditions is authoritative:
+
+- successful delivery: merge and delivery closeout are already authoritative
+- explicit pre-merge cancellation: the tracker or PR state ended owned-lane progress before merge, and no contradictory retained-lane evidence remains
 
 `cleanup` must not begin while:
 
-- review work is still pending
-- merge is not yet authoritative
-- delivery closeout is incomplete
+- review work is still pending for a lane whose owned progress has not been explicitly canceled
+- neither successful delivery nor explicit cancellation has ended owned-lane progress
+- successful delivery is the governing path but merge is not yet authoritative
+- successful delivery is the governing path and delivery closeout is incomplete
 
 ## Transition rules
 
@@ -154,10 +164,13 @@ If merge is authoritative but closeout fails due to a deterministic infrastructu
 2. `review_wait -> review_repair` when authoritative review feedback requires a code change and the retained lane is still reusable.
 3. `review_repair -> review_wait` after a repaired head is pushed and review is requested for that exact head.
 4. `review_wait -> ready_to_land` when approvals, checks, and mergeability all satisfy repository policy for the current lane head.
-5. `ready_to_land -> landing` when the runtime begins the merge step.
-6. `landing -> delivery_closeout` when merge is authoritative for the lane's anchor.
-7. `delivery_closeout -> cleanup` when the tracker closeout succeeds and only deterministic local cleanup remains.
-8. `cleanup -> finished` when the retained workspace and lane branch state are clean.
+5. `ready_to_land -> review_wait` when approvals, checks, or mergeability regress before merge starts and no actionable code change is required.
+6. `ready_to_land -> review_repair` when actionable review repair reappears before merge starts.
+7. `ready_to_land -> landing` when the runtime begins the merge step.
+8. `landing -> delivery_closeout` when merge is authoritative for the lane's anchor.
+9. `delivery_closeout -> cleanup` when the tracker closeout succeeds and only deterministic local cleanup remains.
+10. `review_wait`, `review_repair`, or `ready_to_land` may transition directly to `cleanup` when explicit pre-merge cancellation ends owned-lane progress and only deterministic local cleanup remains.
+11. `cleanup -> finished` when the retained workspace and lane branch state are clean.
 
 At any phase, contradictory signals or exhausted repair/convergence budgets force `manual_intervention_required`.
 
@@ -193,7 +206,8 @@ Examples:
 When cancellation is authoritative:
 
 - the runtime must stop autonomous review follow-up and landing
-- cleanup may proceed only if the cancellation state is explicit and no contradictory retained-lane evidence remains
+- `review_wait`, `review_repair`, and `ready_to_land` may transition directly to `cleanup` only if the cancellation state is explicit and no contradictory retained-lane evidence remains
+- `landing` and `delivery_closeout` must not reinterpret an already-authoritative merge as cancellation; contradictory post-merge cancellation signals require `manual_intervention_required`
 - the runtime must not reopen or reinterpret the lane automatically
 
 ## Ownership boundaries

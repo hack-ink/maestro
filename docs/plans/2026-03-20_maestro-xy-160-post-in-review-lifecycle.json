@@ -101,9 +101,10 @@
       "2026-03-19: Reviewed the current Maestro handoff boundary in system_maestro_runtime, the owned-lane decision classes in system_maestro_owned_lane_policy, the local workflow adapter contracts in AGENTS.md and checked-in skills, and the latest openai/symphony README.md plus SPEC.md as the only external design standard.",
       "2026-03-19: Added docs/spec/system_maestro_post_review_lifecycle.md to define the normative lane phases after PR-backed In Review handoff: review_wait, review_repair, ready_to_land, landing, delivery_closeout, and cleanup, along with retry, cancellation, and manual-intervention boundaries.",
       "2026-03-19: Updated docs/spec/index.md to route readers to the new post-In-Review lifecycle spec and mapped the accepted implementation split onto XY-173, XY-174, XY-175, and XY-177.",
-      "2026-03-19: Fresh verification passed: cargo make fmt-check, python3 /Users/xavier/.codex/skills/plan-writing/scripts/validate_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json, python3 /Users/xavier/.codex/skills/plan-execution/scripts/read_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json, git diff --check."
+      "2026-03-19: Fresh verification passed: cargo make fmt-check, python3 /Users/xavier/.codex/skills/plan-writing/scripts/validate_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json, python3 /Users/xavier/.codex/skills/plan-execution/scripts/read_plan_contract.py --path docs/plans/2026-03-20_maestro-xy-160-post-in-review-lifecycle.json, git diff --check.",
+      "2026-03-20: Review-repair updated the lifecycle spec to add an explicit pre-merge cancellation path into cleanup, define deterministic successful completed-state resolution for delivery_closeout, and add the missing ready_to_land downgrade transitions back to review_wait or review_repair."
     ],
-    "last_updated": "2026-03-19T17:00:22Z",
+    "last_updated": "2026-03-20T07:52:00Z",
     "replan_reason": null,
     "context_snapshot": {
       "design_standard": "openai/symphony README.md + SPEC.md",
