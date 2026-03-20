@@ -49,6 +49,7 @@ pub(crate) trait PullRequestInspector {
 		&self,
 		cwd: &std::path::Path,
 		pr_url: &str,
+		github_token: Option<&str>,
 	) -> std::result::Result<PullRequestDetails, String>;
 }
 
@@ -635,8 +636,11 @@ impl<'a> TrackerToolBridge<'a> {
 		review_context: &ReviewHandoffContext,
 		pr_url: &str,
 	) -> std::result::Result<PullRequestDetails, String> {
-		let pull_request =
-			self.pull_request_inspector.inspect_pull_request(&review_context.cwd, pr_url)?;
+		let pull_request = self.pull_request_inspector.inspect_pull_request(
+			&review_context.cwd,
+			pr_url,
+			review_context.github_token.as_deref(),
+		)?;
 		let local_repo = self.local_repo_inspector.inspect_local_repo(&review_context.cwd)?;
 
 		if pull_request.head_repository_owner != local_repo.repository_owner
@@ -966,6 +970,7 @@ pub(crate) struct ReviewHandoffContext {
 	pub(crate) run_id: String,
 	pub(crate) workspace_path: String,
 	pub(crate) cwd: PathBuf,
+	pub(crate) github_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1047,6 +1052,7 @@ impl PullRequestInspector for GhPullRequestInspector {
 		&self,
 		cwd: &std::path::Path,
 		pr_url: &str,
+		github_token: Option<&str>,
 	) -> std::result::Result<PullRequestDetails, String> {
 		let mut command = Command::new("gh");
 
@@ -1059,8 +1065,7 @@ impl PullRequestInspector for GhPullRequestInspector {
 		]);
 		command.current_dir(cwd);
 
-		github::configure_gh_command(&mut command, cwd)
-			.map_err(|error| format!("Failed to configure GitHub CLI for `{pr_url}`: {error}"))?;
+		github::configure_gh_command(&mut command, github_token);
 
 		let output = command
 			.output()
@@ -1402,8 +1407,25 @@ mod tests {
 			&self,
 			_cwd: &Path,
 			_pr_url: &str,
+			_github_token: Option<&str>,
 		) -> std::result::Result<PullRequestDetails, String> {
 			self.responses.borrow_mut().remove(0)
+		}
+	}
+	struct GitHubTokenAssertingPullRequestInspector {
+		expected_token: String,
+		response: PullRequestDetails,
+	}
+	impl PullRequestInspector for GitHubTokenAssertingPullRequestInspector {
+		fn inspect_pull_request(
+			&self,
+			_cwd: &Path,
+			_pr_url: &str,
+			github_token: Option<&str>,
+		) -> std::result::Result<PullRequestDetails, String> {
+			assert_eq!(github_token, Some(self.expected_token.as_str()));
+
+			Ok(self.response.clone())
 		}
 	}
 	struct FakeLocalRepoInspector {
@@ -1614,6 +1636,7 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: PathBuf::from("/tmp/PUB-618"),
+			github_token: None,
 		}
 	}
 
@@ -1624,6 +1647,19 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: cwd.to_path_buf(),
+			github_token: None,
+		}
+	}
+
+	fn sample_pull_request() -> PullRequestDetails {
+		PullRequestDetails {
+			head_ref_name: String::from("x/maestro-pub-618"),
+			head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+			head_repository_name: String::from("maestro"),
+			head_repository_owner: String::from("helixbox"),
+			is_draft: false,
+			state: String::from("OPEN"),
+			url: String::from("https://github.com/helixbox/maestro/pull/48"),
 		}
 	}
 
@@ -1633,6 +1669,40 @@ Use the tracker tools.
 			repository_name: String::from("maestro"),
 			repository_owner: String::from("helixbox"),
 		}
+	}
+
+	#[test]
+	fn review_handoff_inspection_uses_configured_github_token() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = GitHubTokenAssertingPullRequestInspector {
+			expected_token: String::from("ghp_review"),
+			response: sample_pull_request(),
+		};
+		let local_repo_inspector = FakeLocalRepoInspector::new(vec![Ok(sample_local_repo())]);
+		let mut review_context = sample_review_context();
+
+		review_context.github_token = Some(String::from("ghp_review"));
+
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			review_context,
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/48",
+				"summary": "Ready for review."
+			}),
+		);
+
+		assert!(response.success);
 	}
 
 	#[test]

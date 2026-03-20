@@ -120,9 +120,10 @@
       "Review repair propagated `codex.github-identity` and `codex.linear-workspace` into clone-backed workspaces so lane-local GitHub and Linear routing survives `issue_review_handoff` and post-review status inspection without manual workspace config.",
       "Review repair paginated GitHub review-thread inspection in `src/orchestrator.rs`, counted unresolved threads beyond the first page, and added guards plus tests for mixed-snapshot pagination and missing end-cursor responses.",
       "Late review repair now refreshes managed `.workspaces/*` lanes before post-review GitHub inspection, downgrades refresh failures to a lane-local `workspace_git_metadata_refresh_failed` block, and treats `reviewDecision = null` as approval-satisfied when checks are green and the PR is mergeable so zero-required-review repositories can reach `ready_to_land`.",
-      "Fresh verification for the late review repair passed: `cargo test build_post_review_lane_statuses_ -- --nocapture`, `cargo test classify_post_review_lane_ready_to_land_allows_zero_required_review_repos -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, `cargo make test`, plan validate/read-back, and `git diff --check`."
+      "Fresh verification for the late review repair passed: `cargo test build_post_review_lane_statuses_ -- --nocapture`, `cargo test classify_post_review_lane_ready_to_land_allows_zero_required_review_repos -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, `cargo make test`, plan validate/read-back, and `git diff --check`.",
+      "Review repair replaced the hard-coded `codex.github-identity -> GITHUB_PAT_X/Y` mapping with optional `github.token` service-config resolution plus ambient `GH_TOKEN` or `gh auth login` fallback, threaded the configured token through review handoff validation, and removed the post-review status path's retained-workspace refresh so `maestro status` stays read-only for owned lanes. Fresh verification passed: `cargo test review_handoff_inspection_uses_configured_github_token -- --nocapture`, `cargo test build_post_review_lane_statuses_leaves_managed_workspace_git_metadata_untouched -- --nocapture`, `cargo test resolves_optional_github_token_reference -- --nocapture`, `cargo test rejects_empty_github_token_when_present -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, and `cargo make test`."
     ],
-    "last_updated": "2026-03-20T02:35:48Z",
+    "last_updated": "2026-03-20T03:11:15Z",
     "replan_reason": null,
     "context_snapshot": {
       "issue": "XY-173",

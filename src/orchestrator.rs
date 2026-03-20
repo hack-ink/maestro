@@ -505,7 +505,9 @@ struct PostReviewLaneClassification {
 	unresolved_review_threads: Option<usize>,
 }
 
-struct GhPullRequestReviewStateInspector;
+struct GhPullRequestReviewStateInspector {
+	github_token: Option<String>,
+}
 impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 	fn inspect_review_state(
 		&self,
@@ -524,6 +526,7 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 				locator.number,
 				review_threads_after.as_deref(),
 				pr_url,
+				self.github_token.as_deref(),
 			)?;
 			let next_cursor = match &mut review_state {
 				Some(review_state) =>
@@ -886,13 +889,15 @@ pub(crate) fn print_status(
 	hydrate_status_snapshot_state(&config, &state_store, recovered_state)?;
 
 	let mut snapshot = build_operator_status_snapshot(&config, &state_store, limit)?;
+	let review_state_inspector =
+		GhPullRequestReviewStateInspector { github_token: config.github().resolve_token()? };
 
 	snapshot.post_review_lanes = build_post_review_lane_statuses(
 		&tracker,
 		&config,
 		&workflow,
 		&state_store,
-		&GhPullRequestReviewStateInspector,
+		&review_state_inspector,
 	)?;
 
 	if json {
@@ -911,6 +916,7 @@ fn query_pull_request_review_state_page(
 	number: u64,
 	review_threads_after: Option<&str>,
 	pr_url: &str,
+	github_token: Option<&str>,
 ) -> crate::prelude::Result<PullRequestReviewStateNode> {
 	let mut command = Command::new("gh");
 
@@ -925,7 +931,7 @@ fn query_pull_request_review_state_page(
 
 	command.current_dir(cwd);
 
-	github::configure_gh_command(&mut command, cwd)?;
+	github::configure_gh_command(&mut command, github_token);
 
 	let output = command.output()?;
 
@@ -3026,6 +3032,7 @@ where
 		.to_owned();
 	let model =
 		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
+	let github_token = project.github().resolve_token()?;
 	let tracker_tool_bridge = TrackerToolBridge::with_run_context(
 		tracker,
 		&issue_run.issue,
@@ -3036,6 +3043,7 @@ where
 			run_id: issue_run.run_id.clone(),
 			workspace_path: relative_workspace_path(project, &issue_run.workspace),
 			cwd: issue_run.workspace.path.clone(),
+			github_token,
 		},
 	);
 	let continuation_guard = IssueTurnContinuationGuard {
@@ -3837,8 +3845,6 @@ where
 	let issues_by_id =
 		issues.into_iter().map(|issue| (issue.id.clone(), issue)).collect::<HashMap<_, _>>();
 	let success_state = workflow.frontmatter().tracker().success_state();
-	let workspace_manager =
-		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 	let mut lanes = Vec::new();
 
 	for workspace in workspaces {
@@ -3847,31 +3853,6 @@ where
 		};
 
 		if issue.state.name != success_state {
-			continue;
-		}
-		if should_refresh_post_review_workspace_git_metadata(project, workspace.workspace_path())
-			&& let Err(_error) =
-				workspace_manager.refresh_workspace_git_metadata(workspace.workspace_path())
-		{
-			lanes.push(OperatorPostReviewLaneStatus {
-				issue_id: issue.id.clone(),
-				issue_identifier: issue.identifier.clone(),
-				issue_state: issue.state.name.clone(),
-				branch_name: workspace.branch_name().to_owned(),
-				workspace_path: relative_workspace_path_for_path(
-					project,
-					workspace.workspace_path(),
-				),
-				classification: PostReviewLaneDecision::Block.as_str().to_owned(),
-				reason: String::from("workspace_git_metadata_refresh_failed"),
-				pr_url: None,
-				pr_state: None,
-				review_decision: None,
-				mergeable: None,
-				check_state: None,
-				unresolved_review_threads: None,
-			});
-
 			continue;
 		}
 
@@ -4037,13 +4018,6 @@ fn blocked_post_review_lane(reason: &str) -> PostReviewLaneClassification {
 		check_state: None,
 		unresolved_review_threads: None,
 	}
-}
-
-fn should_refresh_post_review_workspace_git_metadata(
-	project: &ServiceConfig,
-	workspace_path: &Path,
-) -> bool {
-	workspace_path.starts_with(project.workspace_root())
 }
 
 fn workspace_head_oid(workspace_path: &Path) -> crate::prelude::Result<Option<String>> {
@@ -4589,30 +4563,6 @@ mod tests {
 		}
 	}
 
-	struct GitConfigAssertingReviewStateInspector {
-		expected_github_identity: String,
-		expected_linear_workspace: String,
-		response: PullRequestReviewState,
-	}
-	impl PullRequestReviewStateInspector for GitConfigAssertingReviewStateInspector {
-		fn inspect_review_state(
-			&self,
-			cwd: &Path,
-			_pr_url: &str,
-		) -> crate::prelude::Result<PullRequestReviewState> {
-			assert_eq!(
-				git_local_config_value(cwd, "codex.github-identity"),
-				self.expected_github_identity
-			);
-			assert_eq!(
-				git_local_config_value(cwd, "codex.linear-workspace"),
-				self.expected_linear_workspace
-			);
-
-			Ok(self.response.clone())
-		}
-	}
-
 	impl FakeTracker {
 		fn new(issues: Vec<TrackerIssue>) -> Self {
 			Self::with_refresh_snapshots_and_project(issues.clone(), vec![issues], true)
@@ -4906,7 +4856,7 @@ mod tests {
 		}
 	}
 
-	fn git_local_config_value(repo_root: &Path, key: &str) -> String {
+	fn try_git_local_config_value(repo_root: &Path, key: &str) -> Option<String> {
 		let output = Command::new("git")
 			.arg("-C")
 			.arg(repo_root)
@@ -4914,12 +4864,36 @@ mod tests {
 			.output()
 			.expect("git config should run");
 
-		assert!(output.status.success(), "git config should succeed for `{key}`");
+		if !output.status.success() {
+			return None;
+		}
 
-		String::from_utf8(output.stdout)
-			.expect("git config output should be utf-8")
-			.trim()
-			.to_owned()
+		Some(
+			String::from_utf8(output.stdout)
+				.expect("git config output should be utf-8")
+				.trim()
+				.to_owned(),
+		)
+	}
+
+	fn git_remote_url(repo_root: &Path, remote_name: &str) -> Option<String> {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(repo_root)
+			.args(["remote", "get-url", remote_name])
+			.output()
+			.expect("git remote get-url should run");
+
+		if !output.status.success() {
+			return None;
+		}
+
+		Some(
+			String::from_utf8(output.stdout)
+				.expect("git remote get-url output should be utf-8")
+				.trim()
+				.to_owned(),
+		)
 	}
 
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
@@ -7647,8 +7621,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn build_post_review_lane_statuses_refreshes_managed_workspace_git_metadata_before_inspection()
-	{
+	fn build_post_review_lane_statuses_leaves_managed_workspace_git_metadata_untouched() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
 		let tracker =
@@ -7705,6 +7678,12 @@ read_first = [{read_first}]
 			.args(["config", "--local", "--unset-all", "codex.linear-workspace"])
 			.status()
 			.expect("git config should run");
+		Command::new("git")
+			.arg("-C")
+			.arg(&workspace.path)
+			.args(["remote", "remove", "origin"])
+			.status()
+			.expect("git remote remove should run");
 
 		state_store
 			.upsert_workspace(
@@ -7726,26 +7705,23 @@ read_first = [{read_first}]
 			&config,
 			&workflow,
 			&state_store,
-			&GitConfigAssertingReviewStateInspector {
-				expected_github_identity: String::from("y"),
-				expected_linear_workspace: String::from("hackink"),
-				response: sample_pull_request_review_state(
-					pr_url,
-					&workspace.branch_name,
-					&head_oid,
-					Some("APPROVED"),
-					"MERGEABLE",
-					Some("SUCCESS"),
-					0,
-				),
-			},
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				pr_url,
+				&workspace.branch_name,
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				Some("SUCCESS"),
+				0,
+			))]),
 		)
 		.expect("post-review lane status build should succeed");
 
 		assert_eq!(lanes.len(), 1);
 		assert_eq!(lanes[0].classification, "ready_to_land");
-		assert_eq!(git_local_config_value(&workspace.path, "codex.github-identity"), "y");
-		assert_eq!(git_local_config_value(&workspace.path, "codex.linear-workspace"), "hackink");
+		assert_eq!(try_git_local_config_value(&workspace.path, "codex.github-identity"), None);
+		assert_eq!(try_git_local_config_value(&workspace.path, "codex.linear-workspace"), None);
+		assert_eq!(git_remote_url(&workspace.path, "origin"), None);
 	}
 
 	#[test]
@@ -7773,42 +7749,6 @@ read_first = [{read_first}]
 		assert_eq!(lanes.len(), 1);
 		assert_eq!(lanes[0].classification, "blocked");
 		assert_eq!(lanes[0].reason, "missing_review_handoff_record");
-	}
-
-	#[test]
-	fn build_post_review_lane_statuses_blocks_managed_workspace_refresh_failures() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
-		let issue = sample_issue("In Review", &[]);
-		let tracker =
-			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
-		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let workspace_path = config.workspace_root().join(&issue.identifier);
-
-		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
-		fs::write(workspace_path.join("NOT_GIT"), "broken workspace")
-			.expect("sentinel file should write");
-
-		state_store
-			.upsert_workspace(
-				config.id(),
-				&issue.id,
-				"x/pubfi-pub-101",
-				&workspace_path.display().to_string(),
-			)
-			.expect("workspace should record");
-
-		let lanes = orchestrator::build_post_review_lane_statuses(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&FakePullRequestReviewStateInspector::new(Vec::new()),
-		)
-		.expect("post-review lane status build should succeed");
-
-		assert_eq!(lanes.len(), 1);
-		assert_eq!(lanes[0].classification, "blocked");
-		assert_eq!(lanes[0].reason, "workspace_git_metadata_refresh_failed");
 	}
 
 	#[test]

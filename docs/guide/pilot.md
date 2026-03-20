@@ -21,6 +21,7 @@ Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run 
 - The target repository files referenced by `WORKFLOW.md [context.read_first]` exist.
 - The Linear team already has the workflow states used by the target `WORKFLOW.md`.
 - The Linear API token is configured through `tracker.api_key` in `tmp/maestro.toml`.
+- When you want explicit non-interactive GitHub auth for review handoff and post-review status, configure `github.token` in `tmp/maestro.toml`. If `github.token` is omitted, `maestro` falls back to ambient `GH_TOKEN` or an existing `gh auth login` session.
 
 Recommended first-run check:
 
@@ -70,6 +71,9 @@ workflow_path = "WORKFLOW.md"
 project_slug = "1a216b6d7100"
 api_key = "$LINEAR_API_KEY"
 
+[github]
+token = "$GITHUB_TOKEN"
+
 [agent]
 transport = "stdio://"
 model = "gpt-5-codex"
@@ -83,6 +87,7 @@ Notes:
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
 - `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
+- `github.token` is optional. When configured, it accepts a literal GitHub token or an environment-variable reference in the form `$ENV_VAR` and is used for PR-backed review handoff validation plus post-review PR-state inspection.
 - The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear.
 - Checked-in config examples should use the canonical Linear `slugId` for the target project. For the current self-dogfood pilot, that value is `1a216b6d7100`.
 

@@ -20,6 +20,8 @@ pub struct ServiceConfig {
 	workflow_path: PathBuf,
 	tracker: ProjectTrackerConfig,
 	#[serde(default)]
+	github: ProjectGitHubConfig,
+	#[serde(default)]
 	agent: ProjectAgentConfig,
 }
 impl ServiceConfig {
@@ -64,6 +66,11 @@ impl ServiceConfig {
 		&self.tracker
 	}
 
+	/// GitHub configuration for this project.
+	pub fn github(&self) -> &ProjectGitHubConfig {
+		&self.github
+	}
+
 	/// Agent defaults scoped to this project.
 	pub fn agent(&self) -> &ProjectAgentConfig {
 		&self.agent
@@ -74,7 +81,9 @@ impl ServiceConfig {
 			eyre::bail!("Project id must not be empty.");
 		}
 
-		self.tracker.validate()
+		self.tracker.validate()?;
+
+		self.github.validate()
 	}
 }
 
@@ -98,21 +107,7 @@ impl ProjectTrackerConfig {
 
 	/// Resolve the configured tracker API key into a concrete token string.
 	pub fn resolve_api_key(&self) -> Result<String> {
-		let api_key = self.api_key();
-
-		if let Some(env_var) = api_key.strip_prefix('$') {
-			if env_var.trim().is_empty() {
-				eyre::bail!("`tracker.api_key` env reference must include a variable name.");
-			}
-
-			return env::var(env_var).map_err(|error| {
-				eyre::eyre!(
-					"Failed to read environment variable `{env_var}` referenced by `tracker.api_key`: {error}"
-				)
-			});
-		}
-
-		Ok(api_key.to_owned())
+		resolve_secret_reference("tracker.api_key", self.api_key())
 	}
 
 	fn validate(&self) -> Result<()> {
@@ -121,6 +116,34 @@ impl ProjectTrackerConfig {
 		}
 		if self.api_key.trim().is_empty() {
 			eyre::bail!("`tracker.api_key` must not be empty.");
+		}
+
+		Ok(())
+	}
+}
+
+/// Optional GitHub settings for a target project.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectGitHubConfig {
+	token: Option<String>,
+}
+impl ProjectGitHubConfig {
+	/// GitHub token or environment-variable reference like `$GITHUB_PAT_Y`.
+	pub fn token(&self) -> Option<&str> {
+		self.token.as_deref()
+	}
+
+	/// Resolve the configured GitHub token into a concrete string when present.
+	pub fn resolve_token(&self) -> Result<Option<String>> {
+		self.token().map(|value| resolve_secret_reference("github.token", value)).transpose()
+	}
+
+	fn validate(&self) -> Result<()> {
+		if let Some(token) = self.token()
+			&& token.trim().is_empty()
+		{
+			eyre::bail!("`github.token` must not be empty when configured.");
 		}
 
 		Ok(())
@@ -155,6 +178,22 @@ pub fn default_config_path() -> Result<PathBuf> {
 
 fn default_workflow_path() -> PathBuf {
 	PathBuf::from("WORKFLOW.md")
+}
+
+fn resolve_secret_reference(field_name: &str, value: &str) -> Result<String> {
+	if let Some(env_var) = value.strip_prefix('$') {
+		if env_var.trim().is_empty() {
+			eyre::bail!("`{field_name}` env reference must include a variable name.");
+		}
+
+		return env::var(env_var).map_err(|error| {
+			eyre::eyre!(
+				"Failed to read environment variable `{env_var}` referenced by `{field_name}`: {error}"
+			)
+		});
+	}
+
+	Ok(value.to_owned())
 }
 
 #[cfg(test)]
@@ -217,6 +256,48 @@ mod tests {
 
 		assert_eq!(config.workspace_root(), Path::new("/tmp/workspaces"));
 		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
+	}
+
+	#[test]
+	fn resolves_optional_github_token_reference() {
+		let config = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key = "lin_api_test"
+
+				[github]
+				token = "$HOME"
+			"#,
+		)
+		.expect("service config should parse");
+
+		assert!(!config.github().resolve_token().expect("HOME should resolve").unwrap().is_empty());
+	}
+
+	#[test]
+	fn rejects_empty_github_token_when_present() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key = "lin_api_test"
+
+				[github]
+				token = ""
+			"#,
+		);
+		let error = result.expect_err("empty github token should be rejected");
+
+		assert!(error.to_string().contains("github.token"));
 	}
 
 	#[test]
