@@ -2749,7 +2749,7 @@ where
 			return Ok(None);
 		}
 
-		validate_prepared_issue_run_runtime(&context, &lease_issue_id, &workspace.path)?;
+		validate_prepared_issue_run_runtime(&context, &lease_issue_id, &workspace)?;
 
 		if !context.dry_run {
 			clear_terminal_guard_marker(&workspace.path)?;
@@ -2792,7 +2792,7 @@ where
 fn validate_prepared_issue_run_runtime<T>(
 	context: &PrepareIssueRunContext<'_, T>,
 	issue_id: &str,
-	workspace_path: &Path,
+	workspace: &WorkspaceSpec,
 ) -> crate::prelude::Result<()>
 where
 	T: IssueTracker,
@@ -2802,12 +2802,14 @@ where
 	}
 
 	validate_review_handoff_runtime(context.project, context.dry_run).inspect_err(|_error| {
-		if !context.dry_run {
+		// Preserve reused retained lanes when GitHub review-handoff preflight fails so
+		// local uncommitted repair work is never discarded by missing token authority.
+		if !context.dry_run && !workspace.reused_existing {
 			let _ = cleanup_terminal_workspace(
 				context.state_store,
 				context.workspace_manager,
 				issue_id,
-				workspace_path,
+				&workspace.path,
 			);
 		}
 	})
@@ -8541,7 +8543,7 @@ read_first = [{read_first}]
 		let error =
 			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
 				.expect_err(
-					"live dispatch should fail before workspace prepare when github token authority is missing",
+					"live dispatch should fail before agent execution when github token authority is missing",
 				);
 
 		assert!(error.to_string().contains("github.token_env_var"));
@@ -8556,6 +8558,74 @@ read_first = [{read_first}]
 				.workspace_for_issue(&listed_issue.id)
 				.expect("workspace lookup should work")
 				.is_none()
+		);
+		assert!(
+			!config.workspace_root().join(&listed_issue.identifier).exists(),
+			"newly created workspaces should still be cleaned when preflight fails"
+		);
+	}
+
+	#[test]
+	fn live_run_preserves_reused_workspace_when_github_token_preflight_fails() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let listed_issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![listed_issue.clone()],
+			vec![vec![listed_issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&listed_issue.identifier, false)
+			.expect("retained workspace should exist");
+		let sentinel_path = workspace.path.join("dirty.txt");
+
+		fs::write(&sentinel_path, "uncommitted repair work\n")
+			.expect("retained workspace should keep local edits");
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&listed_issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace mapping should record");
+
+		let error = orchestrator::run_project_once(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			false,
+		)
+		.expect_err(
+			"live dispatch should still fail before agent execution when github token authority is missing",
+		);
+
+		assert!(error.to_string().contains("github.token_env_var"));
+		assert!(
+			workspace.path.exists(),
+			"reused retained workspaces must survive preflight failure"
+		);
+		assert!(
+			sentinel_path.exists(),
+			"preflight failure must not discard local uncommitted repair work"
+		);
+		assert!(
+			state_store
+				.workspace_for_issue(&listed_issue.id)
+				.expect("workspace lookup should work")
+				.is_some_and(|mapping| mapping.workspace_path() == workspace.path.as_path()),
+			"retained workspace mapping should remain intact after preflight failure"
+		);
+		assert!(
+			state_store
+				.lease_for_issue(&listed_issue.id)
+				.expect("lease lookup should work")
+				.is_none(),
+			"lease should still clear after preflight failure"
 		);
 	}
 
