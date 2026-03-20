@@ -843,8 +843,6 @@ impl<'a> TrackerToolBridge<'a> {
 			return Err(error);
 		}
 		if let Err(error) = self.tracker.create_comment(&self.issue.id, &completion_comment) {
-			let _ = state::remove_review_handoff_marker(&review_context.cwd);
-
 			return Err(Report::new(ReviewHandoffWritebackFailed {
 				issue_identifier: self.issue.identifier.clone(),
 				run_id: review_context.run_id.clone(),
@@ -3131,7 +3129,7 @@ Use the tracker tools.
 		assert!(
 			state::read_review_handoff_marker(temp_dir.path())
 				.expect("marker read should succeed")
-				.is_none()
+				.is_some()
 		);
 	}
 
