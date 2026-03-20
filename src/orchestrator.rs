@@ -4064,16 +4064,16 @@ where
 
 		return Ok(classification);
 	}
+	if mergeability_requires_block(&review_state.mergeable) {
+		classification.decision = PostReviewLaneDecision::Block;
+		classification.reason = String::from("pull_request_not_mergeable");
+
+		return Ok(classification);
+	}
 	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED"))
 		|| review_state.pending_review_requests > 0
 	{
 		classification.reason = String::from("waiting_for_review");
-
-		return Ok(classification);
-	}
-	if mergeability_requires_block(&review_state.mergeable) {
-		classification.decision = PostReviewLaneDecision::Block;
-		classification.reason = String::from("pull_request_not_mergeable");
 
 		return Ok(classification);
 	}
@@ -8236,6 +8236,117 @@ read_first = [{read_first}]
 
 		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
 		assert_eq!(classification.reason, "waiting_for_review");
+	}
+
+	#[test]
+	fn classify_post_review_lane_blocks_conflicted_pull_request_before_review_required_wait() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&head_oid,
+				Some("REVIEW_REQUIRED"),
+				"CONFLICTING",
+				"DIRTY",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
+		assert_eq!(classification.reason, "pull_request_not_mergeable");
+	}
+
+	#[test]
+	fn classify_post_review_lane_blocks_conflicted_pull_request_before_pending_review_wait() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(
+				sample_pull_request_review_state_with_pending_requests(
+					"https://github.com/hack-ink/maestro/pull/174",
+					"x/pubfi-pub-101",
+					&head_oid,
+					None,
+					"CONFLICTING",
+					"DIRTY",
+					Some("SUCCESS"),
+					0,
+					1,
+				),
+			)]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
+		assert_eq!(classification.reason, "pull_request_not_mergeable");
 	}
 
 	#[test]
