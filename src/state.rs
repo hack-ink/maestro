@@ -1331,18 +1331,58 @@ pub(crate) fn write_review_handoff_marker(
 	Ok(())
 }
 
+pub(crate) fn remove_review_handoff_marker(workspace_path: &Path) -> Result<()> {
+	match fs::remove_file(workspace_path.join(REVIEW_HANDOFF_MARKER_FILE)) {
+		Ok(()) => Ok(()),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error.into()),
+	}
+}
+
 pub(crate) fn read_review_handoff_marker(
 	workspace_path: &Path,
 ) -> Result<Option<ReviewHandoffMarker>> {
-	Ok(read_review_handoff_marker_record(workspace_path)?.and_then(|marker| {
-		Some(ReviewHandoffMarker {
-			run_id: marker.run_id?,
-			attempt_number: marker.attempt_number?,
-			branch_name: marker.branch_name?,
-			pr_url: marker.pr_url?,
-			pr_head_ref_name: marker.pr_head_ref_name?,
-			pr_head_oid: marker.pr_head_oid?,
-		})
+	let Some(marker) = read_review_handoff_marker_record(workspace_path)? else {
+		return Ok(None);
+	};
+
+	Ok(Some(ReviewHandoffMarker {
+		run_id: marker.run_id.ok_or_else(|| {
+			eyre::eyre!(
+				"Review handoff marker `{}` is missing required field `run_id`.",
+				workspace_path.join(REVIEW_HANDOFF_MARKER_FILE).display()
+			)
+		})?,
+		attempt_number: marker.attempt_number.ok_or_else(|| {
+			eyre::eyre!(
+				"Review handoff marker `{}` is missing required field `attempt_number`.",
+				workspace_path.join(REVIEW_HANDOFF_MARKER_FILE).display()
+			)
+		})?,
+		branch_name: marker.branch_name.ok_or_else(|| {
+			eyre::eyre!(
+				"Review handoff marker `{}` is missing required field `branch_name`.",
+				workspace_path.join(REVIEW_HANDOFF_MARKER_FILE).display()
+			)
+		})?,
+		pr_url: marker.pr_url.ok_or_else(|| {
+			eyre::eyre!(
+				"Review handoff marker `{}` is missing required field `pr_url`.",
+				workspace_path.join(REVIEW_HANDOFF_MARKER_FILE).display()
+			)
+		})?,
+		pr_head_ref_name: marker.pr_head_ref_name.ok_or_else(|| {
+			eyre::eyre!(
+				"Review handoff marker `{}` is missing required field `pr_head_ref_name`.",
+				workspace_path.join(REVIEW_HANDOFF_MARKER_FILE).display()
+			)
+		})?,
+		pr_head_oid: marker.pr_head_oid.ok_or_else(|| {
+			eyre::eyre!(
+				"Review handoff marker `{}` is missing required field `pr_head_oid`.",
+				workspace_path.join(REVIEW_HANDOFF_MARKER_FILE).display()
+			)
+		})?,
 	}))
 }
 
@@ -1699,7 +1739,7 @@ fn clear_close_on_exec(file: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	#[cfg(unix)] use std::os::fd::IntoRawFd;
-	use std::{collections::HashMap, path::Path};
+	use std::{collections::HashMap, fs, path::Path};
 
 	use tempfile::TempDir;
 
@@ -1727,6 +1767,22 @@ mod tests {
 			.expect("review handoff marker should exist");
 
 		assert_eq!(restored, marker);
+	}
+
+	#[test]
+	fn malformed_review_handoff_marker_returns_error() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+
+		fs::write(
+			temp_dir.path().join(state::REVIEW_HANDOFF_MARKER_FILE),
+			"run_id=run-1\npr_url=https://github.com/hack-ink/maestro/pull/101\n",
+		)
+		.expect("marker should write");
+
+		let error = state::read_review_handoff_marker(temp_dir.path())
+			.expect_err("partial marker should fail instead of looking absent");
+
+		assert!(error.to_string().contains("attempt_number"));
 	}
 
 	#[test]

@@ -816,18 +816,6 @@ impl<'a> TrackerToolBridge<'a> {
 			)
 		})?;
 
-		self.tracker.update_issue_state(&self.issue.id, success_state_id)?;
-
-		if let Err(error) = self.tracker.create_comment(&self.issue.id, &completion_comment) {
-			return Err(Report::new(ReviewHandoffWritebackFailed {
-				issue_identifier: self.issue.identifier.clone(),
-				run_id: review_context.run_id.clone(),
-				pr_url: pending_review_handoff.pr_url,
-				success_state: success_state.to_owned(),
-				source: error.to_string(),
-			}));
-		}
-
 		state::write_review_handoff_marker(
 			&review_context.cwd,
 			&ReviewHandoffMarker::new(
@@ -848,6 +836,23 @@ impl<'a> TrackerToolBridge<'a> {
 				source: format!("failed to persist the local review handoff marker: {error}"),
 			})
 		})?;
+
+		if let Err(error) = self.tracker.update_issue_state(&self.issue.id, success_state_id) {
+			let _ = state::remove_review_handoff_marker(&review_context.cwd);
+
+			return Err(error);
+		}
+		if let Err(error) = self.tracker.create_comment(&self.issue.id, &completion_comment) {
+			let _ = state::remove_review_handoff_marker(&review_context.cwd);
+
+			return Err(Report::new(ReviewHandoffWritebackFailed {
+				issue_identifier: self.issue.identifier.clone(),
+				run_id: review_context.run_id.clone(),
+				pr_url: pending_review_handoff.pr_url,
+				success_state: success_state.to_owned(),
+				source: error.to_string(),
+			}));
+		}
 
 		self.pending_review_handoff.borrow_mut().take();
 
@@ -1389,7 +1394,7 @@ fn current_timestamp() -> String {
 mod tests {
 	use std::{
 		cell::RefCell,
-		env,
+		env, fs,
 		path::{Path, PathBuf},
 		process,
 	};
@@ -3065,6 +3070,7 @@ Use the tracker tools.
 
 	#[test]
 	fn reports_partial_review_handoff_when_comment_write_fails_after_state_update() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
 		let tracker = FakeTracker::with_comment_error("tracker comment write failed");
 		let issue = sample_issue();
 		let workflow = sample_workflow();
@@ -3094,7 +3100,7 @@ Use the tracker tools.
 			&tracker,
 			&issue,
 			&workflow,
-			sample_review_context(),
+			sample_review_context_in(temp_dir.path()),
 			&inspector,
 			&local_repo_inspector,
 		);
@@ -3121,6 +3127,76 @@ Use the tracker tools.
 		assert_eq!(writeback_error.success_state, "In Review");
 		assert!(writeback_error.source.contains("tracker comment write failed"));
 		assert_eq!(tracker.state_updates.borrow().as_slice(), ["state-review"]);
+		assert!(tracker.comments.borrow().is_empty());
+		assert!(
+			state::read_review_handoff_marker(temp_dir.path())
+				.expect("marker read should succeed")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn rejects_review_handoff_before_tracker_success_writes_when_marker_persistence_fails() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let marker_path = temp_dir.path().join("marker-parent-is-file");
+
+		fs::write(&marker_path, "not a directory").expect("marker parent file should write");
+
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let inspector = FakePullRequestInspector::new(vec![
+			Ok(PullRequestDetails {
+				head_ref_name: String::from("x/maestro-pub-618"),
+				head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				head_repository_name: String::from("maestro"),
+				head_repository_owner: String::from("helixbox"),
+				is_draft: false,
+				state: String::from("OPEN"),
+				url: String::from("https://github.com/helixbox/maestro/pull/150"),
+			}),
+			Ok(PullRequestDetails {
+				head_ref_name: String::from("x/maestro-pub-618"),
+				head_ref_oid: String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				head_repository_name: String::from("maestro"),
+				head_repository_owner: String::from("helixbox"),
+				is_draft: false,
+				state: String::from("OPEN"),
+				url: String::from("https://github.com/helixbox/maestro/pull/150"),
+			}),
+		]);
+		let local_repo_inspector =
+			FakeLocalRepoInspector::new(vec![Ok(sample_local_repo()), Ok(sample_local_repo())]);
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_context_in(&marker_path),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/150",
+				"summary": "Ready for review."
+			}),
+		);
+
+		assert!(response.success);
+
+		let error = bridge
+			.apply_review_handoff()
+			.expect_err("marker persistence failures must block tracker success writes");
+		let writeback_error = error
+			.downcast_ref::<super::ReviewHandoffWritebackFailed>()
+			.expect("marker write failures should use dedicated error type");
+
+		assert!(
+			writeback_error.source.contains("failed to persist the local review handoff marker")
+		);
+		assert!(tracker.state_updates.borrow().is_empty());
 		assert!(tracker.comments.borrow().is_empty());
 	}
 

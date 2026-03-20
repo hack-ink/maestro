@@ -8366,6 +8366,48 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_blocks_malformed_review_handoff_record() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+
+		fs::write(
+			workspace.path.join(crate::state::REVIEW_HANDOFF_MARKER_FILE),
+			"run_id=run-1\npr_url=https://github.com/hack-ink/maestro/pull/173\n",
+		)
+		.expect("marker should write");
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(Vec::new()),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "blocked");
+		assert_eq!(lanes[0].reason, "review_handoff_record_read_failed");
+	}
+
+	#[test]
 	fn build_post_review_lane_statuses_blocks_missing_review_handoff_record_when_branch_head_rebind_hits_fork_pr()
 	 {
 		let (_temp_dir, config, workflow) = temp_project_layout();
