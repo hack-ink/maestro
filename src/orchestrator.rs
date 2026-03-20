@@ -54,6 +54,7 @@ query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: Strin
       isDraft
       reviewDecision
       mergeable
+      mergeStateStatus
       headRefName
       headRefOid
       reviewThreads(first: 100, after: $reviewThreadsAfter) {
@@ -487,6 +488,7 @@ struct PullRequestReviewState {
 	is_draft: bool,
 	review_decision: Option<String>,
 	mergeable: String,
+	merge_state_status: String,
 	head_ref_name: String,
 	head_ref_oid: String,
 	status_check_rollup_state: Option<String>,
@@ -651,6 +653,8 @@ struct PullRequestReviewStateNode {
 	#[serde(rename = "reviewDecision")]
 	review_decision: Option<String>,
 	mergeable: String,
+	#[serde(rename = "mergeStateStatus")]
+	merge_state_status: String,
 	#[serde(rename = "headRefName")]
 	head_ref_name: String,
 	#[serde(rename = "headRefOid")]
@@ -966,6 +970,7 @@ fn pull_request_review_state_from_page(
 		is_draft: pull_request.is_draft,
 		review_decision: pull_request.review_decision.clone(),
 		mergeable: pull_request.mergeable.clone(),
+		merge_state_status: pull_request.merge_state_status.clone(),
 		head_ref_name: pull_request.head_ref_name.clone(),
 		head_ref_oid: pull_request.head_ref_oid.clone(),
 		status_check_rollup_state: pull_request_status_check_rollup_state(pull_request),
@@ -982,6 +987,7 @@ fn merge_pull_request_review_state_page(
 		|| review_state.is_draft != pull_request.is_draft
 		|| review_state.review_decision != pull_request.review_decision
 		|| review_state.mergeable != pull_request.mergeable
+		|| review_state.merge_state_status != pull_request.merge_state_status
 		|| review_state.head_ref_name != pull_request.head_ref_name
 		|| review_state.head_ref_oid != pull_request.head_ref_oid
 		|| review_state.status_check_rollup_state
@@ -1366,7 +1372,7 @@ where
 				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
 			)?;
 
-			validate_review_handoff_runtime(false)?;
+			validate_review_handoff_runtime(project, false)?;
 
 			if !state_store.try_acquire_lease(
 				project.id(),
@@ -2425,7 +2431,6 @@ where
 	}
 
 	validate_project_contract(project, workflow)?;
-	validate_review_handoff_runtime(dry_run)?;
 
 	let issues = tracker.list_project_issues(project.tracker().project_slug())?;
 	let mut selected_retry_issue = None;
@@ -2549,9 +2554,6 @@ where
 
 	let tracker_project =
 		resolve_tracker_project(context.tracker, context.project.tracker().project_slug())?;
-
-	validate_review_handoff_runtime(context.dry_run)?;
-
 	let Some(issue) = refresh_issue(context.tracker, context.issue_id)? else {
 		return Ok(None);
 	};
@@ -2746,6 +2748,9 @@ where
 
 			return Ok(None);
 		}
+
+		validate_prepared_issue_run_runtime(&context, &lease_issue_id, &workspace.path)?;
+
 		if !context.dry_run {
 			clear_terminal_guard_marker(&workspace.path)?;
 		}
@@ -2782,6 +2787,30 @@ where
 			Err(error)
 		},
 	}
+}
+
+fn validate_prepared_issue_run_runtime<T>(
+	context: &PrepareIssueRunContext<'_, T>,
+	issue_id: &str,
+	workspace_path: &Path,
+) -> crate::prelude::Result<()>
+where
+	T: IssueTracker,
+{
+	if context.lease_preacquired {
+		return Ok(());
+	}
+
+	validate_review_handoff_runtime(context.project, context.dry_run).inspect_err(|_error| {
+		if !context.dry_run {
+			let _ = cleanup_terminal_workspace(
+				context.state_store,
+				context.workspace_manager,
+				issue_id,
+				workspace_path,
+			);
+		}
+	})
 }
 
 fn resolve_prepare_run_identity(
@@ -2903,12 +2932,16 @@ where
 		.ok_or_else(|| eyre::eyre!("Linear project slug `{project_slug}` was not found."))
 }
 
-fn validate_review_handoff_runtime(dry_run: bool) -> crate::prelude::Result<()> {
+fn validate_review_handoff_runtime(
+	project: &ServiceConfig,
+	dry_run: bool,
+) -> crate::prelude::Result<()> {
 	if dry_run {
 		return Ok(());
 	}
 
 	validate_command_available("gh", "PR-backed review handoff")?;
+	resolve_configured_env_var("github.token_env_var", project.github().token_env_var())?;
 
 	Ok(())
 }
@@ -4000,7 +4033,15 @@ where
 
 		return Ok(classification);
 	}
-	if checks_require_repair(review_state.status_check_rollup_state.as_deref()) {
+	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED")) {
+		classification.reason = String::from("waiting_for_review");
+
+		return Ok(classification);
+	}
+	if failed_checks_require_repair(
+		review_state.status_check_rollup_state.as_deref(),
+		&review_state.merge_state_status,
+	) {
 		classification.decision = PostReviewLaneDecision::NeedsReviewRepair;
 		classification.reason = String::from("required_checks_failed");
 
@@ -4013,7 +4054,7 @@ where
 		return Ok(classification);
 	}
 	if approvals_are_satisfied(review_state.review_decision.as_deref())
-		&& checks_are_green(review_state.status_check_rollup_state.as_deref())
+		&& merge_state_allows_ready_to_land(&review_state.merge_state_status)
 		&& review_state.mergeable == "MERGEABLE"
 	{
 		classification.decision = PostReviewLaneDecision::ReadyToLand;
@@ -4023,11 +4064,6 @@ where
 	}
 	if checks_require_wait(review_state.status_check_rollup_state.as_deref()) {
 		classification.reason = String::from("required_checks_pending");
-
-		return Ok(classification);
-	}
-	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED")) {
-		classification.reason = String::from("waiting_for_review");
 
 		return Ok(classification);
 	}
@@ -4107,8 +4143,8 @@ fn resolve_configured_env_var(
 	})
 }
 
-fn checks_are_green(check_state: Option<&str>) -> bool {
-	matches!(check_state, None | Some("SUCCESS"))
+fn merge_state_allows_ready_to_land(merge_state_status: &str) -> bool {
+	matches!(merge_state_status, "CLEAN" | "HAS_HOOKS" | "UNSTABLE")
 }
 
 fn approvals_are_satisfied(review_decision: Option<&str>) -> bool {
@@ -4119,8 +4155,8 @@ fn checks_require_wait(check_state: Option<&str>) -> bool {
 	matches!(check_state, Some("EXPECTED" | "PENDING"))
 }
 
-fn checks_require_repair(check_state: Option<&str>) -> bool {
-	matches!(check_state, Some("ERROR" | "FAILURE"))
+fn failed_checks_require_repair(check_state: Option<&str>, merge_state_status: &str) -> bool {
+	matches!(check_state, Some("ERROR" | "FAILURE")) && merge_state_status == "BLOCKED"
 }
 
 fn mergeability_requires_block(mergeable: &str) -> bool {
@@ -4864,12 +4900,14 @@ mod tests {
 		state::ReviewHandoffMarker::new("run-1", 1, branch_name, pr_url, branch_name, head_oid)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn sample_pull_request_review_state(
 		pr_url: &str,
 		branch_name: &str,
 		head_oid: &str,
 		review_decision: Option<&str>,
 		mergeable: &str,
+		merge_state_status: &str,
 		check_state: Option<&str>,
 		unresolved_review_threads: usize,
 	) -> PullRequestReviewState {
@@ -4879,6 +4917,7 @@ mod tests {
 			is_draft: false,
 			review_decision: review_decision.map(str::to_owned),
 			mergeable: mergeable.to_owned(),
+			merge_state_status: merge_state_status.to_owned(),
 			head_ref_name: branch_name.to_owned(),
 			head_ref_oid: head_oid.to_owned(),
 			status_check_rollup_state: check_state.map(str::to_owned),
@@ -4900,6 +4939,7 @@ mod tests {
 			is_draft: false,
 			review_decision: Some(String::from("APPROVED")),
 			mergeable: String::from("MERGEABLE"),
+			merge_state_status: String::from("CLEAN"),
 			head_ref_name: branch_name.to_owned(),
 			head_ref_oid: head_oid.to_owned(),
 			review_threads: PullRequestReviewThreadConnection {
@@ -4969,6 +5009,34 @@ mod tests {
 			&[("AGENTS.md", "Read me first.\n")],
 			"Follow the repository policy.\n",
 		)
+	}
+
+	fn service_config_with_github_token_env_var(
+		config: &ServiceConfig,
+		token_env_var: &str,
+	) -> ServiceConfig {
+		ServiceConfig::parse_toml(&format!(
+			r#"
+				id = "{}"
+				repo_root = "{}"
+				workspace_root = "{}"
+				workflow_path = "{}"
+
+				[tracker]
+				project_slug = "{}"
+				api_key_env_var = "{}"
+
+				[github]
+				token_env_var = "{token_env_var}"
+			"#,
+			config.id(),
+			config.repo_root().display(),
+			config.workspace_root().display(),
+			config.workflow_path().display(),
+			config.tracker().project_slug(),
+			config.tracker().api_key_env_var(),
+		))
+		.expect("service config with github token authority should parse")
 	}
 
 	fn temp_project_layout_with_tracker_project_slug(
@@ -7675,6 +7743,7 @@ read_first = [{read_first}]
 				&head_oid,
 				Some("APPROVED"),
 				"MERGEABLE",
+				"CLEAN",
 				Some("SUCCESS"),
 				0,
 			))]),
@@ -7778,6 +7847,7 @@ read_first = [{read_first}]
 				&head_oid,
 				Some("APPROVED"),
 				"MERGEABLE",
+				"CLEAN",
 				Some("SUCCESS"),
 				0,
 			))]),
@@ -7906,6 +7976,7 @@ read_first = [{read_first}]
 				&head_oid,
 				Some("APPROVED"),
 				"MERGEABLE",
+				"CLEAN",
 				Some("SUCCESS"),
 				2,
 			))]),
@@ -7959,6 +8030,7 @@ read_first = [{read_first}]
 				&head_oid,
 				None,
 				"MERGEABLE",
+				"CLEAN",
 				Some("SUCCESS"),
 				0,
 			))]),
@@ -7967,6 +8039,168 @@ read_first = [{read_first}]
 
 		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
 		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+	}
+
+	#[test]
+	fn classify_post_review_lane_ready_to_land_allows_optional_failed_checks() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"UNSTABLE",
+				Some("FAILURE"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
+		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+	}
+
+	#[test]
+	fn classify_post_review_lane_ready_to_land_allows_pre_receive_hooks() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"HAS_HOOKS",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
+		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+	}
+
+	#[test]
+	fn classify_post_review_lane_waits_for_review_before_optional_failed_checks() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&head_oid,
+				Some("REVIEW_REQUIRED"),
+				"MERGEABLE",
+				"UNSTABLE",
+				Some("FAILURE"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
+		assert_eq!(classification.reason, "waiting_for_review");
 	}
 
 	#[test]
@@ -8238,10 +8472,37 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn live_runs_require_gh_preflight() {
-		assert!(orchestrator::validate_review_handoff_runtime(true).is_ok());
+	fn validate_review_handoff_runtime_requires_gh_and_github_token_authority() {
+		let (_temp_dir, config_without_github, _workflow) = temp_project_layout();
+		let config_with_github = ServiceConfig::parse_toml(&format!(
+			r#"
+				id = "pubfi"
+				repo_root = "{}"
+				workspace_root = "{}"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[github]
+				token_env_var = "HOME"
+			"#,
+			config_without_github.repo_root().display(),
+			config_without_github.workspace_root().display()
+		))
+		.expect("service config should parse");
+
+		assert!(
+			orchestrator::validate_review_handoff_runtime(&config_without_github, true).is_ok()
+		);
+		assert!(orchestrator::validate_review_handoff_runtime(&config_with_github, false).is_ok());
 		assert!(orchestrator::validate_daemon_runtime().is_ok());
 		assert!(orchestrator::validate_command_available("git", "test preflight").is_ok());
+
+		let error = orchestrator::validate_review_handoff_runtime(&config_without_github, false)
+			.expect_err("missing github token env-var should fail live preflight");
+
+		assert!(error.to_string().contains("github.token_env_var"));
 
 		let error = orchestrator::validate_command_available(
 			"__maestro_missing_command__",
@@ -8253,6 +8514,48 @@ read_first = [{read_first}]
 			error
 				.to_string()
 				.contains("Required command `__maestro_missing_command__` is unavailable")
+		);
+	}
+
+	#[test]
+	fn live_run_without_candidate_does_not_require_github_token_authority() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let tracker = FakeTracker::with_refresh_snapshots_and_project(vec![], vec![vec![]], true);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let summary =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
+				.expect("empty backlog should not require github token authority");
+
+		assert!(summary.is_none());
+	}
+
+	#[test]
+	fn live_run_with_candidate_requires_github_token_authority_before_agent_execution() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let listed_issue = sample_issue("Todo", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![listed_issue.clone()],
+			vec![vec![listed_issue.clone()]],
+		);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let error =
+			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
+				.expect_err(
+					"live dispatch should fail before workspace prepare when github token authority is missing",
+				);
+
+		assert!(error.to_string().contains("github.token_env_var"));
+		assert!(
+			state_store
+				.lease_for_issue(&listed_issue.id)
+				.expect("lease lookup should work")
+				.is_none()
+		);
+		assert!(
+			state_store
+				.workspace_for_issue(&listed_issue.id)
+				.expect("workspace lookup should work")
+				.is_none()
 		);
 	}
 
@@ -8457,7 +8760,8 @@ read_first = [{read_first}]
 
 	#[test]
 	fn prepare_issue_run_records_starting_attempt_before_execute() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -8504,7 +8808,8 @@ read_first = [{read_first}]
 
 	#[test]
 	fn prepare_issue_run_uses_persisted_retry_budget_marker_after_restart() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("Todo", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -8546,7 +8851,8 @@ read_first = [{read_first}]
 
 	#[test]
 	fn prepare_issue_run_keeps_persisted_retry_budget_when_preferred_base_is_stale() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("Todo", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -8588,7 +8894,8 @@ read_first = [{read_first}]
 
 	#[test]
 	fn prepare_issue_run_honors_preferred_identity_when_attempt_is_current() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("Todo", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -9589,7 +9896,8 @@ read_first = [{read_first}]
 
 	#[test]
 	fn prepare_issue_run_clears_terminal_guard_marker_when_new_attempt_starts() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("Todo", &[]);
 		let tracker = FakeTracker::with_refresh_snapshots(vec![], vec![vec![issue.clone()]]);
 		let state_store = StateStore::open_in_memory().expect("state store should open");
