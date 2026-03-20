@@ -90,6 +90,15 @@ trait PullRequestReviewStateInspector {
 		cwd: &Path,
 		pr_url: &str,
 	) -> crate::prelude::Result<PullRequestReviewState>;
+
+	fn inspect_review_state_for_branch_head(
+		&self,
+		_cwd: &Path,
+		_branch_name: &str,
+		_head_oid: &str,
+	) -> crate::prelude::Result<Option<PullRequestReviewState>> {
+		Ok(None)
+	}
 }
 
 /// One bounded `run --once` invocation and its optional daemon-planned overrides.
@@ -111,7 +120,7 @@ pub(crate) struct RunOnceRequest<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RunSummary {
+pub(crate) struct RunSummary {
 	project_id: String,
 	issue_id: String,
 	issue_identifier: String,
@@ -124,6 +133,74 @@ struct RunSummary {
 	attempt_number: i64,
 	run_id: String,
 	continuation_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IssueDispatchMode {
+	Normal,
+	Retry,
+}
+impl IssueDispatchMode {
+	fn allows_issue(
+		self,
+		issue: &TrackerIssue,
+		retry_project_slug: &str,
+		project: &ServiceConfig,
+		workflow: &WorkflowDocument,
+		state_store: &StateStore,
+		hint: RetryIssueStateHint<'_>,
+	) -> crate::prelude::Result<bool> {
+		match self {
+			Self::Normal => Ok(issue_passes_dispatch_policy(issue, workflow)),
+			Self::Retry => issue_passes_retry_dispatch_policy(
+				issue,
+				retry_project_slug,
+				project,
+				workflow,
+				state_store,
+				hint,
+			),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostReviewLaneDecision {
+	Continue,
+	WaitForReview,
+	NeedsReviewRepair,
+	ReadyToLand,
+	Block,
+}
+impl PostReviewLaneDecision {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Continue => "continue",
+			Self::WaitForReview => "wait_for_review",
+			Self::NeedsReviewRepair => "needs_review_repair",
+			Self::ReadyToLand => "ready_to_land",
+			Self::Block => "blocked",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetryKind {
+	Continuation,
+	Failure,
+}
+
+pub(crate) enum RetryDispatchDecision {
+	Blocked { excluded_issue_ids: Vec<String> },
+	Dispatch(Box<RunSummary>),
+	Continue,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ActiveRunDisposition {
+	Terminal,
+	NonActive,
+	Stalled { idle_for: Duration },
 }
 
 struct MaterializedDaemonSpawnState {
@@ -512,6 +589,11 @@ struct PostReviewLaneClassification {
 	unresolved_review_threads: Option<usize>,
 }
 
+enum PostReviewLaneStateLoad {
+	Classification(PostReviewLaneClassification),
+	ReviewState(PullRequestReviewState),
+}
+
 struct GhPullRequestReviewStateInspector {
 	github_token_env_var: Option<String>,
 }
@@ -560,6 +642,57 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 		review_state.ok_or_else(|| {
 			eyre::eyre!("GitHub GraphQL response for `{pr_url}` did not include a pull request.")
 		})
+	}
+
+	fn inspect_review_state_for_branch_head(
+		&self,
+		cwd: &Path,
+		branch_name: &str,
+		head_oid: &str,
+	) -> crate::prelude::Result<Option<PullRequestReviewState>> {
+		let github_token = resolve_configured_env_var(
+			"github.token_env_var",
+			self.github_token_env_var.as_deref(),
+		)?;
+		let mut command = Command::new("gh");
+
+		command.args([
+			"pr",
+			"list",
+			"--head",
+			branch_name,
+			"--state",
+			"all",
+			"--json",
+			"url,state,headRefOid",
+		]);
+		command.current_dir(cwd);
+
+		github::configure_gh_command(&mut command, github_token.as_str());
+
+		let output = command.output()?;
+
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+
+			eyre::bail!(
+				"Failed to inspect retained pull requests for branch `{branch_name}`: {}",
+				stderr.trim()
+			);
+		}
+
+		let pr_url = serde_json::from_slice::<Vec<PullRequestBranchLookupEntry>>(&output.stdout)?
+			.into_iter()
+			.find(|entry| {
+				entry.head_ref_oid == head_oid
+					&& matches!(entry.state.as_str(), "OPEN" | "MERGED" | "CLOSED")
+			})
+			.map(|entry| entry.url);
+		let Some(pr_url) = pr_url else {
+			return Ok(None);
+		};
+
+		self.inspect_review_state(cwd, &pr_url).map(Some)
 	}
 }
 
@@ -701,6 +834,14 @@ struct PullRequestPageInfo {
 }
 
 #[derive(Deserialize)]
+struct PullRequestBranchLookupEntry {
+	url: String,
+	state: String,
+	#[serde(rename = "headRefOid")]
+	head_ref_oid: String,
+}
+
+#[derive(Deserialize)]
 struct PullRequestCommitConnection {
 	nodes: Vec<PullRequestCommitNode>,
 }
@@ -719,72 +860,6 @@ struct PullRequestCommitPayload {
 #[derive(Deserialize)]
 struct PullRequestStatusCheckRollup {
 	state: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IssueDispatchMode {
-	Normal,
-	Retry,
-}
-impl IssueDispatchMode {
-	fn allows_issue(
-		self,
-		issue: &TrackerIssue,
-		retry_project_slug: &str,
-		project: &ServiceConfig,
-		workflow: &WorkflowDocument,
-		state_store: &StateStore,
-		hint: RetryIssueStateHint<'_>,
-	) -> crate::prelude::Result<bool> {
-		match self {
-			Self::Normal => Ok(issue_passes_dispatch_policy(issue, workflow)),
-			Self::Retry => issue_passes_retry_dispatch_policy(
-				issue,
-				retry_project_slug,
-				project,
-				workflow,
-				state_store,
-				hint,
-			),
-		}
-	}
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PostReviewLaneDecision {
-	WaitForReview,
-	NeedsReviewRepair,
-	ReadyToLand,
-	Block,
-}
-impl PostReviewLaneDecision {
-	fn as_str(self) -> &'static str {
-		match self {
-			Self::WaitForReview => "wait_for_review",
-			Self::NeedsReviewRepair => "needs_review_repair",
-			Self::ReadyToLand => "ready_to_land",
-			Self::Block => "blocked",
-		}
-	}
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetryKind {
-	Continuation,
-	Failure,
-}
-
-enum RetryDispatchDecision {
-	Blocked { excluded_issue_ids: Vec<String> },
-	Dispatch(Box<RunSummary>),
-	Continue,
-}
-
-#[derive(Clone, Debug)]
-enum ActiveRunDisposition {
-	Terminal,
-	NonActive,
-	Stalled { idle_for: Duration },
 }
 
 pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()> {
@@ -4005,40 +4080,15 @@ fn classify_post_review_lane<I>(
 where
 	I: PullRequestReviewStateInspector,
 {
-	let Some(review_handoff) = snapshot.review_handoff.as_ref() else {
-		return Ok(blocked_post_review_lane("missing_review_handoff_record"));
-	};
-	let local_head_oid = match validate_post_review_lane_workspace(snapshot, review_handoff) {
-		Ok(local_head_oid) => local_head_oid,
-		Err(reason) => return Ok(blocked_post_review_lane(reason)),
-	};
-	let review_state = match review_state_inspector
-		.inspect_review_state(snapshot.workspace.workspace_path(), review_handoff.pr_url())
-	{
-		Ok(review_state) => review_state,
-		Err(_error) => return Ok(blocked_post_review_lane("pull_request_state_read_failed")),
+	let review_state = match load_post_review_lane_review_state(snapshot, review_state_inspector)? {
+		PostReviewLaneStateLoad::Classification(classification) => return Ok(classification),
+		PostReviewLaneStateLoad::ReviewState(review_state) => review_state,
 	};
 	let mut classification = initial_post_review_lane_classification(&review_state);
 
-	if review_state.head_ref_name != review_handoff.branch_name()
-		|| review_state.head_ref_name != snapshot.workspace.branch_name()
-	{
-		classification.decision = PostReviewLaneDecision::Block;
-		classification.reason = String::from("pull_request_branch_mismatch");
-
-		return Ok(classification);
-	}
-	if review_state.head_ref_oid != review_handoff.pr_head_oid()
-		|| review_state.head_ref_oid != local_head_oid
-	{
-		classification.decision = PostReviewLaneDecision::Block;
-		classification.reason = String::from("pull_request_head_mismatch");
-
-		return Ok(classification);
-	}
 	if review_state.state == "MERGED" {
-		classification.decision = PostReviewLaneDecision::Block;
-		classification.reason = String::from("pull_request_already_merged");
+		classification.decision = PostReviewLaneDecision::Continue;
+		classification.reason = String::from("pull_request_merged_closeout_pending");
 
 		return Ok(classification);
 	}
@@ -4113,6 +4163,97 @@ where
 	Ok(classification)
 }
 
+fn load_post_review_lane_review_state<I>(
+	snapshot: &PostReviewLaneSnapshot,
+	review_state_inspector: &I,
+) -> crate::prelude::Result<PostReviewLaneStateLoad>
+where
+	I: PullRequestReviewStateInspector,
+{
+	if let Some(review_handoff) = snapshot.review_handoff.as_ref() {
+		let local_head_oid = match validate_post_review_lane_workspace(snapshot, review_handoff) {
+			Ok(local_head_oid) => local_head_oid,
+			Err(reason) =>
+				return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+					reason,
+				))),
+		};
+		let review_state = match review_state_inspector
+			.inspect_review_state(snapshot.workspace.workspace_path(), review_handoff.pr_url())
+		{
+			Ok(review_state) => review_state,
+			Err(_error) =>
+				return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+					"pull_request_state_read_failed",
+				))),
+		};
+
+		return Ok(validate_post_review_lane_review_state(
+			review_state,
+			snapshot.workspace.branch_name(),
+			review_handoff.pr_head_oid(),
+			local_head_oid,
+		));
+	}
+
+	let Some(local_branch_name) = snapshot.local_branch_name.as_deref() else {
+		return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+			"missing_review_handoff_record",
+		)));
+	};
+	let Some(local_head_oid) = snapshot.local_head_oid.as_deref() else {
+		return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+			"missing_review_handoff_record",
+		)));
+	};
+	let Some(review_state) = (match review_state_inspector.inspect_review_state_for_branch_head(
+		snapshot.workspace.workspace_path(),
+		local_branch_name,
+		local_head_oid,
+	) {
+		Ok(review_state) => review_state,
+		Err(_error) =>
+			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+				"pull_request_state_read_failed",
+			))),
+	}) else {
+		return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+			"missing_review_handoff_record",
+		)));
+	};
+
+	Ok(validate_post_review_lane_review_state(
+		review_state,
+		snapshot.workspace.branch_name(),
+		local_head_oid,
+		local_head_oid,
+	))
+}
+
+fn validate_post_review_lane_review_state(
+	review_state: PullRequestReviewState,
+	expected_branch_name: &str,
+	expected_pr_head_oid: &str,
+	local_head_oid: &str,
+) -> PostReviewLaneStateLoad {
+	if review_state.head_ref_name != expected_branch_name {
+		return PostReviewLaneStateLoad::Classification(blocked_post_review_lane_from_state(
+			&review_state,
+			"pull_request_branch_mismatch",
+		));
+	}
+	if review_state.head_ref_oid != expected_pr_head_oid
+		|| review_state.head_ref_oid != local_head_oid
+	{
+		return PostReviewLaneStateLoad::Classification(blocked_post_review_lane_from_state(
+			&review_state,
+			"pull_request_head_mismatch",
+		));
+	}
+
+	PostReviewLaneStateLoad::ReviewState(review_state)
+}
+
 fn validate_post_review_lane_workspace<'a>(
 	snapshot: &'a PostReviewLaneSnapshot,
 	review_handoff: &ReviewHandoffMarker,
@@ -4155,6 +4296,18 @@ fn initial_post_review_lane_classification(
 		check_state: review_state.status_check_rollup_state.clone(),
 		unresolved_review_threads: Some(review_state.unresolved_review_threads),
 	}
+}
+
+fn blocked_post_review_lane_from_state(
+	review_state: &PullRequestReviewState,
+	reason: &str,
+) -> PostReviewLaneClassification {
+	let mut classification = initial_post_review_lane_classification(review_state);
+
+	classification.decision = PostReviewLaneDecision::Block;
+	classification.reason = reason.to_owned();
+
+	classification
 }
 
 fn blocked_post_review_lane(reason: &str) -> PostReviewLaneClassification {
@@ -4271,8 +4424,8 @@ fn merge_state_allows_ready_to_land(merge_state_status: &str) -> bool {
 }
 
 fn approvals_are_satisfied(review_decision: Option<&str>, pending_review_requests: usize) -> bool {
-	matches!(review_decision, Some("APPROVED"))
-		|| (review_decision.is_none() && pending_review_requests == 0)
+	pending_review_requests == 0
+		&& (matches!(review_decision, Some("APPROVED")) || review_decision.is_none())
 }
 
 fn checks_require_wait(check_state: Option<&str>) -> bool {
@@ -4784,10 +4937,23 @@ mod tests {
 
 	struct FakePullRequestReviewStateInspector {
 		responses: RefCell<Vec<crate::prelude::Result<PullRequestReviewState>>>,
+		branch_head_responses: RefCell<Vec<crate::prelude::Result<Option<PullRequestReviewState>>>>,
 	}
 	impl FakePullRequestReviewStateInspector {
 		fn new(responses: Vec<crate::prelude::Result<PullRequestReviewState>>) -> Self {
-			Self { responses: RefCell::new(responses) }
+			Self {
+				responses: RefCell::new(responses),
+				branch_head_responses: RefCell::new(Vec::new()),
+			}
+		}
+
+		fn with_branch_head_responses(
+			mut self,
+			responses: Vec<crate::prelude::Result<Option<PullRequestReviewState>>>,
+		) -> Self {
+			self.branch_head_responses = RefCell::new(responses);
+
+			self
 		}
 	}
 	impl PullRequestReviewStateInspector for FakePullRequestReviewStateInspector {
@@ -4797,6 +4963,19 @@ mod tests {
 			_pr_url: &str,
 		) -> crate::prelude::Result<PullRequestReviewState> {
 			self.responses.borrow_mut().remove(0)
+		}
+
+		fn inspect_review_state_for_branch_head(
+			&self,
+			_cwd: &Path,
+			_branch_name: &str,
+			_head_oid: &str,
+		) -> crate::prelude::Result<Option<PullRequestReviewState>> {
+			if self.branch_head_responses.borrow().is_empty() {
+				return Ok(None);
+			}
+
+			self.branch_head_responses.borrow_mut().remove(0)
 		}
 	}
 	struct TestEnvVarGuard {
@@ -8072,6 +8251,67 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_recovers_missing_review_handoff_record_from_branch_head() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+		let head_oid = String::from_utf8(
+			Command::new("git")
+				.arg("-C")
+				.arg(&workspace.path)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse should run")
+				.stdout,
+		)
+		.expect("git output should be utf-8")
+		.trim()
+		.to_owned();
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(Vec::new()).with_branch_head_responses(vec![
+				Ok(Some(sample_pull_request_review_state(
+					pr_url,
+					&workspace.branch_name,
+					&head_oid,
+					Some("APPROVED"),
+					"MERGEABLE",
+					"CLEAN",
+					Some("SUCCESS"),
+					0,
+				))),
+			]),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "ready_to_land");
+		assert_eq!(lanes[0].reason, "approvals_and_checks_satisfied");
+		assert_eq!(lanes[0].pr_url.as_deref(), Some(pr_url));
+	}
+
+	#[test]
 	fn build_post_review_lane_statuses_blocks_nonactive_labeled_post_review_issues() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -8402,6 +8642,123 @@ read_first = [{read_first}]
 
 		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
 		assert_eq!(classification.reason, "waiting_for_review");
+	}
+
+	#[test]
+	fn classify_post_review_lane_waits_when_approved_review_still_has_pending_requests() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_branch_name: Some(String::from("x/pubfi-pub-101")),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(
+				sample_pull_request_review_state_with_pending_requests(
+					"https://github.com/hack-ink/maestro/pull/174",
+					"x/pubfi-pub-101",
+					&head_oid,
+					Some("APPROVED"),
+					"MERGEABLE",
+					"CLEAN",
+					Some("SUCCESS"),
+					0,
+					1,
+				),
+			)]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
+		assert_eq!(classification.reason, "waiting_for_review");
+	}
+
+	#[test]
+	fn classify_post_review_lane_continues_when_pull_request_is_already_merged() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_branch_name: Some(String::from("x/pubfi-pub-101")),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let mut review_state = sample_pull_request_review_state(
+			"https://github.com/hack-ink/maestro/pull/174",
+			"x/pubfi-pub-101",
+			&head_oid,
+			Some("APPROVED"),
+			"MERGEABLE",
+			"CLEAN",
+			Some("SUCCESS"),
+			0,
+		);
+
+		review_state.state = String::from("MERGED");
+
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(review_state)]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::Continue);
+		assert_eq!(classification.reason, "pull_request_merged_closeout_pending");
 	}
 
 	#[test]
