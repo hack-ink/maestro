@@ -9,11 +9,8 @@ pub(crate) struct PullRequestLocator {
 	pub(crate) number: u64,
 }
 
-pub(crate) fn configure_gh_command(command: &mut Command, github_token: Option<&str>) {
-	if let Some(token) = github_token {
-		command.env("GH_TOKEN", token);
-	}
-
+pub(crate) fn configure_gh_command(command: &mut Command, github_token: &str) {
+	command.env("GH_TOKEN", github_token);
 	command.env("GH_PROMPT_DISABLED", "1");
 }
 
@@ -88,7 +85,7 @@ mod tests {
 	fn configure_gh_command_sets_explicit_token_when_present() {
 		let mut command = std::process::Command::new("gh");
 
-		super::configure_gh_command(&mut command, Some("ghp_example"));
+		super::configure_gh_command(&mut command, "ghp_example");
 
 		let gh_token = command
 			.get_envs()
@@ -100,18 +97,18 @@ mod tests {
 	}
 
 	#[test]
-	fn configure_gh_command_preserves_standard_auth_fallback_when_token_is_missing() {
+	fn configure_gh_command_disables_prompt_for_explicit_token_auth() {
 		let mut command = std::process::Command::new("gh");
 
-		super::configure_gh_command(&mut command, None);
+		super::configure_gh_command(&mut command, "ghp_example");
 
 		assert!(
 			command
 				.get_envs()
-				.find_map(|(key, value)| (key == OsStr::new("GH_TOKEN")).then_some(value))
+				.find_map(|(key, value)| (key == OsStr::new("GH_PROMPT_DISABLED")).then_some(value))
 				.flatten()
-				.is_none(),
-			"configure_gh_command should not force GH_TOKEN when no explicit token is configured"
+				.is_some_and(|value| value == OsStr::new("1")),
+			"configure_gh_command should disable interactive gh prompts"
 		);
 	}
 }

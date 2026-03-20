@@ -49,7 +49,7 @@ pub(crate) trait PullRequestInspector {
 		&self,
 		cwd: &std::path::Path,
 		pr_url: &str,
-		github_token: Option<&str>,
+		github_token: &str,
 	) -> std::result::Result<PullRequestDetails, String>;
 }
 
@@ -639,7 +639,7 @@ impl<'a> TrackerToolBridge<'a> {
 		let pull_request = self.pull_request_inspector.inspect_pull_request(
 			&review_context.cwd,
 			pr_url,
-			review_context.github_token.as_deref(),
+			review_context.github_token.as_str(),
 		)?;
 		let local_repo = self.local_repo_inspector.inspect_local_repo(&review_context.cwd)?;
 
@@ -970,7 +970,7 @@ pub(crate) struct ReviewHandoffContext {
 	pub(crate) run_id: String,
 	pub(crate) workspace_path: String,
 	pub(crate) cwd: PathBuf,
-	pub(crate) github_token: Option<String>,
+	pub(crate) github_token: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1052,7 +1052,7 @@ impl PullRequestInspector for GhPullRequestInspector {
 		&self,
 		cwd: &std::path::Path,
 		pr_url: &str,
-		github_token: Option<&str>,
+		github_token: &str,
 	) -> std::result::Result<PullRequestDetails, String> {
 		let mut command = Command::new("gh");
 
@@ -1407,7 +1407,7 @@ mod tests {
 			&self,
 			_cwd: &Path,
 			_pr_url: &str,
-			_github_token: Option<&str>,
+			_github_token: &str,
 		) -> std::result::Result<PullRequestDetails, String> {
 			self.responses.borrow_mut().remove(0)
 		}
@@ -1421,9 +1421,9 @@ mod tests {
 			&self,
 			_cwd: &Path,
 			_pr_url: &str,
-			github_token: Option<&str>,
+			github_token: &str,
 		) -> std::result::Result<PullRequestDetails, String> {
-			assert_eq!(github_token, Some(self.expected_token.as_str()));
+			assert_eq!(github_token, self.expected_token.as_str());
 
 			Ok(self.response.clone())
 		}
@@ -1636,7 +1636,7 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: PathBuf::from("/tmp/PUB-618"),
-			github_token: None,
+			github_token: String::from("ghp_review"),
 		}
 	}
 
@@ -1647,7 +1647,7 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: cwd.to_path_buf(),
-			github_token: None,
+			github_token: String::from("ghp_review"),
 		}
 	}
 
@@ -1681,10 +1681,7 @@ Use the tracker tools.
 			response: sample_pull_request(),
 		};
 		let local_repo_inspector = FakeLocalRepoInspector::new(vec![Ok(sample_local_repo())]);
-		let mut review_context = sample_review_context();
-
-		review_context.github_token = Some(String::from("ghp_review"));
-
+		let review_context = sample_review_context();
 		let bridge = TrackerToolBridge::with_review_handoff_for_test(
 			&tracker,
 			&issue,

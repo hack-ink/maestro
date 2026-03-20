@@ -32,7 +32,7 @@ When you need a shorter operator snapshot, pass `--limit` to `cargo run -- statu
 
 ## Pilot Guide
 
-For the first real pilot, target `maestro` itself before onboarding another repository. Keep the live service config at `./tmp/maestro.toml`, and keep issue workspaces under the repo-local `.workspaces/` directory. If you need a tracked template, start from `./maestro.example.toml`. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage. Configure the Linear token through `[tracker].api_key` and, when you want explicit non-interactive GitHub auth for PR-backed review handoff and post-review status, configure `[github].token` in the same TOML file.
+For the first real pilot, target `maestro` itself before onboarding another repository. Keep the live service config at `./tmp/maestro.toml`, and keep issue workspaces under the repo-local `.workspaces/` directory. If you need a tracked template, start from `./maestro.example.toml`. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage. Configure secret authority through TOML by naming the required environment variables in `[tracker].api_key_env_var` and `[github].token_env_var`; `maestro` does not infer GitHub auth from ambient shell state.
 
 Recommended order:
 

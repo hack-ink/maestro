@@ -506,7 +506,7 @@ struct PostReviewLaneClassification {
 }
 
 struct GhPullRequestReviewStateInspector {
-	github_token: Option<String>,
+	github_token: String,
 }
 impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 	fn inspect_review_state(
@@ -526,7 +526,7 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 				locator.number,
 				review_threads_after.as_deref(),
 				pr_url,
-				self.github_token.as_deref(),
+				self.github_token.as_str(),
 			)?;
 			let next_cursor = match &mut review_state {
 				Some(review_state) =>
@@ -889,8 +889,9 @@ pub(crate) fn print_status(
 	hydrate_status_snapshot_state(&config, &state_store, recovered_state)?;
 
 	let mut snapshot = build_operator_status_snapshot(&config, &state_store, limit)?;
-	let review_state_inspector =
-		GhPullRequestReviewStateInspector { github_token: config.github().resolve_token()? };
+	let review_state_inspector = GhPullRequestReviewStateInspector {
+		github_token: config.github().resolve_required_token()?,
+	};
 
 	snapshot.post_review_lanes = build_post_review_lane_statuses(
 		&tracker,
@@ -916,7 +917,7 @@ fn query_pull_request_review_state_page(
 	number: u64,
 	review_threads_after: Option<&str>,
 	pr_url: &str,
-	github_token: Option<&str>,
+	github_token: &str,
 ) -> crate::prelude::Result<PullRequestReviewStateNode> {
 	let mut command = Command::new("gh");
 
@@ -3032,7 +3033,7 @@ where
 		.to_owned();
 	let model =
 		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
-	let github_token = project.github().resolve_token()?;
+	let github_token = project.github().resolve_required_token()?;
 	let tracker_tool_bridge = TrackerToolBridge::with_run_context(
 		tracker,
 		&issue_run.issue,
@@ -5038,7 +5039,7 @@ mod tests {
 
 				[tracker]
 				project_slug = "{project_slug}"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 			"#,
 			repo_root.display(),
 			workspace_root.display()

@@ -2,18 +2,20 @@
   "spec": {
     "schema": "plan/1",
     "plan_id": "maestro-xy-173-review-state-classifier",
-    "goal": "Implement the first runtime slice of post-In-Review autonomy by letting Maestro classify an owned PR-backed lane as wait_for_review, needs_review_repair, ready_to_land, or blocked from authoritative GitHub review and check state.",
+    "goal": "Implement the first runtime slice of post-In-Review autonomy by letting Maestro classify an owned PR-backed lane as wait_for_review, needs_review_repair, ready_to_land, or blocked from authoritative GitHub review and check state, while making service-config secret authority explicit through TOML-only `*_env_var` fields.",
     "success_criteria": [
       "Maestro can re-read the recorded PR for an owned In Review lane and classify the lane as wait_for_review, needs_review_repair, ready_to_land, or blocked without mutating the lane.",
       "The classification uses authoritative PR identity, review-thread state, review verdicts, required-check state, and mergeability instead of user chat relay.",
       "The current runtime exposes the classification through status or deterministic logs for the owned lane and handles the absence of an eligible In Review lane explicitly.",
-      "Docs and targeted tests cover the classification rules and the ownership boundary between signal intake and later repair or landing work."
+      "Docs and targeted tests cover the classification rules and the ownership boundary between signal intake and later repair or landing work.",
+      "Service config accepts only explicit TOML-declared secret env-var names such as `tracker.api_key_env_var` and `github.token_env_var`; it does not accept literal tokens, `$ENV_VAR` value overloading, or ambient GitHub auth fallback."
     ],
     "constraints": [
       "Implement against the accepted XY-160 and XY-176 lifecycle and owned-lane policy instead of inventing new skill-specific states.",
       "Do not perform repair, merge, closeout, or cleanup in this issue.",
       "Do not rely on Linear comment rereads alone for PR identity because the current tracker abstraction does not expose comment or attachment history.",
-      "Keep the branch rooted at the latest origin/main in the isolated XY-173 workspace; do not touch the root checkout's local WORKFLOW.md modification."
+      "Keep the branch rooted at the latest origin/main in the isolated XY-173 workspace; do not touch the root checkout's local WORKFLOW.md modification.",
+      "Do not preserve compatibility with the old `tracker.api_key`, `github.token`, `$ENV_VAR` value syntax, or ambient `gh auth login` fallback; this batch should fail fast on the new explicit schema."
     ],
     "defaults": {
       "status_surface": "reuse local status/reporting surfaces before adding new commands",
@@ -23,7 +25,8 @@
         "ready_to_land",
         "blocked"
       ],
-      "authoritative_pr_identity": "must be persisted by the runtime, not reconstructed from chat"
+      "authoritative_pr_identity": "must be persisted by the runtime, not reconstructed from chat",
+      "secret_authority": "service config names the required environment variables explicitly via `*_env_var`; runtime does not infer auth from ambient shell state"
     },
     "tasks": [
       {
@@ -94,8 +97,53 @@
         "depends_on": [
           "task-2"
         ]
-      }
-    ],
+        },
+        {
+          "id": "task-4",
+          "title": "Replace dual-use secret fields with explicit env-var contract",
+          "status": "done",
+          "objective": "Change the service config schema, runtime resolution, and GitHub auth plumbing to use TOML-only `tracker.api_key_env_var` and `github.token_env_var` fields with no compatibility fallback.",
+          "inputs": [
+            "Current XY-173 config/auth implementation",
+            "User directive to remove compatibility and ambient auth fallback"
+          ],
+          "outputs": [
+            "Updated config schema and auth resolution code",
+            "Regression tests rejecting the old fields and fallback behavior"
+          ],
+          "verification": [
+            "Targeted config and GitHub auth tests",
+            "cargo make fmt-check",
+            "cargo make lint"
+          ],
+          "depends_on": [
+            "task-3"
+          ]
+        },
+        {
+          "id": "task-5",
+          "title": "Align docs evidence and finish verification for the env-var contract",
+          "status": "done",
+          "objective": "Update examples, runbooks, and plan evidence so the new explicit `*_env_var` contract is the only documented path, then rerun the full repo gates.",
+          "inputs": [
+            "Task 4 implementation",
+            "Current pilot and example config docs"
+          ],
+          "outputs": [
+            "Updated examples and operator docs",
+            "Plan evidence for the contract change and full verification"
+          ],
+          "verification": [
+            "cargo make fmt-check",
+            "cargo make lint",
+            "cargo make test",
+            "git diff --check"
+          ],
+          "depends_on": [
+            "task-4"
+          ]
+        }
+      ],
     "replan_policy": {
       "owner": "plan-writing",
       "triggers": [
@@ -121,9 +169,11 @@
       "Review repair paginated GitHub review-thread inspection in `src/orchestrator.rs`, counted unresolved threads beyond the first page, and added guards plus tests for mixed-snapshot pagination and missing end-cursor responses.",
       "Late review repair now refreshes managed `.workspaces/*` lanes before post-review GitHub inspection, downgrades refresh failures to a lane-local `workspace_git_metadata_refresh_failed` block, and treats `reviewDecision = null` as approval-satisfied when checks are green and the PR is mergeable so zero-required-review repositories can reach `ready_to_land`.",
       "Fresh verification for the late review repair passed: `cargo test build_post_review_lane_statuses_ -- --nocapture`, `cargo test classify_post_review_lane_ready_to_land_allows_zero_required_review_repos -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, `cargo make test`, plan validate/read-back, and `git diff --check`.",
-      "Review repair replaced the hard-coded `codex.github-identity -> GITHUB_PAT_X/Y` mapping with optional `github.token` service-config resolution plus ambient `GH_TOKEN` or `gh auth login` fallback, threaded the configured token through review handoff validation, and removed the post-review status path's retained-workspace refresh so `maestro status` stays read-only for owned lanes. Fresh verification passed: `cargo test review_handoff_inspection_uses_configured_github_token -- --nocapture`, `cargo test build_post_review_lane_statuses_leaves_managed_workspace_git_metadata_untouched -- --nocapture`, `cargo test resolves_optional_github_token_reference -- --nocapture`, `cargo test rejects_empty_github_token_when_present -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, and `cargo make test`."
+      "Review repair replaced the hard-coded `codex.github-identity -> GITHUB_PAT_X/Y` mapping with optional `github.token` service-config resolution plus ambient `GH_TOKEN` or `gh auth login` fallback, threaded the configured token through review handoff validation, and removed the post-review status path's retained-workspace refresh so `maestro status` stays read-only for owned lanes. Fresh verification passed: `cargo test review_handoff_inspection_uses_configured_github_token -- --nocapture`, `cargo test build_post_review_lane_statuses_leaves_managed_workspace_git_metadata_untouched -- --nocapture`, `cargo test resolves_optional_github_token_reference -- --nocapture`, `cargo test rejects_empty_github_token_when_present -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, and `cargo make test`.",
+      "Switched the service-config secret contract to explicit TOML-declared env-var names only: `tracker.api_key_env_var` and `github.token_env_var`. The runtime now rejects legacy `tracker.api_key`, `github.token`, and `$ENV_VAR` value overloading, and GitHub operations require configured token authority instead of ambient `GH_TOKEN` or `gh auth login` fallback. Updated `maestro.example.toml`, `README.md`, and `docs/guide/pilot.md`, then reran targeted auth/config tests plus full verification: `cargo test configure_gh_command --manifest-path .workspaces/XY-173/Cargo.toml`, `cargo test resolve_required_github_token_rejects_missing_token_env_var --manifest-path .workspaces/XY-173/Cargo.toml`, `cargo test review_handoff_inspection_uses_configured_github_token --manifest-path .workspaces/XY-173/Cargo.toml`, `cargo test build_post_review_lane_statuses_ --manifest-path .workspaces/XY-173/Cargo.toml`, `cargo test rejects_legacy_tracker_api_key_field --manifest-path .workspaces/XY-173/Cargo.toml`, `cargo make fmt-check`, `cargo make lint`, `cargo make test`, plan validate/read-back, and `git diff --check`.",
+      "Final pre-push self-review removed the last optional GitHub token resolver helper so the checked-in service-config API exposes only the explicit required-token path for GitHub-backed flows, then reran `cargo test resolves_required_github_token_from_env_var_name --manifest-path .workspaces/XY-173/Cargo.toml`, `cargo make fmt-check`, `cargo make lint`, `cargo make test`, plan validate/read-back, and `git diff --check` on the final diff."
     ],
-    "last_updated": "2026-03-20T03:11:15Z",
+    "last_updated": "2026-03-20T04:13:17Z",
     "replan_reason": null,
     "context_snapshot": {
       "issue": "XY-173",

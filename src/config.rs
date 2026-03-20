@@ -92,7 +92,7 @@ impl ServiceConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProjectTrackerConfig {
 	project_slug: String,
-	api_key: String,
+	api_key_env_var: String,
 }
 impl ProjectTrackerConfig {
 	/// Stable Linear project slug.
@@ -100,23 +100,22 @@ impl ProjectTrackerConfig {
 		&self.project_slug
 	}
 
-	/// Tracker API key value or environment-variable reference like `$LINEAR_API_KEY`.
-	pub fn api_key(&self) -> &str {
-		&self.api_key
+	/// Name of the environment variable that stores the tracker API key.
+	pub fn api_key_env_var(&self) -> &str {
+		&self.api_key_env_var
 	}
 
-	/// Resolve the configured tracker API key into a concrete token string.
+	/// Resolve the configured tracker API key env-var name into a concrete token string.
 	pub fn resolve_api_key(&self) -> Result<String> {
-		resolve_secret_reference("tracker.api_key", self.api_key())
+		resolve_secret_env_var("tracker.api_key_env_var", self.api_key_env_var())
 	}
 
 	fn validate(&self) -> Result<()> {
 		if self.project_slug.trim().is_empty() {
 			eyre::bail!("`tracker.project_slug` must not be empty.");
 		}
-		if self.api_key.trim().is_empty() {
-			eyre::bail!("`tracker.api_key` must not be empty.");
-		}
+
+		validate_env_var_name("tracker.api_key_env_var", self.api_key_env_var())?;
 
 		Ok(())
 	}
@@ -126,24 +125,28 @@ impl ProjectTrackerConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectGitHubConfig {
-	token: Option<String>,
+	token_env_var: Option<String>,
 }
 impl ProjectGitHubConfig {
-	/// GitHub token or environment-variable reference like `$GITHUB_PAT_Y`.
-	pub fn token(&self) -> Option<&str> {
-		self.token.as_deref()
+	/// Name of the environment variable that stores the GitHub token.
+	pub fn token_env_var(&self) -> Option<&str> {
+		self.token_env_var.as_deref()
 	}
 
-	/// Resolve the configured GitHub token into a concrete string when present.
-	pub fn resolve_token(&self) -> Result<Option<String>> {
-		self.token().map(|value| resolve_secret_reference("github.token", value)).transpose()
+	/// Resolve the configured GitHub token env-var name into a concrete string.
+	pub fn resolve_required_token(&self) -> Result<String> {
+		let token_env_var = self.token_env_var().ok_or_else(|| {
+			eyre::eyre!(
+				"`github.token_env_var` must be configured for GitHub-backed review handoff and post-review status inspection."
+			)
+		})?;
+
+		resolve_secret_env_var("github.token_env_var", token_env_var)
 	}
 
 	fn validate(&self) -> Result<()> {
-		if let Some(token) = self.token()
-			&& token.trim().is_empty()
-		{
-			eyre::bail!("`github.token` must not be empty when configured.");
+		if let Some(token_env_var) = self.token_env_var() {
+			validate_env_var_name("github.token_env_var", token_env_var)?;
 		}
 
 		Ok(())
@@ -180,20 +183,46 @@ fn default_workflow_path() -> PathBuf {
 	PathBuf::from("WORKFLOW.md")
 }
 
-fn resolve_secret_reference(field_name: &str, value: &str) -> Result<String> {
-	if let Some(env_var) = value.strip_prefix('$') {
-		if env_var.trim().is_empty() {
-			eyre::bail!("`{field_name}` env reference must include a variable name.");
-		}
+fn validate_env_var_name(field_name: &str, value: &str) -> Result<()> {
+	let trimmed = value.trim();
 
-		return env::var(env_var).map_err(|error| {
-			eyre::eyre!(
-				"Failed to read environment variable `{env_var}` referenced by `{field_name}`: {error}"
-			)
-		});
+	if trimmed.is_empty() {
+		eyre::bail!("`{field_name}` must not be empty.");
+	}
+	if trimmed != value {
+		eyre::bail!("`{field_name}` must not include surrounding whitespace.");
+	}
+	if trimmed.starts_with('$') {
+		eyre::bail!(
+			"`{field_name}` must name the environment variable directly, without a `$` prefix."
+		);
 	}
 
-	Ok(value.to_owned())
+	let mut chars = trimmed.chars();
+	let Some(first) = chars.next() else {
+		eyre::bail!("`{field_name}` must not be empty.");
+	};
+
+	if !(first == '_' || first.is_ascii_alphabetic()) {
+		eyre::bail!(
+			"`{field_name}` must start with an ASCII letter or underscore and contain only ASCII letters, digits, or underscores."
+		);
+	}
+	if chars.any(|character| !(character == '_' || character.is_ascii_alphanumeric())) {
+		eyre::bail!("`{field_name}` must contain only ASCII letters, digits, or underscores.");
+	}
+
+	Ok(())
+}
+
+fn resolve_secret_env_var(field_name: &str, env_var: &str) -> Result<String> {
+	validate_env_var_name(field_name, env_var)?;
+
+	env::var(env_var).map_err(|error| {
+		eyre::eyre!(
+			"Failed to read environment variable `{env_var}` referenced by `{field_name}`: {error}"
+		)
+	})
 }
 
 #[cfg(test)]
@@ -214,7 +243,7 @@ mod tests {
 
 				[tracker]
 				project_slug = "pubfi"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 
 				[agent]
 				transport = "stdio://"
@@ -226,10 +255,7 @@ mod tests {
 		assert_eq!(config.id(), "pubfi");
 		assert_eq!(config.workflow_path(), Path::new("WORKFLOW.md"));
 		assert_eq!(config.tracker().project_slug(), "pubfi");
-		assert_eq!(
-			config.tracker().resolve_api_key().expect("literal key should resolve"),
-			"lin_api_test"
-		);
+		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
 		assert_eq!(config.agent().model(), Some("gpt-5-codex"));
 	}
 
@@ -246,7 +272,7 @@ mod tests {
 
 				[tracker]
 				project_slug = "pubfi"
-				api_key = "$HOME"
+				api_key_env_var = "HOME"
 			"#,
 		)
 		.expect("temp config should be written");
@@ -259,7 +285,7 @@ mod tests {
 	}
 
 	#[test]
-	fn resolves_optional_github_token_reference() {
+	fn resolves_required_github_token_from_env_var_name() {
 		let config = ServiceConfig::parse_toml(
 			r#"
 				id = "pubfi"
@@ -268,19 +294,19 @@ mod tests {
 
 				[tracker]
 				project_slug = "pubfi"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 
 				[github]
-				token = "$HOME"
+				token_env_var = "HOME"
 			"#,
 		)
 		.expect("service config should parse");
 
-		assert!(!config.github().resolve_token().expect("HOME should resolve").unwrap().is_empty());
+		assert!(!config.github().resolve_required_token().expect("HOME should resolve").is_empty());
 	}
 
 	#[test]
-	fn rejects_empty_github_token_when_present() {
+	fn rejects_empty_github_token_env_var_when_present() {
 		let result = ServiceConfig::parse_toml(
 			r#"
 				id = "pubfi"
@@ -289,15 +315,15 @@ mod tests {
 
 				[tracker]
 				project_slug = "pubfi"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 
 				[github]
-				token = ""
+				token_env_var = ""
 			"#,
 		);
-		let error = result.expect_err("empty github token should be rejected");
+		let error = result.expect_err("empty github token env-var should be rejected");
 
-		assert!(error.to_string().contains("github.token"));
+		assert!(error.to_string().contains("github.token_env_var"));
 	}
 
 	#[test]
@@ -310,7 +336,7 @@ mod tests {
 
 				[tracker]
 				project = "pubfi"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 			"#,
 		);
 		let error = result.expect_err("legacy `project` key should be rejected");
@@ -329,13 +355,92 @@ mod tests {
 				[tracker]
 				project_slug = "pubfi"
 				project = "legacy-pubfi"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 			"#,
 		);
 		let error =
 			result.expect_err("legacy `project` key should be rejected even with `project_slug`");
 
 		assert!(error.to_string().contains("unknown field `project`"));
+	}
+
+	#[test]
+	fn rejects_legacy_tracker_api_key_field() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key = "$HOME"
+			"#,
+		);
+		let error = result.expect_err("legacy `api_key` key should be rejected");
+
+		assert!(error.to_string().contains("unknown field `api_key`"));
+	}
+
+	#[test]
+	fn rejects_dollar_prefixed_tracker_api_key_env_var() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "$HOME"
+			"#,
+		);
+		let error = result.expect_err("dollar-prefixed env var name should be rejected");
+
+		assert!(error.to_string().contains("without a `$` prefix"));
+	}
+
+	#[test]
+	fn rejects_legacy_github_token_field() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[github]
+				token = "$HOME"
+			"#,
+		);
+		let error = result.expect_err("legacy `token` key should be rejected");
+
+		assert!(error.to_string().contains("unknown field `token`"));
+	}
+
+	#[test]
+	fn resolve_required_github_token_rejects_missing_token_env_var() {
+		let config = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+			"#,
+		)
+		.expect("service config should parse");
+		let error = config
+			.github()
+			.resolve_required_token()
+			.expect_err("missing github token env-var should be rejected");
+
+		assert!(error.to_string().contains("github.token_env_var"));
 	}
 
 	#[test]
@@ -348,7 +453,7 @@ mod tests {
 
 				[tracker]
 				project_slug = "one"
-				api_key = "lin_api_test"
+				api_key_env_var = "HOME"
 			"#,
 		);
 
