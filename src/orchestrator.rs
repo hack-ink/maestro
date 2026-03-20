@@ -57,6 +57,9 @@ query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: Strin
       mergeStateStatus
       headRefName
       headRefOid
+      headRepository {
+        name
+      }
       headRepositoryOwner {
         login
       }
@@ -686,12 +689,21 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 			);
 		}
 
-		for entry in serde_json::from_slice::<Vec<PullRequestBranchLookupEntry>>(&output.stdout)?
-			.into_iter()
-			.filter(|entry| {
-				entry.head_ref_oid == head_oid
-					&& matches!(entry.state.as_str(), "OPEN" | "MERGED" | "CLOSED")
-			}) {
+		let mut entries =
+			serde_json::from_slice::<Vec<PullRequestBranchLookupEntry>>(&output.stdout)?
+				.into_iter()
+				.filter(|entry| {
+					entry.head_ref_oid == head_oid
+						&& matches!(entry.state.as_str(), "OPEN" | "MERGED" | "CLOSED")
+				})
+				.collect::<Vec<_>>();
+
+		entries.sort_by(|left, right| {
+			pull_request_branch_lookup_state_rank(&left.state)
+				.cmp(&pull_request_branch_lookup_state_rank(&right.state))
+		});
+
+		for entry in entries {
 			let review_state = self.inspect_review_state(cwd, &entry.url)?;
 			let locator = github::parse_pull_request_url(&entry.url)?;
 
@@ -1138,6 +1150,15 @@ fn merge_pull_request_review_state_page(
 
 fn count_unresolved_review_threads(review_threads: &PullRequestReviewThreadConnection) -> usize {
 	review_threads.nodes.iter().filter(|thread| !thread.is_resolved && !thread.is_outdated).count()
+}
+
+fn pull_request_branch_lookup_state_rank(state: &str) -> u8 {
+	match state {
+		"OPEN" => 0,
+		"MERGED" => 1,
+		"CLOSED" => 2,
+		_ => 3,
+	}
 }
 
 fn pull_request_status_check_rollup_state(
@@ -9864,6 +9885,23 @@ read_first = [{read_first}]
 				.expect_err("changed head repository name should fail");
 
 		assert!(error.to_string().contains("changed while paginating"));
+	}
+
+	#[test]
+	fn pull_request_review_state_query_requests_head_repository_name() {
+		assert!(
+			orchestrator::PULL_REQUEST_REVIEW_STATE_QUERY
+				.contains("headRepository {\n        name\n      }")
+		);
+	}
+
+	#[test]
+	fn branch_head_recovery_prefers_open_pull_requests() {
+		let mut states = ["MERGED", "CLOSED", "OPEN"];
+
+		states.sort_by_key(|state| orchestrator::pull_request_branch_lookup_state_rank(state));
+
+		assert_eq!(states, ["OPEN", "MERGED", "CLOSED"]);
 	}
 
 	#[test]
