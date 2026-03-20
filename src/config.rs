@@ -133,17 +133,6 @@ impl ProjectGitHubConfig {
 		self.token_env_var.as_deref()
 	}
 
-	/// Resolve the configured GitHub token env-var name into a concrete string.
-	pub fn resolve_required_token(&self) -> Result<String> {
-		let token_env_var = self.token_env_var().ok_or_else(|| {
-			eyre::eyre!(
-				"`github.token_env_var` must be configured for GitHub-backed review handoff and post-review status inspection."
-			)
-		})?;
-
-		resolve_secret_env_var("github.token_env_var", token_env_var)
-	}
-
 	fn validate(&self) -> Result<()> {
 		if let Some(token_env_var) = self.token_env_var() {
 			validate_env_var_name("github.token_env_var", token_env_var)?;
@@ -285,7 +274,7 @@ mod tests {
 	}
 
 	#[test]
-	fn resolves_required_github_token_from_env_var_name() {
+	fn parses_github_token_env_var_name() {
 		let config = ServiceConfig::parse_toml(
 			r#"
 				id = "pubfi"
@@ -302,7 +291,7 @@ mod tests {
 		)
 		.expect("service config should parse");
 
-		assert!(!config.github().resolve_required_token().expect("HOME should resolve").is_empty());
+		assert_eq!(config.github().token_env_var(), Some("HOME"));
 	}
 
 	#[test]
@@ -422,7 +411,7 @@ mod tests {
 	}
 
 	#[test]
-	fn resolve_required_github_token_rejects_missing_token_env_var() {
+	fn missing_github_token_env_var_remains_unconfigured() {
 		let config = ServiceConfig::parse_toml(
 			r#"
 				id = "pubfi"
@@ -435,12 +424,8 @@ mod tests {
 			"#,
 		)
 		.expect("service config should parse");
-		let error = config
-			.github()
-			.resolve_required_token()
-			.expect_err("missing github token env-var should be rejected");
 
-		assert!(error.to_string().contains("github.token_env_var"));
+		assert_eq!(config.github().token_env_var(), None);
 	}
 
 	#[test]

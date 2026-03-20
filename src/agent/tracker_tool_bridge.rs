@@ -1,5 +1,6 @@
 use std::{
 	cell::RefCell,
+	env,
 	error::Error,
 	fmt::{Display, Formatter},
 	path::{Component, PathBuf},
@@ -636,10 +637,11 @@ impl<'a> TrackerToolBridge<'a> {
 		review_context: &ReviewHandoffContext,
 		pr_url: &str,
 	) -> std::result::Result<PullRequestDetails, String> {
+		let github_token = resolve_review_handoff_github_token(review_context)?;
 		let pull_request = self.pull_request_inspector.inspect_pull_request(
 			&review_context.cwd,
 			pr_url,
-			review_context.github_token.as_str(),
+			github_token.as_str(),
 		)?;
 		let local_repo = self.local_repo_inspector.inspect_local_repo(&review_context.cwd)?;
 
@@ -957,12 +959,6 @@ impl DynamicToolHandler for TrackerToolBridge<'_> {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TurnCompletionStatus {
-	Continue,
-	Complete,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReviewHandoffContext {
 	pub(crate) attempt_number: i64,
@@ -970,21 +966,7 @@ pub(crate) struct ReviewHandoffContext {
 	pub(crate) run_id: String,
 	pub(crate) workspace_path: String,
 	pub(crate) cwd: PathBuf,
-	pub(crate) github_token: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunCompletionDisposition {
-	ManualAttention,
-	ReviewHandoff,
-}
-impl RunCompletionDisposition {
-	fn as_str(self) -> &'static str {
-		match self {
-			Self::ManualAttention => "manual_attention",
-			Self::ReviewHandoff => "review_handoff",
-		}
-	}
+	pub(crate) github_token_env_var: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1004,6 +986,7 @@ impl Display for ReviewHandoffWritebackFailed {
 		)
 	}
 }
+
 impl Error for ReviewHandoffWritebackFailed {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1194,6 +1177,32 @@ struct PullRequestRepositoryOwnerResponse {
 	login: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryIdentity {
+	name: String,
+	owner: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnCompletionStatus {
+	Continue,
+	Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunCompletionDisposition {
+	ManualAttention,
+	ReviewHandoff,
+}
+impl RunCompletionDisposition {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::ManualAttention => "manual_attention",
+			Self::ReviewHandoff => "review_handoff",
+		}
+	}
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum DynamicToolContentItem {
@@ -1206,10 +1215,20 @@ impl DynamicToolContentItem {
 	}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RepositoryIdentity {
-	name: String,
-	owner: String,
+fn resolve_review_handoff_github_token(
+	review_context: &ReviewHandoffContext,
+) -> std::result::Result<String, String> {
+	let Some(env_var) = review_context.github_token_env_var.as_deref() else {
+		return Err(String::from(
+			"`github.token_env_var` must be configured for PR-backed review handoff validation.",
+		));
+	};
+
+	env::var(env_var).map_err(|error| {
+		format!(
+			"Failed to read environment variable `{env_var}` referenced by `github.token_env_var`: {error}"
+		)
+	})
 }
 
 fn run_command_for_stdout(
@@ -1363,6 +1382,7 @@ fn current_timestamp() -> String {
 mod tests {
 	use std::{
 		cell::RefCell,
+		env,
 		path::{Path, PathBuf},
 	};
 
@@ -1636,7 +1656,7 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: PathBuf::from("/tmp/PUB-618"),
-			github_token: String::from("ghp_review"),
+			github_token_env_var: Some(String::from("HOME")),
 		}
 	}
 
@@ -1647,7 +1667,7 @@ Use the tracker tools.
 			run_id: String::from("pub-618-attempt-2-123"),
 			workspace_path: String::from(".workspaces/PUB-618"),
 			cwd: cwd.to_path_buf(),
-			github_token: String::from("ghp_review"),
+			github_token_env_var: Some(String::from("HOME")),
 		}
 	}
 
@@ -1677,7 +1697,7 @@ Use the tracker tools.
 		let issue = sample_issue();
 		let workflow = sample_workflow();
 		let inspector = GitHubTokenAssertingPullRequestInspector {
-			expected_token: String::from("ghp_review"),
+			expected_token: env::var("HOME").expect("HOME should exist"),
 			response: sample_pull_request(),
 		};
 		let local_repo_inspector = FakeLocalRepoInspector::new(vec![Ok(sample_local_repo())]);
@@ -1700,6 +1720,45 @@ Use the tracker tools.
 		);
 
 		assert!(response.success);
+	}
+
+	#[test]
+	fn review_handoff_inspection_requires_configured_github_token_env_var() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let pull_request_inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let mut review_context = sample_review_context();
+
+		review_context.github_token_env_var = None;
+
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			review_context,
+			&pull_request_inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/48",
+				"summary": "Ready for review."
+			}),
+		);
+
+		assert!(!response.success);
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: String::from(
+					"`github.token_env_var` must be configured for PR-backed review handoff validation.",
+				),
+			}]
+		);
 	}
 
 	#[test]

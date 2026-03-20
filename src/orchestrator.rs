@@ -506,7 +506,7 @@ struct PostReviewLaneClassification {
 }
 
 struct GhPullRequestReviewStateInspector {
-	github_token: String,
+	github_token_env_var: Option<String>,
 }
 impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 	fn inspect_review_state(
@@ -514,6 +514,10 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 		cwd: &Path,
 		pr_url: &str,
 	) -> crate::prelude::Result<PullRequestReviewState> {
+		let github_token = resolve_configured_env_var(
+			"github.token_env_var",
+			self.github_token_env_var.as_deref(),
+		)?;
 		let locator = github::parse_pull_request_url(pr_url)?;
 		let mut review_threads_after: Option<String> = None;
 		let mut review_state: Option<PullRequestReviewState> = None;
@@ -526,7 +530,7 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 				locator.number,
 				review_threads_after.as_deref(),
 				pr_url,
-				self.github_token.as_str(),
+				github_token.as_str(),
 			)?;
 			let next_cursor = match &mut review_state {
 				Some(review_state) =>
@@ -890,7 +894,7 @@ pub(crate) fn print_status(
 
 	let mut snapshot = build_operator_status_snapshot(&config, &state_store, limit)?;
 	let review_state_inspector = GhPullRequestReviewStateInspector {
-		github_token: config.github().resolve_required_token()?,
+		github_token_env_var: config.github().token_env_var().map(str::to_owned),
 	};
 
 	snapshot.post_review_lanes = build_post_review_lane_statuses(
@@ -3033,7 +3037,6 @@ where
 		.to_owned();
 	let model =
 		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
-	let github_token = project.github().resolve_required_token()?;
 	let tracker_tool_bridge = TrackerToolBridge::with_run_context(
 		tracker,
 		&issue_run.issue,
@@ -3044,7 +3047,7 @@ where
 			run_id: issue_run.run_id.clone(),
 			workspace_path: relative_workspace_path(project, &issue_run.workspace),
 			cwd: issue_run.workspace.path.clone(),
-			github_token,
+			github_token_env_var: project.github().token_env_var().map(str::to_owned),
 		},
 	);
 	let continuation_guard = IssueTurnContinuationGuard {
@@ -3857,8 +3860,32 @@ where
 			continue;
 		}
 
-		let review_handoff = state::read_review_handoff_marker(workspace.workspace_path())?;
-		let local_head_oid = workspace_head_oid(workspace.workspace_path())?;
+		let review_handoff = match state::read_review_handoff_marker(workspace.workspace_path()) {
+			Ok(review_handoff) => review_handoff,
+			Err(_error) => {
+				lanes.push(blocked_post_review_lane_status(
+					project,
+					&issue,
+					&workspace,
+					"review_handoff_record_read_failed",
+				));
+
+				continue;
+			},
+		};
+		let local_head_oid = match workspace_head_oid(workspace.workspace_path()) {
+			Ok(local_head_oid) => local_head_oid,
+			Err(_error) => {
+				lanes.push(blocked_post_review_lane_status(
+					project,
+					&issue,
+					&workspace,
+					"workspace_head_read_failed",
+				));
+
+				continue;
+			},
+		};
 		let snapshot = PostReviewLaneSnapshot { issue, workspace, review_handoff, local_head_oid };
 		let classification = classify_post_review_lane(&snapshot, review_state_inspector)?;
 
@@ -4021,6 +4048,29 @@ fn blocked_post_review_lane(reason: &str) -> PostReviewLaneClassification {
 	}
 }
 
+fn blocked_post_review_lane_status(
+	project: &ServiceConfig,
+	issue: &TrackerIssue,
+	workspace: &WorkspaceMapping,
+	reason: &str,
+) -> OperatorPostReviewLaneStatus {
+	OperatorPostReviewLaneStatus {
+		issue_id: issue.id.clone(),
+		issue_identifier: issue.identifier.clone(),
+		issue_state: issue.state.name.clone(),
+		branch_name: workspace.branch_name().to_owned(),
+		workspace_path: relative_workspace_path_for_path(project, workspace.workspace_path()),
+		classification: String::from("blocked"),
+		reason: String::from(reason),
+		pr_url: None,
+		pr_state: None,
+		review_decision: None,
+		mergeable: None,
+		check_state: None,
+		unresolved_review_threads: None,
+	}
+}
+
 fn workspace_head_oid(workspace_path: &Path) -> crate::prelude::Result<Option<String>> {
 	let output =
 		Command::new("git").arg("-C").arg(workspace_path).args(["rev-parse", "HEAD"]).output()?;
@@ -4040,6 +4090,21 @@ fn workspace_head_oid(workspace_path: &Path) -> crate::prelude::Result<Option<St
 	}
 
 	Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+
+fn resolve_configured_env_var(
+	field_name: &str,
+	env_var: Option<&str>,
+) -> crate::prelude::Result<String> {
+	let env_var = env_var.ok_or_else(|| {
+		eyre::eyre!("`{field_name}` must be configured for this GitHub-backed operation.")
+	})?;
+
+	env::var(env_var).map_err(|error| {
+		eyre::eyre!(
+			"Failed to read environment variable `{env_var}` referenced by `{field_name}`: {error}"
+		)
+	})
 }
 
 fn checks_are_green(check_state: Option<&str>) -> bool {
@@ -4515,13 +4580,14 @@ mod tests {
 		},
 		config::ServiceConfig,
 		orchestrator::{
-			self, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
-			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
-			ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision, PostReviewLaneSnapshot,
-			PullRequestCommitConnection, PullRequestCommitNode, PullRequestCommitPayload,
-			PullRequestPageInfo, PullRequestReviewState, PullRequestReviewStateInspector,
-			PullRequestReviewStateNode, PullRequestReviewThreadConnection,
-			PullRequestReviewThreadNode, PullRequestStatusCheckRollup, RunSummary,
+			self, GhPullRequestReviewStateInspector, ISSUE_COMMENT_TOOL_NAME,
+			ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision,
+			PostReviewLaneSnapshot, PullRequestCommitConnection, PullRequestCommitNode,
+			PullRequestCommitPayload, PullRequestPageInfo, PullRequestReviewState,
+			PullRequestReviewStateInspector, PullRequestReviewStateNode,
+			PullRequestReviewThreadConnection, PullRequestReviewThreadNode,
+			PullRequestStatusCheckRollup, RunSummary,
 		},
 		prelude::Result,
 		state::{self, RUN_ACTIVITY_MARKER_FILE, StateStore},
@@ -7753,6 +7819,51 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_blocks_workspace_head_read_failures() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let (_project_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_path = temp_dir.path().join("lane");
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+		state::write_review_handoff_marker(
+			&workspace_path,
+			&sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				pr_url,
+				"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+			),
+		)
+		.expect("review handoff marker should write");
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(Vec::new()),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "blocked");
+		assert_eq!(lanes[0].reason, "workspace_head_read_failed");
+	}
+
+	#[test]
 	fn classify_post_review_lane_requires_review_repair_for_unresolved_threads() {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -7898,6 +8009,51 @@ read_first = [{read_first}]
 			&FakePullRequestReviewStateInspector::new(vec![Err(color_eyre::eyre::eyre!(
 				"gh api failed"
 			))]),
+		)
+		.expect("classification should degrade to blocked");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
+		assert_eq!(classification.reason, "pull_request_state_read_failed");
+	}
+
+	#[test]
+	fn classify_post_review_lane_blocks_missing_github_token_env_var() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&GhPullRequestReviewStateInspector { github_token_env_var: None },
 		)
 		.expect("classification should degrade to blocked");
 
