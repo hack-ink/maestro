@@ -140,7 +140,7 @@ impl WorkspaceManager {
 		Ok(())
 	}
 
-	fn refresh_workspace_git_metadata(&self, workspace_path: &Path) -> Result<()> {
+	pub(crate) fn refresh_workspace_git_metadata(&self, workspace_path: &Path) -> Result<()> {
 		copy_repo_local_git_config(&self.repo_root, workspace_path)?;
 
 		if let Some(source_origin_url) = try_git_stdout(

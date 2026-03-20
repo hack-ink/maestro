@@ -3837,6 +3837,8 @@ where
 	let issues_by_id =
 		issues.into_iter().map(|issue| (issue.id.clone(), issue)).collect::<HashMap<_, _>>();
 	let success_state = workflow.frontmatter().tracker().success_state();
+	let workspace_manager =
+		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 	let mut lanes = Vec::new();
 
 	for workspace in workspaces {
@@ -3845,6 +3847,31 @@ where
 		};
 
 		if issue.state.name != success_state {
+			continue;
+		}
+		if should_refresh_post_review_workspace_git_metadata(project, workspace.workspace_path())
+			&& let Err(_error) =
+				workspace_manager.refresh_workspace_git_metadata(workspace.workspace_path())
+		{
+			lanes.push(OperatorPostReviewLaneStatus {
+				issue_id: issue.id.clone(),
+				issue_identifier: issue.identifier.clone(),
+				issue_state: issue.state.name.clone(),
+				branch_name: workspace.branch_name().to_owned(),
+				workspace_path: relative_workspace_path_for_path(
+					project,
+					workspace.workspace_path(),
+				),
+				classification: PostReviewLaneDecision::Block.as_str().to_owned(),
+				reason: String::from("workspace_git_metadata_refresh_failed"),
+				pr_url: None,
+				pr_state: None,
+				review_decision: None,
+				mergeable: None,
+				check_state: None,
+				unresolved_review_threads: None,
+			});
+
 			continue;
 		}
 
@@ -3976,7 +4003,7 @@ where
 
 		return Ok(classification);
 	}
-	if matches!(review_state.review_decision.as_deref(), Some("APPROVED"))
+	if approvals_are_satisfied(review_state.review_decision.as_deref())
 		&& checks_are_green(review_state.status_check_rollup_state.as_deref())
 		&& review_state.mergeable == "MERGEABLE"
 	{
@@ -3990,7 +4017,7 @@ where
 
 		return Ok(classification);
 	}
-	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED") | None) {
+	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED")) {
 		classification.reason = String::from("waiting_for_review");
 
 		return Ok(classification);
@@ -4010,6 +4037,13 @@ fn blocked_post_review_lane(reason: &str) -> PostReviewLaneClassification {
 		check_state: None,
 		unresolved_review_threads: None,
 	}
+}
+
+fn should_refresh_post_review_workspace_git_metadata(
+	project: &ServiceConfig,
+	workspace_path: &Path,
+) -> bool {
+	workspace_path.starts_with(project.workspace_root())
 }
 
 fn workspace_head_oid(workspace_path: &Path) -> crate::prelude::Result<Option<String>> {
@@ -4035,6 +4069,10 @@ fn workspace_head_oid(workspace_path: &Path) -> crate::prelude::Result<Option<St
 
 fn checks_are_green(check_state: Option<&str>) -> bool {
 	matches!(check_state, None | Some("SUCCESS"))
+}
+
+fn approvals_are_satisfied(review_decision: Option<&str>) -> bool {
+	matches!(review_decision, Some("APPROVED") | None)
 }
 
 fn checks_require_wait(check_state: Option<&str>) -> bool {
@@ -4551,6 +4589,30 @@ mod tests {
 		}
 	}
 
+	struct GitConfigAssertingReviewStateInspector {
+		expected_github_identity: String,
+		expected_linear_workspace: String,
+		response: PullRequestReviewState,
+	}
+	impl PullRequestReviewStateInspector for GitConfigAssertingReviewStateInspector {
+		fn inspect_review_state(
+			&self,
+			cwd: &Path,
+			_pr_url: &str,
+		) -> crate::prelude::Result<PullRequestReviewState> {
+			assert_eq!(
+				git_local_config_value(cwd, "codex.github-identity"),
+				self.expected_github_identity
+			);
+			assert_eq!(
+				git_local_config_value(cwd, "codex.linear-workspace"),
+				self.expected_linear_workspace
+			);
+
+			Ok(self.response.clone())
+		}
+	}
+
 	impl FakeTracker {
 		fn new(issues: Vec<TrackerIssue>) -> Self {
 			Self::with_refresh_snapshots_and_project(issues.clone(), vec![issues], true)
@@ -4842,6 +4904,22 @@ mod tests {
 				}],
 			},
 		}
+	}
+
+	fn git_local_config_value(repo_root: &Path, key: &str) -> String {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(repo_root)
+			.args(["config", "--local", "--get", key])
+			.output()
+			.expect("git config should run");
+
+		assert!(output.status.success(), "git config should succeed for `{key}`");
+
+		String::from_utf8(output.stdout)
+			.expect("git config output should be utf-8")
+			.trim()
+			.to_owned()
 	}
 
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
@@ -7569,6 +7647,108 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_refreshes_managed_workspace_git_metadata_before_inspection()
+	{
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(config.repo_root())
+				.args(["config", "--local", "codex.github-identity", "y"])
+				.status()
+				.expect("git config should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(config.repo_root())
+				.args(["config", "--local", "codex.linear-workspace", "hackink"])
+				.status()
+				.expect("git config should run")
+				.success()
+		);
+
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+		let head_oid = String::from_utf8(
+			Command::new("git")
+				.arg("-C")
+				.arg(&workspace.path)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse should run")
+				.stdout,
+		)
+		.expect("git output should be utf-8")
+		.trim()
+		.to_owned();
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+
+		Command::new("git")
+			.arg("-C")
+			.arg(&workspace.path)
+			.args(["config", "--local", "--unset-all", "codex.github-identity"])
+			.status()
+			.expect("git config should run");
+		Command::new("git")
+			.arg("-C")
+			.arg(&workspace.path)
+			.args(["config", "--local", "--unset-all", "codex.linear-workspace"])
+			.status()
+			.expect("git config should run");
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		state::write_review_handoff_marker(
+			&workspace.path,
+			&sample_review_handoff_marker(&workspace.branch_name, pr_url, &head_oid),
+		)
+		.expect("review handoff marker should write");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&GitConfigAssertingReviewStateInspector {
+				expected_github_identity: String::from("y"),
+				expected_linear_workspace: String::from("hackink"),
+				response: sample_pull_request_review_state(
+					pr_url,
+					&workspace.branch_name,
+					&head_oid,
+					Some("APPROVED"),
+					"MERGEABLE",
+					Some("SUCCESS"),
+					0,
+				),
+			},
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "ready_to_land");
+		assert_eq!(git_local_config_value(&workspace.path, "codex.github-identity"), "y");
+		assert_eq!(git_local_config_value(&workspace.path, "codex.linear-workspace"), "hackink");
+	}
+
+	#[test]
 	fn build_post_review_lane_statuses_blocks_missing_review_handoff_record() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let repo_root = config.repo_root().to_path_buf();
@@ -7593,6 +7773,42 @@ read_first = [{read_first}]
 		assert_eq!(lanes.len(), 1);
 		assert_eq!(lanes[0].classification, "blocked");
 		assert_eq!(lanes[0].reason, "missing_review_handoff_record");
+	}
+
+	#[test]
+	fn build_post_review_lane_statuses_blocks_managed_workspace_refresh_failures() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_path = config.workspace_root().join(&issue.identifier);
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+		fs::write(workspace_path.join("NOT_GIT"), "broken workspace")
+			.expect("sentinel file should write");
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(Vec::new()),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "blocked");
+		assert_eq!(lanes[0].reason, "workspace_git_metadata_refresh_failed");
 	}
 
 	#[test]
@@ -7646,6 +7862,59 @@ read_first = [{read_first}]
 
 		assert_eq!(classification.decision, PostReviewLaneDecision::NeedsReviewRepair);
 		assert_eq!(classification.reason, "unresolved_review_threads");
+	}
+
+	#[test]
+	fn classify_post_review_lane_ready_to_land_allows_zero_required_review_repos() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&head_oid,
+				None,
+				"MERGEABLE",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
+		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
 	}
 
 	#[test]

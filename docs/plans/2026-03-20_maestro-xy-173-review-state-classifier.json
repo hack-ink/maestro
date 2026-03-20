@@ -118,9 +118,11 @@
       "Verification passed on the XY-173 lane: `cargo make fmt-check`, `cargo make lint`, `cargo make test`, and `git diff --check`.",
       "Pre-commit self-review tightened the status surface so a GitHub PR state read failure degrades the affected post-review lane to `blocked` with reason `pull_request_state_read_failed` instead of aborting the entire `status` command.",
       "Review repair propagated `codex.github-identity` and `codex.linear-workspace` into clone-backed workspaces so lane-local GitHub and Linear routing survives `issue_review_handoff` and post-review status inspection without manual workspace config.",
-      "Review repair paginated GitHub review-thread inspection in `src/orchestrator.rs`, counted unresolved threads beyond the first page, and added guards plus tests for mixed-snapshot pagination and missing end-cursor responses."
+      "Review repair paginated GitHub review-thread inspection in `src/orchestrator.rs`, counted unresolved threads beyond the first page, and added guards plus tests for mixed-snapshot pagination and missing end-cursor responses.",
+      "Late review repair now refreshes managed `.workspaces/*` lanes before post-review GitHub inspection, downgrades refresh failures to a lane-local `workspace_git_metadata_refresh_failed` block, and treats `reviewDecision = null` as approval-satisfied when checks are green and the PR is mergeable so zero-required-review repositories can reach `ready_to_land`.",
+      "Fresh verification for the late review repair passed: `cargo test build_post_review_lane_statuses_ -- --nocapture`, `cargo test classify_post_review_lane_ready_to_land_allows_zero_required_review_repos -- --nocapture`, `cargo make fmt-check`, `cargo make lint`, `cargo make test`, plan validate/read-back, and `git diff --check`."
     ],
-    "last_updated": "2026-03-19T20:12:16Z",
+    "last_updated": "2026-03-20T02:35:48Z",
     "replan_reason": null,
     "context_snapshot": {
       "issue": "XY-173",
