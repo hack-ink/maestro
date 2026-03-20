@@ -1223,12 +1223,19 @@ fn resolve_review_handoff_github_token(
 			"`github.token_env_var` must be configured for PR-backed review handoff validation.",
 		));
 	};
-
-	env::var(env_var).map_err(|error| {
+	let value = env::var(env_var).map_err(|error| {
 		format!(
 			"Failed to read environment variable `{env_var}` referenced by `github.token_env_var`: {error}"
 		)
-	})
+	})?;
+
+	if value.trim().is_empty() {
+		return Err(format!(
+			"Environment variable `{env_var}` referenced by `github.token_env_var` must not be blank."
+		));
+	}
+
+	Ok(value)
 }
 
 fn run_command_for_stdout(
@@ -1384,6 +1391,7 @@ mod tests {
 		cell::RefCell,
 		env,
 		path::{Path, PathBuf},
+		process,
 	};
 
 	use tempfile::TempDir;
@@ -1459,6 +1467,28 @@ mod tests {
 	impl LocalRepoInspector for FakeLocalRepoInspector {
 		fn inspect_local_repo(&self, _cwd: &Path) -> std::result::Result<LocalRepoDetails, String> {
 			self.responses.borrow_mut().remove(0)
+		}
+	}
+	struct TestEnvVarGuard {
+		key: String,
+		previous: Option<std::ffi::OsString>,
+	}
+	impl TestEnvVarGuard {
+		fn set(key: impl Into<String>, value: &str) -> Self {
+			let key = key.into();
+			let previous = env::var_os(&key);
+
+			unsafe { env::set_var(&key, value) };
+
+			Self { key, previous }
+		}
+	}
+	impl Drop for TestEnvVarGuard {
+		fn drop(&mut self) {
+			match self.previous.take() {
+				Some(previous) => unsafe { env::set_var(&self.key, previous) },
+				None => unsafe { env::remove_var(&self.key) },
+			}
 		}
 	}
 	impl FakeTracker {
@@ -1756,6 +1786,48 @@ Use the tracker tools.
 			vec![super::DynamicToolContentItem::InputText {
 				text: String::from(
 					"`github.token_env_var` must be configured for PR-backed review handoff validation.",
+				),
+			}]
+		);
+	}
+
+	#[test]
+	fn review_handoff_inspection_rejects_blank_github_token_env_var() {
+		let tracker = FakeTracker::new();
+		let issue = sample_issue();
+		let workflow = sample_workflow();
+		let pull_request_inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let env_var =
+			format!("MAESTRO_TEST_BLANK_REVIEW_HANDOFF_GITHUB_TOKEN_ENV_{}", process::id());
+		let _env_guard = TestEnvVarGuard::set(&env_var, "");
+		let mut review_context = sample_review_context();
+
+		review_context.github_token_env_var = Some(env_var.clone());
+
+		let bridge = TrackerToolBridge::with_review_handoff_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			review_context,
+			&pull_request_inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": "https://github.com/helixbox/maestro/pull/48",
+				"summary": "Ready for review."
+			}),
+		);
+
+		assert!(!response.success);
+		assert_eq!(
+			response.content_items,
+			vec![super::DynamicToolContentItem::InputText {
+				text: format!(
+					"Environment variable `{env_var}` referenced by `github.token_env_var` must not be blank."
 				),
 			}]
 		);

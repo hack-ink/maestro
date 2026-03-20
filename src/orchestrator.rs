@@ -57,6 +57,9 @@ query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: Strin
       mergeStateStatus
       headRefName
       headRefOid
+      reviewRequests(first: 1) {
+        totalCount
+      }
       reviewThreads(first: 100, after: $reviewThreadsAfter) {
         nodes {
           isResolved
@@ -487,6 +490,7 @@ struct PullRequestReviewState {
 	state: String,
 	is_draft: bool,
 	review_decision: Option<String>,
+	pending_review_requests: usize,
 	mergeable: String,
 	merge_state_status: String,
 	head_ref_name: String,
@@ -652,6 +656,8 @@ struct PullRequestReviewStateNode {
 	is_draft: bool,
 	#[serde(rename = "reviewDecision")]
 	review_decision: Option<String>,
+	#[serde(rename = "reviewRequests")]
+	review_requests: PullRequestReviewRequestConnection,
 	mergeable: String,
 	#[serde(rename = "mergeStateStatus")]
 	merge_state_status: String,
@@ -662,6 +668,12 @@ struct PullRequestReviewStateNode {
 	#[serde(rename = "reviewThreads")]
 	review_threads: PullRequestReviewThreadConnection,
 	commits: PullRequestCommitConnection,
+}
+
+#[derive(Deserialize)]
+struct PullRequestReviewRequestConnection {
+	#[serde(rename = "totalCount")]
+	total_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -969,6 +981,7 @@ fn pull_request_review_state_from_page(
 		state: pull_request.state.clone(),
 		is_draft: pull_request.is_draft,
 		review_decision: pull_request.review_decision.clone(),
+		pending_review_requests: pull_request.review_requests.total_count,
 		mergeable: pull_request.mergeable.clone(),
 		merge_state_status: pull_request.merge_state_status.clone(),
 		head_ref_name: pull_request.head_ref_name.clone(),
@@ -986,6 +999,7 @@ fn merge_pull_request_review_state_page(
 		|| review_state.state != pull_request.state
 		|| review_state.is_draft != pull_request.is_draft
 		|| review_state.review_decision != pull_request.review_decision
+		|| review_state.pending_review_requests != pull_request.review_requests.total_count
 		|| review_state.mergeable != pull_request.mergeable
 		|| review_state.merge_state_status != pull_request.merge_state_status
 		|| review_state.head_ref_name != pull_request.head_ref_name
@@ -3993,16 +4007,7 @@ where
 		Ok(review_state) => review_state,
 		Err(_error) => return Ok(blocked_post_review_lane("pull_request_state_read_failed")),
 	};
-	let mut classification = PostReviewLaneClassification {
-		decision: PostReviewLaneDecision::WaitForReview,
-		reason: String::from("waiting_for_review_or_checks"),
-		pr_url: Some(review_state.url.clone()),
-		pr_state: Some(review_state.state.clone()),
-		review_decision: review_state.review_decision.clone(),
-		mergeable: Some(review_state.mergeable.clone()),
-		check_state: review_state.status_check_rollup_state.clone(),
-		unresolved_review_threads: Some(review_state.unresolved_review_threads),
-	};
+	let mut classification = initial_post_review_lane_classification(&review_state);
 
 	if review_state.head_ref_name != review_handoff.branch_name()
 		|| review_state.head_ref_name != snapshot.workspace.branch_name()
@@ -4059,7 +4064,9 @@ where
 
 		return Ok(classification);
 	}
-	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED")) {
+	if matches!(review_state.review_decision.as_deref(), Some("REVIEW_REQUIRED"))
+		|| review_state.pending_review_requests > 0
+	{
 		classification.reason = String::from("waiting_for_review");
 
 		return Ok(classification);
@@ -4070,8 +4077,10 @@ where
 
 		return Ok(classification);
 	}
-	if approvals_are_satisfied(review_state.review_decision.as_deref())
-		&& merge_state_allows_ready_to_land(&review_state.merge_state_status)
+	if approvals_are_satisfied(
+		review_state.review_decision.as_deref(),
+		review_state.pending_review_requests,
+	) && merge_state_allows_ready_to_land(&review_state.merge_state_status)
 		&& review_state.mergeable == "MERGEABLE"
 	{
 		classification.decision = PostReviewLaneDecision::ReadyToLand;
@@ -4086,6 +4095,21 @@ where
 	}
 
 	Ok(classification)
+}
+
+fn initial_post_review_lane_classification(
+	review_state: &PullRequestReviewState,
+) -> PostReviewLaneClassification {
+	PostReviewLaneClassification {
+		decision: PostReviewLaneDecision::WaitForReview,
+		reason: String::from("waiting_for_review_or_checks"),
+		pr_url: Some(review_state.url.clone()),
+		pr_state: Some(review_state.state.clone()),
+		review_decision: review_state.review_decision.clone(),
+		mergeable: Some(review_state.mergeable.clone()),
+		check_state: review_state.status_check_rollup_state.clone(),
+		unresolved_review_threads: Some(review_state.unresolved_review_threads),
+	}
 }
 
 fn blocked_post_review_lane(reason: &str) -> PostReviewLaneClassification {
@@ -4152,20 +4176,28 @@ fn resolve_configured_env_var(
 	let env_var = env_var.ok_or_else(|| {
 		eyre::eyre!("`{field_name}` must be configured for this GitHub-backed operation.")
 	})?;
-
-	env::var(env_var).map_err(|error| {
+	let value = env::var(env_var).map_err(|error| {
 		eyre::eyre!(
 			"Failed to read environment variable `{env_var}` referenced by `{field_name}`: {error}"
 		)
-	})
+	})?;
+
+	if value.trim().is_empty() {
+		eyre::bail!(
+			"Environment variable `{env_var}` referenced by `{field_name}` must not be blank."
+		);
+	}
+
+	Ok(value)
 }
 
 fn merge_state_allows_ready_to_land(merge_state_status: &str) -> bool {
 	matches!(merge_state_status, "CLEAN" | "HAS_HOOKS" | "UNSTABLE")
 }
 
-fn approvals_are_satisfied(review_decision: Option<&str>) -> bool {
-	matches!(review_decision, Some("APPROVED") | None)
+fn approvals_are_satisfied(review_decision: Option<&str>, pending_review_requests: usize) -> bool {
+	matches!(review_decision, Some("APPROVED"))
+		|| (review_decision.is_none() && pending_review_requests == 0)
 }
 
 fn checks_require_wait(check_state: Option<&str>) -> bool {
@@ -4616,7 +4648,7 @@ mod tests {
 	#[cfg(unix)] use std::os::fd::IntoRawFd;
 	use std::{
 		cell::RefCell,
-		fs,
+		env, fs,
 		path::{Path, PathBuf},
 		process::{self, Command},
 		thread,
@@ -4637,8 +4669,8 @@ mod tests {
 			ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 			ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision,
 			PostReviewLaneSnapshot, PullRequestCommitConnection, PullRequestCommitNode,
-			PullRequestCommitPayload, PullRequestPageInfo, PullRequestReviewState,
-			PullRequestReviewStateInspector, PullRequestReviewStateNode,
+			PullRequestCommitPayload, PullRequestPageInfo, PullRequestReviewRequestConnection,
+			PullRequestReviewState, PullRequestReviewStateInspector, PullRequestReviewStateNode,
 			PullRequestReviewThreadConnection, PullRequestReviewThreadNode,
 			PullRequestStatusCheckRollup, RunSummary,
 		},
@@ -4680,6 +4712,28 @@ mod tests {
 			_pr_url: &str,
 		) -> crate::prelude::Result<PullRequestReviewState> {
 			self.responses.borrow_mut().remove(0)
+		}
+	}
+	struct TestEnvVarGuard {
+		key: String,
+		previous: Option<std::ffi::OsString>,
+	}
+	impl TestEnvVarGuard {
+		fn set(key: impl Into<String>, value: &str) -> Self {
+			let key = key.into();
+			let previous = env::var_os(&key);
+
+			unsafe { env::set_var(&key, value) };
+
+			Self { key, previous }
+		}
+	}
+	impl Drop for TestEnvVarGuard {
+		fn drop(&mut self) {
+			match self.previous.take() {
+				Some(previous) => unsafe { env::set_var(&self.key, previous) },
+				None => unsafe { env::remove_var(&self.key) },
+			}
 		}
 	}
 
@@ -4928,11 +4982,37 @@ mod tests {
 		check_state: Option<&str>,
 		unresolved_review_threads: usize,
 	) -> PullRequestReviewState {
+		sample_pull_request_review_state_with_pending_requests(
+			pr_url,
+			branch_name,
+			head_oid,
+			review_decision,
+			mergeable,
+			merge_state_status,
+			check_state,
+			unresolved_review_threads,
+			0,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn sample_pull_request_review_state_with_pending_requests(
+		pr_url: &str,
+		branch_name: &str,
+		head_oid: &str,
+		review_decision: Option<&str>,
+		mergeable: &str,
+		merge_state_status: &str,
+		check_state: Option<&str>,
+		unresolved_review_threads: usize,
+		pending_review_requests: usize,
+	) -> PullRequestReviewState {
 		PullRequestReviewState {
 			url: pr_url.to_owned(),
 			state: String::from("OPEN"),
 			is_draft: false,
 			review_decision: review_decision.map(str::to_owned),
+			pending_review_requests,
 			mergeable: mergeable.to_owned(),
 			merge_state_status: merge_state_status.to_owned(),
 			head_ref_name: branch_name.to_owned(),
@@ -4955,6 +5035,7 @@ mod tests {
 			state: String::from("OPEN"),
 			is_draft: false,
 			review_decision: Some(String::from("APPROVED")),
+			review_requests: PullRequestReviewRequestConnection { total_count: 0 },
 			mergeable: String::from("MERGEABLE"),
 			merge_state_status: String::from("CLEAN"),
 			head_ref_name: branch_name.to_owned(),
@@ -8100,6 +8181,64 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn classify_post_review_lane_waits_when_review_decision_is_null_but_review_request_is_pending()
+	{
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(
+				sample_pull_request_review_state_with_pending_requests(
+					"https://github.com/hack-ink/maestro/pull/174",
+					"x/pubfi-pub-101",
+					&head_oid,
+					None,
+					"MERGEABLE",
+					"CLEAN",
+					Some("SUCCESS"),
+					0,
+					1,
+				),
+			)]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
+		assert_eq!(classification.reason, "waiting_for_review");
+	}
+
+	#[test]
 	fn classify_post_review_lane_ready_to_land_allows_optional_failed_checks() {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -8408,6 +8547,53 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn classify_post_review_lane_blocks_blank_github_token_env_var() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+		let env_var = format!("MAESTRO_TEST_BLANK_STATUS_GITHUB_TOKEN_ENV_{}", process::id());
+		let _env_guard = TestEnvVarGuard::set(&env_var, "");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_head_oid: Some(head_oid),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&GhPullRequestReviewStateInspector { github_token_env_var: Some(env_var) },
+		)
+		.expect("classification should degrade to blocked");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
+		assert_eq!(classification.reason, "pull_request_state_read_failed");
+	}
+
+	#[test]
 	fn merge_pull_request_review_state_page_counts_unresolved_threads_across_pages() {
 		let mut review_state = orchestrator::pull_request_review_state_from_page(
 			&sample_pull_request_review_state_page(
@@ -8461,6 +8647,36 @@ read_first = [{read_first}]
 		let error =
 			orchestrator::merge_pull_request_review_state_page(&mut review_state, &next_page)
 				.expect_err("changed review metadata should fail");
+
+		assert!(error.to_string().contains("changed while paginating"));
+	}
+
+	#[test]
+	fn merge_pull_request_review_state_page_rejects_changed_pending_review_request_count() {
+		let mut review_state = orchestrator::pull_request_review_state_from_page(
+			&sample_pull_request_review_state_page(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+				100,
+				true,
+				Some("cursor-1"),
+			),
+		);
+		let mut next_page = sample_pull_request_review_state_page(
+			"https://github.com/hack-ink/maestro/pull/174",
+			"x/pubfi-pub-101",
+			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+			1,
+			false,
+			None,
+		);
+
+		next_page.review_requests.total_count = 1;
+
+		let error =
+			orchestrator::merge_pull_request_review_state_page(&mut review_state, &next_page)
+				.expect_err("changed pending review request count should fail");
 
 		assert!(error.to_string().contains("changed while paginating"));
 	}
@@ -8627,6 +8843,18 @@ read_first = [{read_first}]
 				.to_string()
 				.contains("Required command `__maestro_missing_command__` is unavailable")
 		);
+	}
+
+	#[test]
+	fn validate_review_handoff_runtime_rejects_blank_github_token_env_var() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+		let env_var = format!("MAESTRO_TEST_BLANK_GITHUB_TOKEN_ENV_{}", process::id());
+		let _env_guard = TestEnvVarGuard::set(&env_var, "");
+		let config = service_config_with_github_token_env_var(&config, &env_var);
+		let error = orchestrator::validate_review_handoff_runtime(&config, false)
+			.expect_err("blank github token authority should fail live preflight");
+
+		assert!(error.to_string().contains("must not be blank"));
 	}
 
 	#[test]
