@@ -258,7 +258,7 @@ The status surface should describe only current local execution state, plus rest
 - active leased runs
 - recent run attempts with local status, thread id, and latest recorded protocol event
 - retained workspace mappings
-- retained post-review lanes classified as `wait_for_review`, `needs_review_repair`, `ready_to_land`, or `blocked`, together with the current PR/check metadata used for that classification
+- retained post-review lanes classified as `wait_for_review`, `needs_review_repair`, `ready_to_land`, `continue`, or `blocked`, together with the current PR/check metadata used for that classification
 
 After a process restart, recent-run history may be shallow because attempt and event journals are memory-only. Operators should rely on `status`, tracker comments, and retained workspaces rather than local SQL for first-line recovery.
 

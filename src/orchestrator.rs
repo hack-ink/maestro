@@ -57,6 +57,9 @@ query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: Strin
       mergeStateStatus
       headRefName
       headRefOid
+      headRepositoryOwner {
+        login
+      }
       reviewRequests(first: 1) {
         totalCount
       }
@@ -573,6 +576,7 @@ struct PullRequestReviewState {
 	merge_state_status: String,
 	head_ref_name: String,
 	head_ref_oid: String,
+	head_repository_owner: Option<String>,
 	status_check_rollup_state: Option<String>,
 	unresolved_review_threads: usize,
 }
@@ -681,18 +685,21 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 			);
 		}
 
-		let pr_url = serde_json::from_slice::<Vec<PullRequestBranchLookupEntry>>(&output.stdout)?
+		for entry in serde_json::from_slice::<Vec<PullRequestBranchLookupEntry>>(&output.stdout)?
 			.into_iter()
-			.find(|entry| {
+			.filter(|entry| {
 				entry.head_ref_oid == head_oid
 					&& matches!(entry.state.as_str(), "OPEN" | "MERGED" | "CLOSED")
-			})
-			.map(|entry| entry.url);
-		let Some(pr_url) = pr_url else {
-			return Ok(None);
-		};
+			}) {
+			let review_state = self.inspect_review_state(cwd, &entry.url)?;
+			let locator = github::parse_pull_request_url(&entry.url)?;
 
-		self.inspect_review_state(cwd, &pr_url).map(Some)
+			if review_state.head_repository_owner.as_deref() == Some(locator.owner.as_str()) {
+				return Ok(Some(review_state));
+			}
+		}
+
+		Ok(None)
 	}
 }
 
@@ -799,9 +806,16 @@ struct PullRequestReviewStateNode {
 	head_ref_name: String,
 	#[serde(rename = "headRefOid")]
 	head_ref_oid: String,
+	#[serde(rename = "headRepositoryOwner")]
+	head_repository_owner: Option<PullRequestRepositoryOwner>,
 	#[serde(rename = "reviewThreads")]
 	review_threads: PullRequestReviewThreadConnection,
 	commits: PullRequestCommitConnection,
+}
+
+#[derive(Deserialize)]
+struct PullRequestRepositoryOwner {
+	login: String,
 }
 
 #[derive(Deserialize)]
@@ -1062,6 +1076,10 @@ fn pull_request_review_state_from_page(
 		merge_state_status: pull_request.merge_state_status.clone(),
 		head_ref_name: pull_request.head_ref_name.clone(),
 		head_ref_oid: pull_request.head_ref_oid.clone(),
+		head_repository_owner: pull_request
+			.head_repository_owner
+			.as_ref()
+			.map(|owner| owner.login.clone()),
 		status_check_rollup_state: pull_request_status_check_rollup_state(pull_request),
 		unresolved_review_threads: count_unresolved_review_threads(&pull_request.review_threads),
 	}
@@ -1080,6 +1098,8 @@ fn merge_pull_request_review_state_page(
 		|| review_state.merge_state_status != pull_request.merge_state_status
 		|| review_state.head_ref_name != pull_request.head_ref_name
 		|| review_state.head_ref_oid != pull_request.head_ref_oid
+		|| review_state.head_repository_owner
+			!= pull_request.head_repository_owner.as_ref().map(|owner| owner.login.clone())
 		|| review_state.status_check_rollup_state
 			!= pull_request_status_check_rollup_state(pull_request)
 	{
@@ -4236,6 +4256,21 @@ fn validate_post_review_lane_review_state(
 	expected_pr_head_oid: &str,
 	local_head_oid: &str,
 ) -> PostReviewLaneStateLoad {
+	let Some(pr_owner) =
+		github::parse_pull_request_url(&review_state.url).ok().map(|locator| locator.owner)
+	else {
+		return PostReviewLaneStateLoad::Classification(blocked_post_review_lane_from_state(
+			&review_state,
+			"pull_request_repository_parse_failed",
+		));
+	};
+
+	if review_state.head_repository_owner.as_deref() != Some(pr_owner.as_str()) {
+		return PostReviewLaneStateLoad::Classification(blocked_post_review_lane_from_state(
+			&review_state,
+			"pull_request_head_repository_owner_mismatch",
+		));
+	}
 	if review_state.head_ref_name != expected_branch_name {
 		return PostReviewLaneStateLoad::Classification(blocked_post_review_lane_from_state(
 			&review_state,
@@ -4902,13 +4937,15 @@ mod tests {
 			ACTIVE_RUN_IDLE_TIMEOUT, DynamicToolHandler, TrackerToolBridge, TurnContinuationGuard,
 		},
 		config::ServiceConfig,
+		github,
 		orchestrator::{
 			self, GhPullRequestReviewStateInspector, ISSUE_COMMENT_TOOL_NAME,
 			ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 			ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision,
 			PostReviewLaneSnapshot, PullRequestCommitConnection, PullRequestCommitNode,
-			PullRequestCommitPayload, PullRequestPageInfo, PullRequestReviewRequestConnection,
-			PullRequestReviewState, PullRequestReviewStateInspector, PullRequestReviewStateNode,
+			PullRequestCommitPayload, PullRequestPageInfo, PullRequestRepositoryOwner,
+			PullRequestReviewRequestConnection, PullRequestReviewState,
+			PullRequestReviewStateInspector, PullRequestReviewStateNode,
 			PullRequestReviewThreadConnection, PullRequestReviewThreadNode,
 			PullRequestStatusCheckRollup, RunSummary,
 		},
@@ -5271,6 +5308,9 @@ mod tests {
 		unresolved_review_threads: usize,
 		pending_review_requests: usize,
 	) -> PullRequestReviewState {
+		let head_repository_owner =
+			github::parse_pull_request_url(pr_url).expect("pull request URL should parse").owner;
+
 		PullRequestReviewState {
 			url: pr_url.to_owned(),
 			state: String::from("OPEN"),
@@ -5281,6 +5321,7 @@ mod tests {
 			merge_state_status: merge_state_status.to_owned(),
 			head_ref_name: branch_name.to_owned(),
 			head_ref_oid: head_oid.to_owned(),
+			head_repository_owner: Some(head_repository_owner),
 			status_check_rollup_state: check_state.map(str::to_owned),
 			unresolved_review_threads,
 		}
@@ -5294,6 +5335,9 @@ mod tests {
 		has_next_page: bool,
 		end_cursor: Option<&str>,
 	) -> PullRequestReviewStateNode {
+		let head_repository_owner =
+			github::parse_pull_request_url(pr_url).expect("pull request URL should parse").owner;
+
 		PullRequestReviewStateNode {
 			url: pr_url.to_owned(),
 			state: String::from("OPEN"),
@@ -5304,6 +5348,9 @@ mod tests {
 			merge_state_status: String::from("CLEAN"),
 			head_ref_name: branch_name.to_owned(),
 			head_ref_oid: head_oid.to_owned(),
+			head_repository_owner: Some(PullRequestRepositoryOwner {
+				login: head_repository_owner,
+			}),
 			review_threads: PullRequestReviewThreadConnection {
 				nodes: (0..unresolved_review_threads)
 					.map(|_| PullRequestReviewThreadNode { is_resolved: false, is_outdated: false })
@@ -8312,6 +8359,69 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_blocks_missing_review_handoff_record_when_branch_head_rebind_hits_fork_pr()
+	 {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+		let head_oid = String::from_utf8(
+			Command::new("git")
+				.arg("-C")
+				.arg(&workspace.path)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse should run")
+				.stdout,
+		)
+		.expect("git output should be utf-8")
+		.trim()
+		.to_owned();
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+		let mut fork_review_state = sample_pull_request_review_state(
+			pr_url,
+			&workspace.branch_name,
+			&head_oid,
+			Some("APPROVED"),
+			"MERGEABLE",
+			"CLEAN",
+			Some("SUCCESS"),
+			0,
+		);
+
+		fork_review_state.head_repository_owner = Some(String::from("someone-else"));
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(Vec::new())
+				.with_branch_head_responses(vec![Ok(Some(fork_review_state))]),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "blocked");
+		assert_eq!(lanes[0].reason, "pull_request_head_repository_owner_mismatch");
+	}
+
+	#[test]
 	fn build_post_review_lane_statuses_blocks_nonactive_labeled_post_review_issues() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -9483,6 +9593,37 @@ read_first = [{read_first}]
 		let error =
 			orchestrator::merge_pull_request_review_state_page(&mut review_state, &next_page)
 				.expect_err("changed pending review request count should fail");
+
+		assert!(error.to_string().contains("changed while paginating"));
+	}
+
+	#[test]
+	fn merge_pull_request_review_state_page_rejects_changed_head_repository_owner() {
+		let mut review_state = orchestrator::pull_request_review_state_from_page(
+			&sample_pull_request_review_state_page(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+				100,
+				true,
+				Some("cursor-1"),
+			),
+		);
+		let mut next_page = sample_pull_request_review_state_page(
+			"https://github.com/hack-ink/maestro/pull/174",
+			"x/pubfi-pub-101",
+			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
+			1,
+			false,
+			None,
+		);
+
+		next_page.head_repository_owner =
+			Some(PullRequestRepositoryOwner { login: String::from("someone-else") });
+
+		let error =
+			orchestrator::merge_pull_request_review_state_page(&mut review_state, &next_page)
+				.expect_err("changed head repository owner should fail");
 
 		assert!(error.to_string().contains("changed while paginating"));
 	}
