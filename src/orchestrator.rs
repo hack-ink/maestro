@@ -2812,9 +2812,6 @@ where
 		)? {
 		return Ok(None);
 	}
-	if !context.dry_run {
-		context.state_store.record_run_attempt(&run_id, &issue.id, attempt_number, "starting")?;
-	}
 
 	match (|| -> crate::prelude::Result<Option<IssueRunPlan>> {
 		let workspace =
@@ -2862,6 +2859,7 @@ where
 		validate_prepared_issue_run_runtime(&context, &lease_issue_id, &workspace)?;
 
 		if !context.dry_run {
+			record_starting_attempt(context.state_store, &run_id, &issue.id, attempt_number)?;
 			clear_terminal_guard_marker(&workspace.path)?;
 		}
 
@@ -2897,6 +2895,15 @@ where
 			Err(error)
 		},
 	}
+}
+
+fn record_starting_attempt(
+	state_store: &StateStore,
+	run_id: &str,
+	issue_id: &str,
+	attempt_number: i64,
+) -> crate::prelude::Result<()> {
+	state_store.record_run_attempt(run_id, issue_id, attempt_number, "starting")
 }
 
 fn validate_prepared_issue_run_runtime<T>(
@@ -4163,6 +4170,11 @@ where
 
 		return Ok(classification);
 	}
+	if checks_require_wait(review_state.status_check_rollup_state.as_deref()) {
+		classification.reason = String::from("required_checks_pending");
+
+		return Ok(classification);
+	}
 	if approvals_are_satisfied(
 		review_state.review_decision.as_deref(),
 		review_state.pending_review_requests,
@@ -4171,11 +4183,6 @@ where
 	{
 		classification.decision = PostReviewLaneDecision::ReadyToLand;
 		classification.reason = String::from("approvals_and_checks_satisfied");
-
-		return Ok(classification);
-	}
-	if checks_require_wait(review_state.status_check_rollup_state.as_deref()) {
-		classification.reason = String::from("required_checks_pending");
 
 		return Ok(classification);
 	}
@@ -9157,6 +9164,61 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn classify_post_review_lane_waits_for_pending_required_checks_before_ready_to_land() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&head_oid,
+			)),
+			local_branch_name: Some(String::from("x/pubfi-pub-101")),
+			local_head_oid: Some(head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"UNSTABLE",
+				Some("PENDING"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
+		assert_eq!(classification.reason, "required_checks_pending");
+	}
+
+	#[test]
 	fn classify_post_review_lane_ready_to_land_allows_pre_receive_hooks() {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
@@ -9847,6 +9909,20 @@ read_first = [{read_first}]
 		assert!(
 			!config.workspace_root().join(&listed_issue.identifier).exists(),
 			"newly created workspaces should still be cleaned when preflight fails"
+		);
+		assert!(
+			state_store
+				.latest_run_attempt_for_issue(&listed_issue.id)
+				.expect("run attempt lookup should work")
+				.is_none(),
+			"preflight failure should not leave a phantom starting attempt"
+		);
+		assert_eq!(
+			state_store
+				.next_attempt_number(&listed_issue.id)
+				.expect("next attempt lookup should work"),
+			1,
+			"preflight failure should not consume the next attempt number"
 		);
 	}
 
