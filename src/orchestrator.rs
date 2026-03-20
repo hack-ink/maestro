@@ -2959,10 +2959,6 @@ fn validate_prepared_issue_run_runtime<T>(
 where
 	T: IssueTracker,
 {
-	if context.lease_preacquired {
-		return Ok(());
-	}
-
 	validate_review_handoff_runtime(context.project, context.dry_run).inspect_err(|_error| {
 		// Preserve reused retained lanes when GitHub review-handoff preflight fails so
 		// local uncommitted repair work is never discarded by missing token authority.
@@ -10585,7 +10581,8 @@ read_first = [{read_first}]
 	#[cfg(unix)]
 	#[test]
 	fn prepare_issue_run_allows_preacquired_cross_process_slot() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("Todo", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -10674,7 +10671,8 @@ read_first = [{read_first}]
 	#[cfg(unix)]
 	#[test]
 	fn prepare_issue_run_allows_preacquired_recovered_retry_attempt() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
+		let (_temp_dir, base_config, workflow) = temp_project_layout();
+		let config = service_config_with_github_token_env_var(&base_config, "HOME");
 		let issue = sample_issue("In Progress", &[]);
 		let tracker =
 			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
@@ -10760,6 +10758,116 @@ read_first = [{read_first}]
 				.expect("child should retain the adopted local lease")
 				.run_id(),
 			"planned-run"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn prepare_issue_run_rejects_preacquired_cross_process_slot_without_github_token_authority() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Todo", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let parent_store = StateStore::open_in_memory().expect("parent state store should open");
+		let child_store = StateStore::open_in_memory().expect("child state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("retained workspace should exist");
+		let sentinel_path = workspace.path.join("dirty.txt");
+
+		fs::write(&sentinel_path, "uncommitted repair work\n")
+			.expect("retained workspace should keep local edits");
+
+		parent_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("parent dispatch-slot root should configure");
+		child_store
+			.configure_dispatch_slot_root(
+				config.id(),
+				config.workspace_root(),
+				workflow.frontmatter().execution().max_concurrent_agents(),
+			)
+			.expect("child dispatch-slot root should configure");
+
+		assert!(
+			parent_store
+				.try_acquire_lease(config.id(), &issue.id, "planned-run", "In Progress")
+				.expect("parent should acquire the shared dispatch slot")
+		);
+
+		let child_issue_claim = parent_store
+			.clone_issue_claim_for_child(&issue.id)
+			.expect("child should inherit the shared issue-claim fd");
+		let (child_guard, child_slot_index) = parent_store
+			.clone_dispatch_slot_for_child(&issue.id)
+			.expect("child should inherit the shared dispatch-slot fd");
+
+		child_store
+			.adopt_preacquired_lease(
+				config.id(),
+				&issue.id,
+				"planned-run",
+				"In Progress",
+				state::PreacquiredLeaseGuards {
+					issue_claim_fd: child_issue_claim.into_raw_fd(),
+					dispatch_slot_fd: child_guard.into_raw_fd(),
+					dispatch_slot_index: child_slot_index,
+				},
+			)
+			.expect("child should adopt the inherited lease guard");
+
+		let error = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &child_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				lease_preacquired: true,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
+				preferred_run_identity: Some(orchestrator::PreferredRunIdentity {
+					run_id: "planned-run",
+					attempt_number: 1,
+				}),
+				preferred_retry_budget_base: None,
+			},
+			issue.clone(),
+		)
+		.expect_err(
+			"preacquired live runs should fail fast when github token authority is missing",
+		);
+
+		assert!(error.to_string().contains("github.token_env_var"));
+		assert!(
+			workspace.path.exists(),
+			"reused retained workspaces must survive preflight failure for preacquired child runs"
+		);
+		assert!(
+			sentinel_path.exists(),
+			"preflight failure must not discard retained local work for preacquired child runs"
+		);
+		assert!(
+			child_store
+				.lease_for_issue(&issue.id)
+				.expect("child lease lookup should succeed")
+				.is_none(),
+			"preacquired child lease should still clear after preflight failure"
+		);
+		assert!(
+			child_store
+				.latest_run_attempt_for_issue(&issue.id)
+				.expect("run attempt lookup should work")
+				.is_none(),
+			"preflight failure should not leave a phantom starting attempt for preacquired child runs"
 		);
 	}
 
