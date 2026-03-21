@@ -1003,6 +1003,7 @@ impl ReviewHandoffMarker {
 		&self.pr_url
 	}
 
+	#[cfg(test)]
 	pub(crate) fn pr_head_oid(&self) -> &str {
 		&self.pr_head_oid
 	}
@@ -1329,14 +1330,6 @@ pub(crate) fn write_review_handoff_marker(
 	)?;
 
 	Ok(())
-}
-
-pub(crate) fn remove_review_handoff_marker(workspace_path: &Path) -> Result<()> {
-	match fs::remove_file(workspace_path.join(REVIEW_HANDOFF_MARKER_FILE)) {
-		Ok(()) => Ok(()),
-		Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-		Err(error) => Err(error.into()),
-	}
 }
 
 pub(crate) fn read_review_handoff_marker(

@@ -4293,7 +4293,6 @@ where
 		return Ok(validate_post_review_lane_review_state(
 			review_state,
 			snapshot.workspace.branch_name(),
-			review_handoff.pr_head_oid(),
 			local_head_oid,
 		));
 	}
@@ -4332,14 +4331,12 @@ where
 		review_state,
 		snapshot.workspace.branch_name(),
 		local_head_oid,
-		local_head_oid,
 	))
 }
 
 fn validate_post_review_lane_review_state(
 	review_state: PullRequestReviewState,
 	expected_branch_name: &str,
-	expected_pr_head_oid: &str,
 	local_head_oid: &str,
 ) -> PostReviewLaneStateLoad {
 	let Some(pr_owner) =
@@ -4377,9 +4374,7 @@ fn validate_post_review_lane_review_state(
 			"pull_request_branch_mismatch",
 		));
 	}
-	if review_state.head_ref_oid != expected_pr_head_oid
-		|| review_state.head_ref_oid != local_head_oid
-	{
+	if review_state.head_ref_oid != local_head_oid {
 		return PostReviewLaneStateLoad::Classification(blocked_post_review_lane_from_state(
 			&review_state,
 			"pull_request_head_mismatch",
@@ -4410,10 +4405,6 @@ fn validate_post_review_lane_workspace<'a>(
 	let Some(local_head_oid) = snapshot.local_head_oid.as_deref() else {
 		return Err("workspace_head_missing");
 	};
-
-	if local_head_oid != review_handoff.pr_head_oid() {
-		return Err("workspace_head_mismatch");
-	}
 
 	Ok(local_head_oid)
 }
@@ -8463,6 +8454,72 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_allows_stale_review_handoff_marker_head_after_repair_push() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+		let current_head_oid = String::from_utf8(
+			Command::new("git")
+				.arg("-C")
+				.arg(&workspace.path)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse should run")
+				.stdout,
+		)
+		.expect("git output should be utf-8")
+		.trim()
+		.to_owned();
+		let stale_marker_head_oid = "08a20f7dfb9526e7421a5f095b1c6adec84e52d6";
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		state::write_review_handoff_marker(
+			&workspace.path,
+			&sample_review_handoff_marker(&workspace.branch_name, pr_url, stale_marker_head_oid),
+		)
+		.expect("review handoff marker should write");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				pr_url,
+				&workspace.branch_name,
+				&current_head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "ready_to_land");
+		assert_eq!(lanes[0].reason, "approvals_and_checks_satisfied");
+		assert_eq!(lanes[0].pr_url.as_deref(), Some(pr_url));
+	}
+
+	#[test]
 	fn build_post_review_lane_statuses_blocks_malformed_review_handoff_record() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
@@ -8942,6 +8999,119 @@ read_first = [{read_first}]
 
 		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
 		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+	}
+
+	#[test]
+	fn classify_post_review_lane_allows_repaired_head_when_review_handoff_marker_head_is_stale() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let marker_head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let current_head_oid = String::from("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&marker_head_oid,
+			)),
+			local_branch_name: Some(String::from("x/pubfi-pub-101")),
+			local_head_oid: Some(current_head_oid.clone()),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&current_head_oid,
+				None,
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
+		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+	}
+
+	#[test]
+	fn classify_post_review_lane_blocks_when_pull_request_head_differs_from_workspace_head() {
+		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("In Review", &[]);
+		let marker_head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+		let current_head_oid = String::from("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+		let pr_head_oid = String::from("feedfacefeedfacefeedfacefeedfacefeedface");
+		let workspace_path = temp_dir.path().join("lane");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let workspace = state_store
+			.list_workspaces("pubfi")
+			.expect("workspace list should succeed")
+			.into_iter()
+			.next()
+			.expect("workspace should exist");
+		let snapshot = PostReviewLaneSnapshot {
+			issue,
+			workspace,
+			review_handoff: Some(sample_review_handoff_marker(
+				"x/pubfi-pub-101",
+				"https://github.com/hack-ink/maestro/pull/174",
+				&marker_head_oid,
+			)),
+			local_branch_name: Some(String::from("x/pubfi-pub-101")),
+			local_head_oid: Some(current_head_oid),
+		};
+		let classification = orchestrator::classify_post_review_lane(
+			&snapshot,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				"https://github.com/hack-ink/maestro/pull/174",
+				"x/pubfi-pub-101",
+				&pr_head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("classification should succeed");
+
+		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
+		assert_eq!(classification.reason, "pull_request_head_mismatch");
 	}
 
 	#[test]

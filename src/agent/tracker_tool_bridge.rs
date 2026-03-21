@@ -837,11 +837,8 @@ impl<'a> TrackerToolBridge<'a> {
 			})
 		})?;
 
-		if let Err(error) = self.tracker.update_issue_state(&self.issue.id, success_state_id) {
-			let _ = state::remove_review_handoff_marker(&review_context.cwd);
+		self.tracker.update_issue_state(&self.issue.id, success_state_id)?;
 
-			return Err(error);
-		}
 		if let Err(error) = self.tracker.create_comment(&self.issue.id, &completion_comment) {
 			return Err(Report::new(ReviewHandoffWritebackFailed {
 				issue_identifier: self.issue.identifier.clone(),
@@ -3013,6 +3010,7 @@ Use the tracker tools.
 
 	#[test]
 	fn rejects_review_handoff_before_posting_success_comment_when_state_transition_fails() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
 		let tracker = FakeTracker::with_state_update_error("tracker state write failed");
 		let issue = sample_issue();
 		let workflow = sample_workflow();
@@ -3042,7 +3040,7 @@ Use the tracker tools.
 			&tracker,
 			&issue,
 			&workflow,
-			sample_review_context(),
+			sample_review_context_in(temp_dir.path()),
 			&inspector,
 			&local_repo_inspector,
 		);
@@ -3064,6 +3062,11 @@ Use the tracker tools.
 		assert!(error.to_string().contains("tracker state write failed"));
 		assert!(tracker.comments.borrow().is_empty());
 		assert!(tracker.state_updates.borrow().is_empty());
+		assert!(
+			state::read_review_handoff_marker(temp_dir.path())
+				.expect("marker read should succeed")
+				.is_some()
+		);
 	}
 
 	#[test]
