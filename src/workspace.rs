@@ -140,7 +140,7 @@ impl WorkspaceManager {
 		Ok(())
 	}
 
-	fn refresh_workspace_git_metadata(&self, workspace_path: &Path) -> Result<()> {
+	pub(crate) fn refresh_workspace_git_metadata(&self, workspace_path: &Path) -> Result<()> {
 		copy_repo_local_git_config(&self.repo_root, workspace_path)?;
 
 		if let Some(source_origin_url) = try_git_stdout(
@@ -445,7 +445,10 @@ fn normalize_remote_url(source_repo_root: &Path, remote_url: &str) -> String {
 fn should_copy_local_git_config(key: &str) -> bool {
 	key.starts_with("user.")
 		|| key.starts_with("gpg.")
-		|| matches!(key, "commit.gpgsign" | "tag.gpgsign")
+		|| matches!(
+			key,
+			"commit.gpgsign" | "tag.gpgsign" | "codex.github-identity" | "codex.linear-workspace"
+		)
 }
 
 fn is_relative_path_remote(remote_url: &str) -> bool {
@@ -623,6 +626,8 @@ mod tests {
 
 		run_git(&repo_root, &["config", "commit.gpgsign", "false"]);
 		run_git(&repo_root, &["config", "user.signingkey", "workspace-tests"]);
+		run_git(&repo_root, &["config", "codex.github-identity", "y"]);
+		run_git(&repo_root, &["config", "codex.linear-workspace", "hackink"]);
 
 		let spec = manager.ensure_workspace("PUB-101", false).expect("workspace should be created");
 
@@ -642,6 +647,14 @@ mod tests {
 			git_stdout(&spec.path, &["config", "--local", "--get", "user.signingkey"]),
 			"workspace-tests"
 		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "codex.github-identity"]),
+			"y"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "codex.linear-workspace"]),
+			"hackink"
+		);
 	}
 
 	#[test]
@@ -656,7 +669,7 @@ mod tests {
 
 		fs::write(
 			&included_config,
-			"[user]\n\tname = Included Tests\n\temail = included@example.com\n",
+			"[user]\n\tname = Included Tests\n\temail = included@example.com\n[codex]\n\tgithub-identity = y\n\tlinear-workspace = hackink\n",
 		)
 		.expect("included config should write");
 
@@ -674,6 +687,14 @@ mod tests {
 		assert_eq!(
 			git_stdout(&spec.path, &["config", "--local", "--get", "user.email"]),
 			"included@example.com"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "codex.github-identity"]),
+			"y"
+		);
+		assert_eq!(
+			git_stdout(&spec.path, &["config", "--local", "--get", "codex.linear-workspace"]),
+			"hackink"
 		);
 	}
 

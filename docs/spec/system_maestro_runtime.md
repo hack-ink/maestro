@@ -241,6 +241,7 @@ The local runtime store may keep only the data needed to operate safely during t
 This runtime state is process-memory only. `maestro` must not require a durable local database file for normal operation or restart recovery.
 The local runtime store must not become the operator-facing source of workflow truth.
 For daemon-child supervision, the active lane may also carry a short-lived workspace heartbeat marker at `.workspaces/<ISSUE>/.maestro-run-activity`. That marker is advisory, keyed to the current `run_id` plus `attempt`, and exists so the daemon can observe child activity across process boundaries, reconstruct a still-live retained lane after parent restart, and preserve retry-budget accounting without reviving a durable local state database.
+For post-review ownership, a retained lane may also carry a local `.workspaces/<ISSUE>/.maestro-review-handoff` marker recording the authoritative PR URL, branch lineage, and validated PR head OID that completed the `In Review` handoff. That marker exists only to rebind the retained lane to its owned PR state; it does not replace tracker or GitHub as the authoritative sources of workflow truth.
 For live execution, the current single project dispatch slot must still remain mutually exclusive across concurrent `maestro` processes. The runtime may enforce that exclusion with a short-lived workspace-root lock anchor, and daemon parents may hand that guard to the spawned `run --once` child so the active lane keeps exclusive ownership even if the parent restarts. That handoff currently requires Unix file-descriptor inheritance, so daemon mode is a Unix-only operator surface in this phase. Restart recovery must not depend on any durable lease database.
 
 ## Supported operator visibility surface
@@ -257,6 +258,7 @@ The status surface should describe only current local execution state, plus rest
 - active leased runs
 - recent run attempts with local status, thread id, and latest recorded protocol event
 - retained workspace mappings
+- retained post-review lanes classified as `wait_for_review`, `needs_review_repair`, `ready_to_land`, `continue`, or `blocked`, together with the current PR/check metadata used for that classification
 
 After a process restart, recent-run history may be shallow because attempt and event journals are memory-only. Operators should rely on `status`, tracker comments, and retained workspaces rather than local SQL for first-line recovery.
 

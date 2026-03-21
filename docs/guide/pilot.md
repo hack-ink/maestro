@@ -2,7 +2,7 @@
 
 Goal: Run the `maestro` MVP against one configured Linear project and one target repository, with `maestro` itself as the default first pilot target.
 Read this when: You are preparing a dry run or live self-dogfood pilot and need the bounded operator procedure for config, target-repo requirements, and expected run behavior.
-Preconditions: `codex app-server` is available locally; `gh` is available locally for live PR-backed handoff validation; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker API token is configured through `tracker.api_key` in `tmp/maestro.toml`.
+Preconditions: `codex app-server` is available locally; `gh` is available locally for live PR-backed handoff validation; the target repository exists on disk with a root `WORKFLOW.md`; referenced `WORKFLOW.md [context.read_first]` files exist; the Linear team exposes the required workflow states; and the tracker and GitHub token env-var names are configured through `tracker.api_key_env_var` and `github.token_env_var` in `tmp/maestro.toml`.
 Depends on: `docs/spec/system_maestro_runtime.md`, `docs/spec/system_workflow_contract.md`, `docs/spec/system_app_server_contract.md`, the target repository root `WORKFLOW.md`, and `Makefile.toml` for repo-native verification tasks.
 Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run --config ./tmp/maestro.toml`; and, when the environment is ready, `cargo run -- run --once --config ./tmp/maestro.toml`.
 
@@ -20,7 +20,8 @@ Verification: `cargo run -- protocol probe`; `cargo run -- run --once --dry-run 
 - The target repository has a root `WORKFLOW.md`.
 - The target repository files referenced by `WORKFLOW.md [context.read_first]` exist.
 - The Linear team already has the workflow states used by the target `WORKFLOW.md`.
-- The Linear API token is configured through `tracker.api_key` in `tmp/maestro.toml`.
+- The Linear API token env-var name is configured through `tracker.api_key_env_var` in `tmp/maestro.toml`.
+- GitHub auth for review handoff and post-review status is configured through `github.token_env_var` in `tmp/maestro.toml`; `maestro` does not fall back to ambient `GH_TOKEN` or an existing `gh auth login` session.
 
 Recommended first-run check:
 
@@ -68,7 +69,10 @@ workflow_path = "WORKFLOW.md"
 
 [tracker]
 project_slug = "1a216b6d7100"
-api_key = "$LINEAR_API_KEY"
+api_key_env_var = "LINEAR_API_KEY"
+
+[github]
+token_env_var = "GITHUB_TOKEN"
 
 [agent]
 transport = "stdio://"
@@ -82,7 +86,8 @@ Notes:
 - `workflow_path` is repository-relative and defaults to `WORKFLOW.md`.
 - `transport` is optional and defaults to `stdio://`.
 - `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
-- `api_key` accepts either a literal Linear token or an environment-variable reference in the form `$ENV_VAR`.
+- `api_key_env_var` is required and must name the environment variable that stores the Linear API token.
+- `github.token_env_var` is required for PR-backed review handoff validation and post-review PR-state inspection and must name the environment variable that stores the GitHub token.
 - The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear.
 - Checked-in config examples should use the canonical Linear `slugId` for the target project. For the current self-dogfood pilot, that value is `1a216b6d7100`.
 
