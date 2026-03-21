@@ -1078,6 +1078,23 @@ fn select_owned_branch_head_review_state(
 			.cmp(&pull_request_branch_lookup_state_rank(&right.state))
 	});
 
+	let open_matches =
+		owned_matches.iter().filter(|review_state| review_state.state == "OPEN").count();
+
+	if open_matches == 1 {
+		let open_index = owned_matches
+			.iter()
+			.position(|review_state| review_state.state == "OPEN")
+			.expect("exactly one open match must have an index");
+
+		return BranchHeadReviewStateResolution::Matched(Box::new(
+			owned_matches.remove(open_index),
+		));
+	}
+	if open_matches > 1 {
+		return BranchHeadReviewStateResolution::Ambiguous;
+	}
+
 	match owned_matches.len() {
 		1 => BranchHeadReviewStateResolution::Matched(Box::new(owned_matches.remove(0))),
 		_ => BranchHeadReviewStateResolution::Ambiguous,
@@ -10198,7 +10215,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn branch_head_recovery_blocks_ambiguous_open_and_merged_pull_requests() {
+	fn branch_head_recovery_prefers_unique_open_pull_request_over_historical_matches() {
 		let open = sample_pull_request_review_state(
 			"https://github.com/hack-ink/maestro/pull/173",
 			"x/pubfi-pub-101",
@@ -10216,7 +10233,7 @@ read_first = [{read_first}]
 
 		assert_eq!(
 			orchestrator::select_owned_branch_head_review_state(vec![merged, open.clone()]),
-			orchestrator::BranchHeadReviewStateResolution::Ambiguous,
+			orchestrator::BranchHeadReviewStateResolution::Matched(Box::new(open)),
 		);
 	}
 
