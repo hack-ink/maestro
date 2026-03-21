@@ -4546,7 +4546,7 @@ fn resolve_configured_env_var(
 }
 
 fn merge_state_allows_ready_to_land(merge_state_status: &str) -> bool {
-	matches!(merge_state_status, "CLEAN" | "HAS_HOOKS" | "UNSTABLE")
+	matches!(merge_state_status, "CLEAN" | "HAS_HOOKS")
 }
 
 fn approvals_are_satisfied(review_decision: Option<&str>, pending_review_requests: usize) -> bool {
@@ -8260,6 +8260,62 @@ read_first = [{read_first}]
 	}
 
 	#[test]
+	fn build_post_review_lane_statuses_waits_when_checks_are_not_green() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let repo_root = config.repo_root().to_path_buf();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let head_oid = String::from_utf8(
+			Command::new("git")
+				.arg("-C")
+				.arg(&repo_root)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse should run")
+				.stdout,
+		)
+		.expect("git output should be utf-8")
+		.trim()
+		.to_owned();
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+
+		state_store
+			.upsert_workspace("pubfi", &issue.id, "main", &repo_root.display().to_string())
+			.expect("workspace should record");
+
+		state::write_review_handoff_marker(
+			&repo_root,
+			&sample_review_handoff_marker("main", pr_url, &head_oid),
+		)
+		.expect("review handoff marker should write");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				pr_url,
+				"main",
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"UNSTABLE",
+				Some("FAILURE"),
+				0,
+			))]),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "wait_for_review");
+		assert_eq!(lanes[0].reason, "waiting_for_review_or_checks");
+		assert_eq!(lanes[0].pr_url.as_deref(), Some(pr_url));
+	}
+
+	#[test]
 	fn build_post_review_lane_statuses_leaves_managed_workspace_git_metadata_untouched() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
@@ -9521,7 +9577,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn classify_post_review_lane_ready_to_land_allows_optional_failed_checks() {
+	fn classify_post_review_lane_waits_when_checks_are_not_green() {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("In Review", &[]);
@@ -9571,8 +9627,8 @@ read_first = [{read_first}]
 		)
 		.expect("classification should succeed");
 
-		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
-		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
+		assert_eq!(classification.reason, "waiting_for_review_or_checks");
 	}
 
 	#[test]
