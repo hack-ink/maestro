@@ -1578,8 +1578,6 @@ where
 				workflow.frontmatter().execution().max_concurrent_agents_by_state(),
 			)?;
 
-			validate_review_handoff_runtime(project, false)?;
-
 			if !state_store.try_acquire_lease(
 				project.id(),
 				&summary.issue_id,
@@ -2951,9 +2949,6 @@ where
 
 			return Ok(None);
 		}
-
-		validate_prepared_issue_run_runtime(&context, &lease_issue_id, &workspace)?;
-
 		if !context.dry_run {
 			record_starting_attempt(context.state_store, &run_id, &issue.id, attempt_number)?;
 			clear_terminal_guard_marker(&workspace.path)?;
@@ -3000,28 +2995,6 @@ fn record_starting_attempt(
 	attempt_number: i64,
 ) -> crate::prelude::Result<()> {
 	state_store.record_run_attempt(run_id, issue_id, attempt_number, "starting")
-}
-
-fn validate_prepared_issue_run_runtime<T>(
-	context: &PrepareIssueRunContext<'_, T>,
-	issue_id: &str,
-	workspace: &WorkspaceSpec,
-) -> crate::prelude::Result<()>
-where
-	T: IssueTracker,
-{
-	validate_review_handoff_runtime(context.project, context.dry_run).inspect_err(|_error| {
-		// Preserve reused retained lanes when GitHub review-handoff preflight fails so
-		// local uncommitted repair work is never discarded by missing token authority.
-		if !context.dry_run && !workspace.reused_existing {
-			let _ = cleanup_terminal_workspace(
-				context.state_store,
-				context.workspace_manager,
-				issue_id,
-				&workspace.path,
-			);
-		}
-	})
 }
 
 fn resolve_prepare_run_identity(
@@ -3143,6 +3116,7 @@ where
 		.ok_or_else(|| eyre::eyre!("Linear project slug `{project_slug}` was not found."))
 }
 
+#[cfg(test)]
 fn validate_review_handoff_runtime(
 	project: &ServiceConfig,
 	dry_run: bool,
@@ -3170,6 +3144,7 @@ fn validate_daemon_runtime() -> crate::prelude::Result<()> {
 	}
 }
 
+#[cfg(test)]
 fn validate_command_available(command: &str, purpose: &str) -> crate::prelude::Result<()> {
 	let output = Command::new(command).arg("--version").output().map_err(|error| {
 		eyre::eyre!("Required command `{command}` is unavailable for {purpose}: {error}")
@@ -4292,19 +4267,21 @@ where
 	if let Some(review_handoff) = snapshot.review_handoff.as_ref() {
 		let local_head_oid = match validate_post_review_lane_workspace(snapshot, review_handoff) {
 			Ok(local_head_oid) => local_head_oid,
-			Err(reason) =>
+			Err(reason) => {
 				return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
 					reason,
-				))),
+				)));
+			},
 		};
 		let review_state = match review_state_inspector
 			.inspect_review_state(snapshot.workspace.workspace_path(), review_handoff.pr_url())
 		{
 			Ok(review_state) => review_state,
-			Err(_error) =>
+			Err(_error) => {
 				return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
 					"pull_request_state_read_failed",
-				))),
+				)));
+			},
 		};
 
 		return Ok(validate_post_review_lane_review_state(
@@ -4330,18 +4307,21 @@ where
 		local_head_oid,
 	) {
 		Ok(BranchHeadReviewStateResolution::Matched(review_state)) => *review_state,
-		Ok(BranchHeadReviewStateResolution::Missing) =>
+		Ok(BranchHeadReviewStateResolution::Missing) => {
 			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
 				"missing_review_handoff_record",
-			))),
-		Ok(BranchHeadReviewStateResolution::Ambiguous) =>
+			)));
+		},
+		Ok(BranchHeadReviewStateResolution::Ambiguous) => {
 			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
 				"pull_request_branch_head_ambiguous",
-			))),
-		Err(_error) =>
+			)));
+		},
+		Err(_error) => {
 			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
 				"pull_request_state_read_failed",
-			))),
+			)));
+		},
 	};
 
 	Ok(validate_post_review_lane_review_state(
@@ -4423,7 +4403,42 @@ fn validate_post_review_lane_workspace<'a>(
 		return Err("workspace_head_missing");
 	};
 
+	if local_head_oid != review_handoff.pr_head_oid() {
+		match workspace_head_descends_from_review_handoff(
+			snapshot.workspace.workspace_path(),
+			review_handoff.pr_head_oid(),
+			local_head_oid,
+		) {
+			Ok(true) => {},
+			Ok(false) => return Err("review_handoff_lineage_mismatch"),
+			Err(()) => return Err("review_handoff_lineage_check_failed"),
+		}
+	}
+
 	Ok(local_head_oid)
+}
+
+fn workspace_head_descends_from_review_handoff(
+	workspace_path: &Path,
+	recorded_head_oid: &str,
+	local_head_oid: &str,
+) -> std::result::Result<bool, ()> {
+	if recorded_head_oid == local_head_oid {
+		return Ok(true);
+	}
+
+	let output = Command::new("git")
+		.arg("-C")
+		.arg(workspace_path)
+		.args(["merge-base", "--is-ancestor", recorded_head_oid, local_head_oid])
+		.output()
+		.map_err(|_| ())?;
+
+	match output.status.code() {
+		Some(0) => Ok(true),
+		Some(1) => Ok(false),
+		_ => Err(()),
+	}
 }
 
 fn initial_post_review_lane_classification(
@@ -5379,6 +5394,57 @@ mod tests {
 		head_oid: &str,
 	) -> state::ReviewHandoffMarker {
 		state::ReviewHandoffMarker::new("run-1", 1, branch_name, pr_url, branch_name, head_oid)
+	}
+
+	fn git_output(workspace_path: &Path, args: &[&str]) -> String {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(workspace_path)
+			.args(args)
+			.output()
+			.expect("git command should run");
+
+		assert!(
+			output.status.success(),
+			"git {} should succeed: {}",
+			args.join(" "),
+			String::from_utf8_lossy(&output.stderr),
+		);
+
+		String::from_utf8(output.stdout).expect("git output should be utf-8").trim().to_owned()
+	}
+
+	fn git_status_success(workspace_path: &Path, args: &[&str]) {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(workspace_path)
+			.args(args)
+			.output()
+			.expect("git command should run");
+
+		assert!(
+			output.status.success(),
+			"git {} should succeed: {}",
+			args.join(" "),
+			String::from_utf8_lossy(&output.stderr),
+		);
+	}
+
+	fn commit_workspace_change(
+		workspace_path: &Path,
+		file_name: &str,
+		contents: &str,
+		message: &str,
+	) -> String {
+		git_status_success(workspace_path, &["config", "user.name", "Maestro Tests"]);
+		git_status_success(workspace_path, &["config", "user.email", "maestro-tests@example.com"]);
+
+		fs::write(workspace_path.join(file_name), contents).expect("workspace file should write");
+
+		git_status_success(workspace_path, &["add", file_name]);
+		git_status_success(workspace_path, &["commit", "-m", message]);
+
+		git_output(workspace_path, &["rev-parse", "HEAD"])
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -8527,7 +8593,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn build_post_review_lane_statuses_allows_stale_review_handoff_marker_head_after_repair_push() {
+	fn build_post_review_lane_statuses_allows_descendant_review_handoff_head_after_repair_push() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
 		let tracker =
@@ -8538,19 +8604,9 @@ read_first = [{read_first}]
 		let workspace = workspace_manager
 			.ensure_workspace(&issue.identifier, false)
 			.expect("workspace should exist");
-		let current_head_oid = String::from_utf8(
-			Command::new("git")
-				.arg("-C")
-				.arg(&workspace.path)
-				.args(["rev-parse", "HEAD"])
-				.output()
-				.expect("git rev-parse should run")
-				.stdout,
-		)
-		.expect("git output should be utf-8")
-		.trim()
-		.to_owned();
-		let stale_marker_head_oid = "08a20f7dfb9526e7421a5f095b1c6adec84e52d6";
+		let marker_head_oid = git_output(&workspace.path, &["rev-parse", "HEAD"]);
+		let current_head_oid =
+			commit_workspace_change(&workspace.path, "repair.txt", "repair push\n", "repair push");
 		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
 
 		state_store
@@ -8564,7 +8620,7 @@ read_first = [{read_first}]
 
 		state::write_review_handoff_marker(
 			&workspace.path,
-			&sample_review_handoff_marker(&workspace.branch_name, pr_url, stale_marker_head_oid),
+			&sample_review_handoff_marker(&workspace.branch_name, pr_url, &marker_head_oid),
 		)
 		.expect("review handoff marker should write");
 
@@ -8590,6 +8646,70 @@ read_first = [{read_first}]
 		assert_eq!(lanes[0].classification, "ready_to_land");
 		assert_eq!(lanes[0].reason, "approvals_and_checks_satisfied");
 		assert_eq!(lanes[0].pr_url.as_deref(), Some(pr_url));
+	}
+
+	#[test]
+	fn build_post_review_lane_statuses_blocks_review_handoff_lineage_rewrite() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+		let marker_head_oid = git_output(&workspace.path, &["rev-parse", "HEAD"]);
+		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
+
+		git_status_success(&workspace.path, &["checkout", "--orphan", "rewrite-history"]);
+
+		fs::write(workspace.path.join("rewrite.txt"), "rewritten history\n")
+			.expect("rewrite file should write");
+
+		git_status_success(&workspace.path, &["add", "rewrite.txt"]);
+		git_status_success(&workspace.path, &["commit", "-m", "rewrite history"]);
+		git_status_success(&workspace.path, &["branch", "-M", &workspace.branch_name]);
+
+		let rewritten_head_oid = git_output(&workspace.path, &["rev-parse", "HEAD"]);
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		state::write_review_handoff_marker(
+			&workspace.path,
+			&sample_review_handoff_marker(&workspace.branch_name, pr_url, &marker_head_oid),
+		)
+		.expect("review handoff marker should write");
+
+		let lanes = orchestrator::build_post_review_lane_statuses(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				pr_url,
+				&workspace.branch_name,
+				&rewritten_head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			))]),
+		)
+		.expect("post-review lane status build should succeed");
+
+		assert_eq!(lanes.len(), 1);
+		assert_eq!(lanes[0].classification, "blocked");
+		assert_eq!(lanes[0].reason, "review_handoff_lineage_mismatch");
 	}
 
 	#[test]
@@ -9075,7 +9195,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn classify_post_review_lane_allows_repaired_head_when_review_handoff_marker_head_is_stale() {
+	fn classify_post_review_lane_blocks_stale_review_handoff_head_without_lineage_proof() {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("In Review", &[]);
@@ -9126,33 +9246,37 @@ read_first = [{read_first}]
 		)
 		.expect("classification should succeed");
 
-		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
-		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
+		assert_eq!(classification.decision, PostReviewLaneDecision::Block);
+		assert_eq!(classification.reason, "review_handoff_lineage_check_failed");
 	}
 
 	#[test]
 	fn classify_post_review_lane_blocks_when_pull_request_head_differs_from_workspace_head() {
-		let temp_dir = TempDir::new().expect("temp dir should exist");
+		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("In Review", &[]);
-		let marker_head_oid = String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
-		let current_head_oid = String::from("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("workspace should exist");
+		let branch_name = workspace.branch_name.clone();
+		let workspace_path = workspace.path.clone();
+		let current_head_oid = git_output(&workspace.path, &["rev-parse", "HEAD"]);
 		let pr_head_oid = String::from("feedfacefeedfacefeedfacefeedfacefeedface");
-		let workspace_path = temp_dir.path().join("lane");
-
-		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+		let marker_head_oid = current_head_oid.clone();
 
 		state_store
 			.upsert_workspace(
-				"pubfi",
+				config.id(),
 				&issue.id,
-				"x/pubfi-pub-101",
+				&branch_name,
 				&workspace_path.display().to_string(),
 			)
 			.expect("workspace should record");
 
 		let workspace = state_store
-			.list_workspaces("pubfi")
+			.list_workspaces(config.id())
 			.expect("workspace list should succeed")
 			.into_iter()
 			.next()
@@ -9161,18 +9285,18 @@ read_first = [{read_first}]
 			issue,
 			workspace,
 			review_handoff: Some(sample_review_handoff_marker(
-				"x/pubfi-pub-101",
+				&branch_name,
 				"https://github.com/hack-ink/maestro/pull/174",
 				&marker_head_oid,
 			)),
-			local_branch_name: Some(String::from("x/pubfi-pub-101")),
+			local_branch_name: Some(branch_name.clone()),
 			local_head_oid: Some(current_head_oid),
 		};
 		let classification = orchestrator::classify_post_review_lane(
 			&snapshot,
 			&FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
 				"https://github.com/hack-ink/maestro/pull/174",
-				"x/pubfi-pub-101",
+				&branch_name,
 				&pr_head_oid,
 				Some("APPROVED"),
 				"MERGEABLE",
@@ -10469,55 +10593,8 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn live_run_with_candidate_requires_github_token_authority_before_agent_execution() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
-		let listed_issue = sample_issue("Todo", &[]);
-		let tracker = FakeTracker::with_refresh_snapshots(
-			vec![listed_issue.clone()],
-			vec![vec![listed_issue.clone()]],
-		);
-		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let error =
-			orchestrator::run_project_once(&tracker, &config, &workflow, &state_store, false)
-				.expect_err(
-					"live dispatch should fail before agent execution when github token authority is missing",
-				);
-
-		assert!(error.to_string().contains("github.token_env_var"));
-		assert!(
-			state_store
-				.lease_for_issue(&listed_issue.id)
-				.expect("lease lookup should work")
-				.is_none()
-		);
-		assert!(
-			state_store
-				.workspace_for_issue(&listed_issue.id)
-				.expect("workspace lookup should work")
-				.is_none()
-		);
-		assert!(
-			!config.workspace_root().join(&listed_issue.identifier).exists(),
-			"newly created workspaces should still be cleaned when preflight fails"
-		);
-		assert!(
-			state_store
-				.latest_run_attempt_for_issue(&listed_issue.id)
-				.expect("run attempt lookup should work")
-				.is_none(),
-			"preflight failure should not leave a phantom starting attempt"
-		);
-		assert_eq!(
-			state_store
-				.next_attempt_number(&listed_issue.id)
-				.expect("next attempt lookup should work"),
-			1,
-			"preflight failure should not consume the next attempt number"
-		);
-	}
-
-	#[test]
-	fn live_run_preserves_reused_workspace_when_github_token_preflight_fails() {
+	fn prepare_issue_run_with_candidate_does_not_require_github_token_authority_before_agent_execution()
+	 {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let listed_issue = sample_issue("Todo", &[]);
 		let tracker = FakeTracker::with_refresh_snapshots(
@@ -10527,56 +10604,47 @@ read_first = [{read_first}]
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let workspace_manager =
 			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
-		let workspace = workspace_manager
-			.ensure_workspace(&listed_issue.identifier, false)
-			.expect("retained workspace should exist");
-		let sentinel_path = workspace.path.join("dirty.txt");
-
-		fs::write(&sentinel_path, "uncommitted repair work\n")
-			.expect("retained workspace should keep local edits");
-
-		state_store
-			.upsert_workspace(
-				config.id(),
-				&listed_issue.id,
-				&workspace.branch_name,
-				&workspace.path.display().to_string(),
-			)
-			.expect("workspace mapping should record");
-
-		let error = orchestrator::run_project_once(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			false,
+		let issue_run = orchestrator::prepare_issue_run(
+			orchestrator::PrepareIssueRunContext {
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+				workspace_manager: &workspace_manager,
+				dry_run: false,
+				lease_preacquired: false,
+				dispatch_mode: orchestrator::IssueDispatchMode::Normal,
+				preferred_issue_state: None,
+				preferred_initial_issue_state: None,
+				preferred_run_identity: None,
+				preferred_retry_budget_base: None,
+			},
+			listed_issue.clone(),
 		)
-		.expect_err(
-			"live dispatch should still fail before agent execution when github token authority is missing",
-		);
+		.expect("candidate dispatch should prepare without github token authority")
+		.expect("candidate issue should plan a run");
 
-		assert!(error.to_string().contains("github.token_env_var"));
+		assert_eq!(issue_run.issue.id, listed_issue.id);
+		assert_eq!(issue_run.issue_state, "In Progress");
 		assert!(
-			workspace.path.exists(),
-			"reused retained workspaces must survive preflight failure"
-		);
-		assert!(
-			sentinel_path.exists(),
-			"preflight failure must not discard local uncommitted repair work"
+			state_store
+				.lease_for_issue(&listed_issue.id)
+				.expect("lease lookup should work")
+				.is_some()
 		);
 		assert!(
 			state_store
 				.workspace_for_issue(&listed_issue.id)
 				.expect("workspace lookup should work")
-				.is_some_and(|mapping| mapping.workspace_path() == workspace.path.as_path()),
-			"retained workspace mapping should remain intact after preflight failure"
+				.is_some()
 		);
-		assert!(
+		assert_eq!(
 			state_store
-				.lease_for_issue(&listed_issue.id)
-				.expect("lease lookup should work")
-				.is_none(),
-			"lease should still clear after preflight failure"
+				.latest_run_attempt_for_issue(&listed_issue.id)
+				.expect("run attempt lookup should work")
+				.expect("starting attempt should record")
+				.status(),
+			"starting"
 		);
 	}
 
@@ -11143,7 +11211,7 @@ read_first = [{read_first}]
 
 	#[cfg(unix)]
 	#[test]
-	fn prepare_issue_run_rejects_preacquired_cross_process_slot_without_github_token_authority() {
+	fn prepare_issue_run_allows_preacquired_cross_process_slot_without_github_token_authority() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
 		let tracker =
@@ -11202,7 +11270,7 @@ read_first = [{read_first}]
 			)
 			.expect("child should adopt the inherited lease guard");
 
-		let error = orchestrator::prepare_issue_run(
+		let issue_run = orchestrator::prepare_issue_run(
 			orchestrator::PrepareIssueRunContext {
 				tracker: &tracker,
 				project: &config,
@@ -11222,32 +11290,36 @@ read_first = [{read_first}]
 			},
 			issue.clone(),
 		)
-		.expect_err(
-			"preacquired live runs should fail fast when github token authority is missing",
-		);
+		.expect(
+			"preacquired live runs should not require github token authority before review handoff",
+		)
+		.expect("preacquired live runs should still prepare a run");
 
-		assert!(error.to_string().contains("github.token_env_var"));
+		assert_eq!(issue_run.run_id, "planned-run");
+		assert_eq!(issue_run.attempt_number, 1);
 		assert!(
 			workspace.path.exists(),
-			"reused retained workspaces must survive preflight failure for preacquired child runs"
+			"reused retained workspaces should remain available for preacquired child runs"
 		);
 		assert!(
 			sentinel_path.exists(),
-			"preflight failure must not discard retained local work for preacquired child runs"
+			"prepare path must not discard retained local work for preacquired child runs"
 		);
 		assert!(
 			child_store
 				.lease_for_issue(&issue.id)
 				.expect("child lease lookup should succeed")
-				.is_none(),
-			"preacquired child lease should still clear after preflight failure"
+				.expect("preacquired child lease should remain adopted")
+				.run_id() == "planned-run",
+			"preacquired child lease should remain adopted after planning"
 		);
 		assert!(
 			child_store
 				.latest_run_attempt_for_issue(&issue.id)
 				.expect("run attempt lookup should work")
-				.is_none(),
-			"preflight failure should not leave a phantom starting attempt for preacquired child runs"
+				.expect("starting attempt should record")
+				.status() == "starting",
+			"preacquired child planning should record a starting attempt"
 		);
 	}
 

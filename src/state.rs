@@ -1003,7 +1003,6 @@ impl ReviewHandoffMarker {
 		&self.pr_url
 	}
 
-	#[cfg(test)]
 	pub(crate) fn pr_head_oid(&self) -> &str {
 		&self.pr_head_oid
 	}
