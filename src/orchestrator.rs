@@ -4546,7 +4546,7 @@ fn resolve_configured_env_var(
 }
 
 fn merge_state_allows_ready_to_land(merge_state_status: &str) -> bool {
-	matches!(merge_state_status, "CLEAN" | "HAS_HOOKS")
+	matches!(merge_state_status, "CLEAN" | "HAS_HOOKS" | "UNSTABLE")
 }
 
 fn approvals_are_satisfied(review_decision: Option<&str>, pending_review_requests: usize) -> bool {
@@ -8260,7 +8260,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn build_post_review_lane_statuses_waits_when_checks_are_not_green() {
+	fn build_post_review_lane_statuses_reports_ready_to_land_with_optional_failed_checks() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let repo_root = config.repo_root().to_path_buf();
 		let issue = sample_issue("In Review", &[]);
@@ -8310,8 +8310,8 @@ read_first = [{read_first}]
 		.expect("post-review lane status build should succeed");
 
 		assert_eq!(lanes.len(), 1);
-		assert_eq!(lanes[0].classification, "wait_for_review");
-		assert_eq!(lanes[0].reason, "waiting_for_review_or_checks");
+		assert_eq!(lanes[0].classification, "ready_to_land");
+		assert_eq!(lanes[0].reason, "approvals_and_checks_satisfied");
 		assert_eq!(lanes[0].pr_url.as_deref(), Some(pr_url));
 	}
 
@@ -9577,7 +9577,7 @@ read_first = [{read_first}]
 	}
 
 	#[test]
-	fn classify_post_review_lane_waits_when_checks_are_not_green() {
+	fn classify_post_review_lane_ready_to_land_allows_optional_failed_checks() {
 		let temp_dir = TempDir::new().expect("temp dir should exist");
 		let state_store = StateStore::open_in_memory().expect("state store should open");
 		let issue = sample_issue("In Review", &[]);
@@ -9627,8 +9627,8 @@ read_first = [{read_first}]
 		)
 		.expect("classification should succeed");
 
-		assert_eq!(classification.decision, PostReviewLaneDecision::WaitForReview);
-		assert_eq!(classification.reason, "waiting_for_review_or_checks");
+		assert_eq!(classification.decision, PostReviewLaneDecision::ReadyToLand);
+		assert_eq!(classification.reason, "approvals_and_checks_satisfied");
 	}
 
 	#[test]
