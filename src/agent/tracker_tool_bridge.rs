@@ -209,10 +209,23 @@ impl<'a> TrackerToolBridge<'a> {
 	}
 
 	fn build_tool_specs(&self) -> Vec<DynamicToolSpec> {
-		let mut tool_specs = self.base_tool_specs();
+		let mut tool_specs = match self.review_context.as_ref().map(|context| context.mode) {
+			Some(ReviewExecutionMode::Repair) => self.comment_tool_specs(),
+			Some(ReviewExecutionMode::Handoff) => {
+				let mut tool_specs = self.base_tool_specs();
 
-		if let Some(review_context) = &self.review_context {
-			tool_specs.extend(self.review_completion_tool_specs(review_context.mode));
+				tool_specs.extend(self.review_handoff_tool_specs());
+
+				tool_specs
+			},
+			None => self.base_tool_specs(),
+		};
+
+		if matches!(
+			self.review_context.as_ref().map(|context| context.mode),
+			Some(ReviewExecutionMode::Repair)
+		) {
+			tool_specs.extend(self.review_repair_tool_specs());
 		}
 
 		tool_specs.push(self.label_add_tool_spec());
@@ -221,44 +234,46 @@ impl<'a> TrackerToolBridge<'a> {
 	}
 
 	fn base_tool_specs(&self) -> Vec<DynamicToolSpec> {
-		vec![
-			DynamicToolSpec {
-				name: ISSUE_TRANSITION_TOOL_NAME.to_owned(),
-				description: String::from(
-					"Move the currently leased issue to another allowed workflow state.",
-				),
-				input_schema: serde_json::json!({
-					"type": "object",
-					"properties": {
-						"issue_id": { "type": "string" },
-						"issue_identifier": { "type": "string" },
-						"state": { "type": "string" }
-					},
-					"required": ["state"],
-					"additionalProperties": false
-				}),
-			},
-			DynamicToolSpec {
-				name: ISSUE_COMMENT_TOOL_NAME.to_owned(),
-				description: String::from("Add a comment to the currently leased issue."),
-				input_schema: serde_json::json!({
-					"type": "object",
-					"properties": {
-						"issue_id": { "type": "string" },
-						"issue_identifier": { "type": "string" },
-						"body": { "type": "string" }
-					},
-					"required": ["body"],
-					"additionalProperties": false
-				}),
-			},
-		]
+		let mut tool_specs = vec![self.transition_tool_spec()];
+
+		tool_specs.extend(self.comment_tool_specs());
+
+		tool_specs
 	}
 
-	fn review_completion_tool_specs(&self, mode: ReviewExecutionMode) -> [DynamicToolSpec; 2] {
-		match mode {
-			ReviewExecutionMode::Handoff => self.review_handoff_tool_specs(),
-			ReviewExecutionMode::Repair => self.review_repair_tool_specs(),
+	fn comment_tool_specs(&self) -> Vec<DynamicToolSpec> {
+		vec![DynamicToolSpec {
+			name: ISSUE_COMMENT_TOOL_NAME.to_owned(),
+			description: String::from("Add a comment to the currently leased issue."),
+			input_schema: serde_json::json!({
+				"type": "object",
+				"properties": {
+					"issue_id": { "type": "string" },
+					"issue_identifier": { "type": "string" },
+					"body": { "type": "string" }
+				},
+				"required": ["body"],
+				"additionalProperties": false
+			}),
+		}]
+	}
+
+	fn transition_tool_spec(&self) -> DynamicToolSpec {
+		DynamicToolSpec {
+			name: ISSUE_TRANSITION_TOOL_NAME.to_owned(),
+			description: String::from(
+				"Move the currently leased issue to another allowed workflow state.",
+			),
+			input_schema: serde_json::json!({
+				"type": "object",
+				"properties": {
+					"issue_id": { "type": "string" },
+					"issue_identifier": { "type": "string" },
+					"state": { "type": "string" }
+				},
+				"required": ["state"],
+				"additionalProperties": false
+			}),
 		}
 	}
 
@@ -1034,6 +1049,12 @@ impl<'a> TrackerToolBridge<'a> {
 		let pull_request = self
 			.validate_review_action_pr(review_context, &pending_review_repair.pr_url)
 			.map_err(|error| eyre::eyre!(error))?;
+		let completion_comment =
+			format_review_repair_comment(review_context, &pending_review_repair);
+
+		validate_public_comment_body(&completion_comment).map_err(|error| eyre::eyre!(error))?;
+
+		self.tracker.create_comment(&self.issue.id, &completion_comment)?;
 
 		state::write_review_handoff_marker(
 			&review_context.cwd,
@@ -1047,12 +1068,6 @@ impl<'a> TrackerToolBridge<'a> {
 			),
 		)?;
 
-		let completion_comment =
-			format_review_repair_comment(review_context, &pending_review_repair);
-
-		validate_public_comment_body(&completion_comment).map_err(|error| eyre::eyre!(error))?;
-
-		self.tracker.create_comment(&self.issue.id, &completion_comment)?;
 		self.pending_review_completion.borrow_mut().take();
 
 		Ok(())
@@ -3035,6 +3050,35 @@ Use the tracker tools.
 	}
 
 	#[test]
+	fn review_repair_tool_surface_excludes_issue_transition() {
+		let tracker = FakeTracker::new();
+		let issue = sample_review_issue();
+		let workflow = sample_workflow();
+		let pr_url = "https://github.com/helixbox/maestro/pull/242";
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let inspector = FakePullRequestInspector::new(Vec::new());
+		let local_repo_inspector = FakeLocalRepoInspector::new(Vec::new());
+		let bridge = TrackerToolBridge::with_review_repair_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_review_repair_context_in(temp_dir.path(), pr_url),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let tool_names = DynamicToolHandler::tool_specs(&bridge)
+			.into_iter()
+			.map(|tool| tool.name)
+			.collect::<Vec<_>>();
+
+		assert!(!tool_names.contains(&String::from(ISSUE_TRANSITION_TOOL_NAME)));
+		assert!(tool_names.contains(&String::from(ISSUE_COMMENT_TOOL_NAME)));
+		assert!(tool_names.contains(&String::from(ISSUE_LABEL_ADD_TOOL_NAME)));
+		assert!(tool_names.contains(&String::from(ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME)));
+		assert!(tool_names.contains(&String::from(ISSUE_TERMINAL_FINALIZE_TOOL_NAME)));
+	}
+
+	#[test]
 	fn review_repair_apply_persists_updated_handoff_marker_without_tracker_transition() {
 		let temp_dir = TempDir::new().expect("tempdir should create");
 		let tracker = FakeTracker::new();
@@ -3132,6 +3176,99 @@ Use the tracker tools.
 
 		assert_eq!(marker.pr_url(), pr_url);
 		assert_eq!(marker.pr_head_oid(), "18a20f7dfb9526e7421a5f095b1c6adec84e52d6");
+	}
+
+	#[test]
+	fn review_repair_apply_keeps_original_handoff_marker_when_comment_write_fails() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let tracker = FakeTracker::with_comment_error("tracker comment write failed");
+		let issue = sample_review_issue();
+		let workflow = sample_workflow();
+		let pr_url = "https://github.com/helixbox/maestro/pull/242";
+		let inspector = FakePullRequestInspector::new(vec![
+			Ok(PullRequestDetails {
+				head_ref_name: String::from("x/maestro-pub-618"),
+				head_ref_oid: String::from("18a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				head_repository_name: String::from("maestro"),
+				head_repository_owner: String::from("helixbox"),
+				is_draft: false,
+				state: String::from("OPEN"),
+				url: String::from(pr_url),
+			}),
+			Ok(PullRequestDetails {
+				head_ref_name: String::from("x/maestro-pub-618"),
+				head_ref_oid: String::from("18a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				head_repository_name: String::from("maestro"),
+				head_repository_owner: String::from("helixbox"),
+				is_draft: false,
+				state: String::from("OPEN"),
+				url: String::from(pr_url),
+			}),
+		]);
+		let local_repo_inspector = FakeLocalRepoInspector::new(vec![
+			Ok(LocalRepoDetails {
+				head_oid: String::from("18a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				repository_name: String::from("maestro"),
+				repository_owner: String::from("helixbox"),
+			}),
+			Ok(LocalRepoDetails {
+				head_oid: String::from("18a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+				repository_name: String::from("maestro"),
+				repository_owner: String::from("helixbox"),
+			}),
+		]);
+		let review_context = sample_review_repair_context_in(temp_dir.path(), pr_url);
+
+		state::write_review_handoff_marker(
+			temp_dir.path(),
+			&state::ReviewHandoffMarker::new(
+				String::from("pub-618-attempt-2-100"),
+				2,
+				review_context.branch_name.clone(),
+				String::from(pr_url),
+				review_context.branch_name.clone(),
+				String::from("08a20f7dfb9526e7421a5f095b1c6adec84e52d6"),
+			),
+		)
+		.expect("original review handoff marker should write");
+
+		let bridge = TrackerToolBridge::with_review_repair_for_test(
+			&tracker,
+			&issue,
+			&workflow,
+			review_context,
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": pr_url,
+				"summary": "Addressed the requested review changes."
+			}),
+		);
+		let finalize_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			serde_json::json!({ "path": "review_repair" }),
+		);
+
+		assert!(response.success);
+		assert!(finalize_response.success);
+
+		let error = bridge
+			.apply_review_repair()
+			.expect_err("comment write failures must preserve the original handoff marker");
+
+		assert!(error.to_string().contains("tracker comment write failed"));
+
+		let marker = state::read_review_handoff_marker(temp_dir.path())
+			.expect("review handoff marker should read")
+			.expect("original review handoff marker should remain");
+
+		assert_eq!(marker.pr_url(), pr_url);
+		assert_eq!(marker.pr_head_oid(), "08a20f7dfb9526e7421a5f095b1c6adec84e52d6");
 	}
 
 	#[test]

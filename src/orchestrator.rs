@@ -3436,6 +3436,7 @@ where
 				&issue_run.issue,
 				issue_run.dispatch_mode,
 				review_context.recorded_pr_url.as_deref(),
+				workflow.frontmatter().tracker().success_state(),
 			)),
 			activity_marker_path: Some(issue_run.workspace.path.clone()),
 			dynamic_tool_handler: Some(&tracker_tool_bridge),
@@ -4168,13 +4169,14 @@ fn build_continuation_user_input(
 	issue: &TrackerIssue,
 	dispatch_mode: IssueDispatchMode,
 	recorded_pr_url: Option<&str>,
+	success_state: &str,
 ) -> String {
 	match dispatch_mode {
 		IssueDispatchMode::ReviewRepair => format!(
 			"Continue retained review repair for Linear issue {identifier} in the current thread and workspace.\n\nContinuation checklist:\n- Resume from the current repository state and outstanding review feedback on `{pr_url}`.\n- Keep changes scoped to the same retained review lane and do not move the issue out of `{success}`.\n- If the repaired head is ready, push it, request fresh review on `{pr_url}`, call `{review_repair_tool}`, and then call `{terminal_finalize_tool}` with path `review_repair`.\n- If the issue requires manual attention, record the manual-attention tracker path before ending the turn.\n- If more work still remains after this turn, you may end the turn without terminal finalization and Maestro will decide whether to continue.",
 			identifier = issue.identifier,
 			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
-			success = "In Review",
+			success = success_state,
 			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
 			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 		),
@@ -7830,6 +7832,7 @@ read_first = [{read_first}]
 			&issue,
 			orchestrator::IssueDispatchMode::Normal,
 			None,
+			workflow.frontmatter().tracker().success_state(),
 		);
 
 		assert!(user_input.contains("you may end the turn without"));
@@ -7871,6 +7874,7 @@ read_first = [{read_first}]
 			&issue,
 			orchestrator::IssueDispatchMode::ReviewRepair,
 			Some(pr_url),
+			workflow.frontmatter().tracker().success_state(),
 		);
 
 		assert!(developer_instructions.contains(ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME));
@@ -7879,7 +7883,57 @@ read_first = [{read_first}]
 		assert!(user_input.contains(pr_url));
 		assert!(user_input.contains("resolve only the GitHub review threads you actually fixed"));
 		assert!(continuation_input.contains("request fresh review"));
+		assert!(continuation_input.contains("In Review"));
 		assert!(continuation_input.contains("review_repair"));
+	}
+
+	#[test]
+	fn review_repair_continuation_prompt_uses_configured_success_state() {
+		let workflow = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+startable_states = ["Todo"]
+in_progress_state = "In Progress"
+success_state = "Ready For QA"
+failure_state = "Todo"
+opt_out_label = "maestro:manual-only"
+needs_attention_label = "maestro:needs-attention"
+
+[agent]
+transport = "stdio://"
+sandbox = "workspace-write"
+approval_policy = "never"
+
+[execution]
+max_attempts = 3
+max_turns = 4
+max_retry_backoff_ms = 300000
+max_concurrent_agents = 1
+max_concurrent_agents_by_state = { "In Progress" = 1 }
+
+[context]
+read_first = ["AGENTS.md"]
++++
+
+Custom workflow.
+"#,
+		)
+		.expect("workflow should parse");
+		let issue = sample_issue("Ready For QA", &[]);
+		let continuation_input = orchestrator::build_continuation_user_input(
+			&issue,
+			orchestrator::IssueDispatchMode::ReviewRepair,
+			Some("https://github.com/helixbox/maestro/pull/77"),
+			workflow.frontmatter().tracker().success_state(),
+		);
+
+		assert!(continuation_input.contains("Ready For QA"));
+		assert!(!continuation_input.contains("do not move the issue out of `In Review`"));
 	}
 
 	#[test]
