@@ -90,23 +90,12 @@ query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: Strin
   }
 }
 "#;
-const PULL_REQUEST_BRANCH_LOOKUP_LIMIT: usize = 1_000;
-
 trait PullRequestReviewStateInspector {
 	fn inspect_review_state(
 		&self,
 		cwd: &Path,
 		pr_url: &str,
 	) -> crate::prelude::Result<PullRequestReviewState>;
-
-	fn inspect_review_state_for_branch_head(
-		&self,
-		_cwd: &Path,
-		_branch_name: &str,
-		_head_oid: &str,
-	) -> crate::prelude::Result<BranchHeadReviewStateResolution> {
-		Ok(BranchHeadReviewStateResolution::Missing)
-	}
 }
 
 /// One bounded `run --once` invocation and its optional daemon-planned overrides.
@@ -612,68 +601,6 @@ impl PullRequestReviewStateInspector for GhPullRequestReviewStateInspector {
 			eyre::eyre!("GitHub GraphQL response for `{pr_url}` did not include a pull request.")
 		})
 	}
-
-	fn inspect_review_state_for_branch_head(
-		&self,
-		cwd: &Path,
-		branch_name: &str,
-		head_oid: &str,
-	) -> crate::prelude::Result<BranchHeadReviewStateResolution> {
-		let github_token = resolve_configured_env_var(
-			"github.token_env_var",
-			self.github_token_env_var.as_deref(),
-		)?;
-		let mut command = Command::new("gh");
-
-		command.args(pull_request_branch_lookup_args(branch_name));
-		command.current_dir(cwd);
-
-		github::configure_gh_command(&mut command, github_token.as_str());
-
-		let output = command.output()?;
-
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr);
-
-			eyre::bail!(
-				"Failed to inspect retained pull requests for branch `{branch_name}`: {}",
-				stderr.trim()
-			);
-		}
-
-		let mut entries =
-			serde_json::from_slice::<Vec<PullRequestBranchLookupEntry>>(&output.stdout)?
-				.into_iter()
-				.filter(|entry| {
-					entry.head_ref_oid == head_oid
-						&& matches!(entry.state.as_str(), "OPEN" | "MERGED" | "CLOSED")
-				})
-				.collect::<Vec<_>>();
-
-		entries.sort_by(|left, right| {
-			pull_request_branch_lookup_state_rank(&left.state)
-				.cmp(&pull_request_branch_lookup_state_rank(&right.state))
-		});
-
-		let mut owned_matches = Vec::new();
-
-		for entry in entries {
-			let review_state = self.inspect_review_state(cwd, &entry.url)?;
-			let locator = github::parse_pull_request_url(&entry.url)?;
-
-			if review_state.head_repository_owner.as_deref() == Some(locator.owner.as_str())
-				&& review_state.head_repository_name.as_deref() == Some(locator.repo.as_str())
-				&& entry.head_repository_owner.as_ref().map(|owner| owner.login.as_str())
-					== Some(locator.owner.as_str())
-				&& entry.head_repository.as_ref().map(|repository| repository.name.as_str())
-					== Some(locator.repo.as_str())
-			{
-				owned_matches.push(review_state);
-			}
-		}
-
-		Ok(select_owned_branch_head_review_state(owned_matches))
-	}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -828,18 +755,6 @@ struct PullRequestPageInfo {
 }
 
 #[derive(Deserialize)]
-struct PullRequestBranchLookupEntry {
-	url: String,
-	state: String,
-	#[serde(rename = "headRefOid")]
-	head_ref_oid: String,
-	#[serde(rename = "headRepository")]
-	head_repository: Option<PullRequestRepository>,
-	#[serde(rename = "headRepositoryOwner")]
-	head_repository_owner: Option<PullRequestRepositoryOwner>,
-}
-
-#[derive(Deserialize)]
 struct PullRequestCommitConnection {
 	nodes: Vec<PullRequestCommitNode>,
 }
@@ -933,13 +848,6 @@ pub(crate) enum ActiveRunDisposition {
 enum PostReviewLaneStateLoad {
 	Classification(PostReviewLaneClassification),
 	ReviewState(PullRequestReviewState),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum BranchHeadReviewStateResolution {
-	Missing,
-	Matched(Box<PullRequestReviewState>),
-	Ambiguous,
 }
 
 pub(crate) fn run_once(request: RunOnceRequest<'_>) -> crate::prelude::Result<()> {
@@ -1086,56 +994,6 @@ pub(crate) fn print_status(
 	Ok(())
 }
 
-fn pull_request_branch_lookup_args(branch_name: &str) -> Vec<String> {
-	vec![
-		String::from("pr"),
-		String::from("list"),
-		String::from("--head"),
-		branch_name.to_owned(),
-		String::from("--state"),
-		String::from("all"),
-		String::from("--limit"),
-		PULL_REQUEST_BRANCH_LOOKUP_LIMIT.to_string(),
-		String::from("--json"),
-		String::from("url,state,headRefOid,headRepositoryOwner,headRepository"),
-	]
-}
-
-fn select_owned_branch_head_review_state(
-	mut owned_matches: Vec<PullRequestReviewState>,
-) -> BranchHeadReviewStateResolution {
-	if owned_matches.is_empty() {
-		return BranchHeadReviewStateResolution::Missing;
-	}
-
-	owned_matches.sort_by(|left, right| {
-		pull_request_branch_lookup_state_rank(&left.state)
-			.cmp(&pull_request_branch_lookup_state_rank(&right.state))
-	});
-
-	let open_matches =
-		owned_matches.iter().filter(|review_state| review_state.state == "OPEN").count();
-
-	if open_matches == 1 {
-		let open_index = owned_matches
-			.iter()
-			.position(|review_state| review_state.state == "OPEN")
-			.expect("exactly one open match must have an index");
-
-		return BranchHeadReviewStateResolution::Matched(Box::new(
-			owned_matches.remove(open_index),
-		));
-	}
-	if open_matches > 1 {
-		return BranchHeadReviewStateResolution::Ambiguous;
-	}
-
-	match owned_matches.len() {
-		1 => BranchHeadReviewStateResolution::Matched(Box::new(owned_matches.remove(0))),
-		_ => BranchHeadReviewStateResolution::Ambiguous,
-	}
-}
-
 fn query_pull_request_review_state_page(
 	cwd: &Path,
 	owner: &str,
@@ -1236,15 +1094,6 @@ fn merge_pull_request_review_state_page(
 
 fn count_unresolved_review_threads(review_threads: &PullRequestReviewThreadConnection) -> usize {
 	review_threads.nodes.iter().filter(|thread| !thread.is_resolved && !thread.is_outdated).count()
-}
-
-fn pull_request_branch_lookup_state_rank(state: &str) -> u8 {
-	match state {
-		"OPEN" => 0,
-		"MERGED" => 1,
-		"CLOSED" => 2,
-		_ => 3,
-	}
 }
 
 fn pull_request_status_check_rollup_state(
@@ -3274,7 +3123,6 @@ where
 		.ok_or_else(|| eyre::eyre!("Linear project slug `{project_slug}` was not found."))
 }
 
-#[cfg(test)]
 fn validate_review_handoff_runtime(
 	project: &ServiceConfig,
 	dry_run: bool,
@@ -3497,6 +3345,7 @@ where
 
 	match tracker_tool_bridge.completion_disposition()? {
 		RunCompletionDisposition::ReviewHandoff => {
+			validate_review_handoff_runtime(project, false)?;
 			run_validation_commands(
 				workflow.frontmatter().execution().validation_commands(),
 				&issue_run.workspace.path,
@@ -4590,44 +4439,9 @@ where
 		));
 	}
 
-	let Some(local_branch_name) = snapshot.local_branch_name.as_deref() else {
-		return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
-			"missing_review_handoff_record",
-		)));
-	};
-	let Some(local_head_oid) = snapshot.local_head_oid.as_deref() else {
-		return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
-			"missing_review_handoff_record",
-		)));
-	};
-	let review_state = match review_state_inspector.inspect_review_state_for_branch_head(
-		snapshot.workspace.workspace_path(),
-		local_branch_name,
-		local_head_oid,
-	) {
-		Ok(BranchHeadReviewStateResolution::Matched(review_state)) => *review_state,
-		Ok(BranchHeadReviewStateResolution::Missing) => {
-			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
-				"missing_review_handoff_record",
-			)));
-		},
-		Ok(BranchHeadReviewStateResolution::Ambiguous) => {
-			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
-				"pull_request_branch_head_ambiguous",
-			)));
-		},
-		Err(_error) => {
-			return Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
-				"pull_request_state_read_failed",
-			)));
-		},
-	};
-
-	Ok(validate_post_review_lane_review_state(
-		review_state,
-		snapshot.workspace.branch_name(),
-		local_head_oid,
-	))
+	Ok(PostReviewLaneStateLoad::Classification(blocked_post_review_lane(
+		"missing_review_handoff_record",
+	)))
 }
 
 fn validate_post_review_lane_review_state(
@@ -5382,8 +5196,8 @@ mod tests {
 		config::ServiceConfig,
 		github,
 		orchestrator::{
-			self, BranchHeadReviewStateResolution, GhPullRequestReviewStateInspector,
-			ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			self, GhPullRequestReviewStateInspector, ISSUE_COMMENT_TOOL_NAME,
+			ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 			ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 			ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision, PostReviewLaneSnapshot,
 			PullRequestCommitConnection, PullRequestCommitNode, PullRequestCommitPayload,
@@ -5418,24 +5232,10 @@ mod tests {
 
 	struct FakePullRequestReviewStateInspector {
 		responses: RefCell<Vec<crate::prelude::Result<PullRequestReviewState>>>,
-		branch_head_responses:
-			RefCell<Vec<crate::prelude::Result<BranchHeadReviewStateResolution>>>,
 	}
 	impl FakePullRequestReviewStateInspector {
 		fn new(responses: Vec<crate::prelude::Result<PullRequestReviewState>>) -> Self {
-			Self {
-				responses: RefCell::new(responses),
-				branch_head_responses: RefCell::new(Vec::new()),
-			}
-		}
-
-		fn with_branch_head_responses(
-			mut self,
-			responses: Vec<crate::prelude::Result<BranchHeadReviewStateResolution>>,
-		) -> Self {
-			self.branch_head_responses = RefCell::new(responses);
-
-			self
+			Self { responses: RefCell::new(responses) }
 		}
 	}
 	impl PullRequestReviewStateInspector for FakePullRequestReviewStateInspector {
@@ -5445,19 +5245,6 @@ mod tests {
 			_pr_url: &str,
 		) -> crate::prelude::Result<PullRequestReviewState> {
 			self.responses.borrow_mut().remove(0)
-		}
-
-		fn inspect_review_state_for_branch_head(
-			&self,
-			_cwd: &Path,
-			_branch_name: &str,
-			_head_oid: &str,
-		) -> crate::prelude::Result<BranchHeadReviewStateResolution> {
-			if self.branch_head_responses.borrow().is_empty() {
-				return Ok(BranchHeadReviewStateResolution::Missing);
-			}
-
-			self.branch_head_responses.borrow_mut().remove(0)
 		}
 	}
 	struct TestEnvVarGuard {
@@ -9213,68 +9000,6 @@ Custom workflow.
 	}
 
 	#[test]
-	fn build_post_review_lane_statuses_recovers_missing_review_handoff_record_from_branch_head() {
-		let (_temp_dir, config, workflow) = temp_project_layout();
-		let issue = sample_issue("In Review", &[]);
-		let tracker =
-			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
-		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let workspace_manager =
-			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
-		let workspace = workspace_manager
-			.ensure_workspace(&issue.identifier, false)
-			.expect("workspace should exist");
-		let head_oid = String::from_utf8(
-			Command::new("git")
-				.arg("-C")
-				.arg(&workspace.path)
-				.args(["rev-parse", "HEAD"])
-				.output()
-				.expect("git rev-parse should run")
-				.stdout,
-		)
-		.expect("git output should be utf-8")
-		.trim()
-		.to_owned();
-		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
-		let recovered_review_state = sample_pull_request_review_state(
-			pr_url,
-			&workspace.branch_name,
-			&head_oid,
-			Some("APPROVED"),
-			"MERGEABLE",
-			"CLEAN",
-			Some("SUCCESS"),
-			0,
-		);
-
-		state_store
-			.upsert_workspace(
-				config.id(),
-				&issue.id,
-				&workspace.branch_name,
-				&workspace.path.display().to_string(),
-			)
-			.expect("workspace should record");
-
-		let lanes = orchestrator::build_post_review_lane_statuses(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&FakePullRequestReviewStateInspector::new(Vec::new()).with_branch_head_responses(vec![
-				Ok(BranchHeadReviewStateResolution::Matched(Box::new(recovered_review_state))),
-			]),
-		)
-		.expect("post-review lane status build should succeed");
-
-		assert_eq!(lanes.len(), 1);
-		assert_eq!(lanes[0].classification, "ready_to_land");
-		assert_eq!(lanes[0].reason, "approvals_and_checks_satisfied");
-		assert_eq!(lanes[0].pr_url.as_deref(), Some(pr_url));
-	}
-
-	#[test]
 	fn build_post_review_lane_statuses_allows_descendant_review_handoff_head_after_repair_push() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
@@ -9434,172 +9159,6 @@ Custom workflow.
 		assert_eq!(lanes.len(), 1);
 		assert_eq!(lanes[0].classification, "blocked");
 		assert_eq!(lanes[0].reason, "review_handoff_record_read_failed");
-	}
-
-	#[test]
-	fn build_post_review_lane_statuses_blocks_missing_review_handoff_record_when_branch_head_rebind_hits_fork_pr()
-	 {
-		let (_temp_dir, config, workflow) = temp_project_layout();
-		let issue = sample_issue("In Review", &[]);
-		let tracker =
-			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
-		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let workspace_manager =
-			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
-		let workspace = workspace_manager
-			.ensure_workspace(&issue.identifier, false)
-			.expect("workspace should exist");
-		let head_oid = String::from_utf8(
-			Command::new("git")
-				.arg("-C")
-				.arg(&workspace.path)
-				.args(["rev-parse", "HEAD"])
-				.output()
-				.expect("git rev-parse should run")
-				.stdout,
-		)
-		.expect("git output should be utf-8")
-		.trim()
-		.to_owned();
-		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
-		let mut fork_review_state = sample_pull_request_review_state(
-			pr_url,
-			&workspace.branch_name,
-			&head_oid,
-			Some("APPROVED"),
-			"MERGEABLE",
-			"CLEAN",
-			Some("SUCCESS"),
-			0,
-		);
-
-		fork_review_state.head_repository_owner = Some(String::from("someone-else"));
-
-		state_store
-			.upsert_workspace(
-				config.id(),
-				&issue.id,
-				&workspace.branch_name,
-				&workspace.path.display().to_string(),
-			)
-			.expect("workspace should record");
-
-		let lanes = orchestrator::build_post_review_lane_statuses(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&FakePullRequestReviewStateInspector::new(Vec::new()).with_branch_head_responses(vec![
-				Ok(BranchHeadReviewStateResolution::Matched(Box::new(fork_review_state))),
-			]),
-		)
-		.expect("post-review lane status build should succeed");
-
-		assert_eq!(lanes.len(), 1);
-		assert_eq!(lanes[0].classification, "blocked");
-		assert_eq!(lanes[0].reason, "pull_request_head_repository_owner_mismatch");
-	}
-
-	#[test]
-	fn build_post_review_lane_statuses_blocks_missing_review_handoff_record_when_branch_head_rebind_hits_same_owner_fork_repo()
-	 {
-		let (_temp_dir, config, workflow) = temp_project_layout();
-		let issue = sample_issue("In Review", &[]);
-		let tracker =
-			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
-		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let workspace_manager =
-			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
-		let workspace = workspace_manager
-			.ensure_workspace(&issue.identifier, false)
-			.expect("workspace should exist");
-		let head_oid = String::from_utf8(
-			Command::new("git")
-				.arg("-C")
-				.arg(&workspace.path)
-				.args(["rev-parse", "HEAD"])
-				.output()
-				.expect("git rev-parse should run")
-				.stdout,
-		)
-		.expect("git output should be utf-8")
-		.trim()
-		.to_owned();
-		let pr_url = "https://github.com/hack-ink/maestro/pull/173";
-		let mut fork_review_state = sample_pull_request_review_state(
-			pr_url,
-			&workspace.branch_name,
-			&head_oid,
-			Some("APPROVED"),
-			"MERGEABLE",
-			"CLEAN",
-			Some("SUCCESS"),
-			0,
-		);
-
-		fork_review_state.head_repository_name = Some(String::from("maestro-fork"));
-
-		state_store
-			.upsert_workspace(
-				config.id(),
-				&issue.id,
-				&workspace.branch_name,
-				&workspace.path.display().to_string(),
-			)
-			.expect("workspace should record");
-
-		let lanes = orchestrator::build_post_review_lane_statuses(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&FakePullRequestReviewStateInspector::new(Vec::new()).with_branch_head_responses(vec![
-				Ok(BranchHeadReviewStateResolution::Matched(Box::new(fork_review_state))),
-			]),
-		)
-		.expect("post-review lane status build should succeed");
-
-		assert_eq!(lanes.len(), 1);
-		assert_eq!(lanes[0].classification, "blocked");
-		assert_eq!(lanes[0].reason, "pull_request_head_repository_name_mismatch");
-	}
-
-	#[test]
-	fn build_post_review_lane_statuses_blocks_ambiguous_missing_review_handoff_record_branch_head_rebind()
-	 {
-		let (_temp_dir, config, workflow) = temp_project_layout();
-		let issue = sample_issue("In Review", &[]);
-		let tracker =
-			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
-		let state_store = StateStore::open_in_memory().expect("state store should open");
-		let workspace_manager =
-			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
-		let workspace = workspace_manager
-			.ensure_workspace(&issue.identifier, false)
-			.expect("workspace should exist");
-
-		state_store
-			.upsert_workspace(
-				config.id(),
-				&issue.id,
-				&workspace.branch_name,
-				&workspace.path.display().to_string(),
-			)
-			.expect("workspace should record");
-
-		let lanes = orchestrator::build_post_review_lane_statuses(
-			&tracker,
-			&config,
-			&workflow,
-			&state_store,
-			&FakePullRequestReviewStateInspector::new(Vec::new())
-				.with_branch_head_responses(vec![Ok(BranchHeadReviewStateResolution::Ambiguous)]),
-		)
-		.expect("post-review lane status build should succeed");
-
-		assert_eq!(lanes.len(), 1);
-		assert_eq!(lanes[0].classification, "blocked");
-		assert_eq!(lanes[0].reason, "pull_request_branch_head_ambiguous");
 	}
 
 	#[test]
@@ -11017,72 +10576,6 @@ Custom workflow.
 		assert!(
 			orchestrator::PULL_REQUEST_REVIEW_STATE_QUERY
 				.contains("headRepository {\n        name\n      }")
-		);
-	}
-
-	#[test]
-	fn branch_head_recovery_prefers_unique_open_pull_request_over_historical_matches() {
-		let open = sample_pull_request_review_state(
-			"https://github.com/hack-ink/maestro/pull/173",
-			"x/pubfi-pub-101",
-			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
-			Some("APPROVED"),
-			"MERGEABLE",
-			"CLEAN",
-			Some("SUCCESS"),
-			0,
-		);
-		let mut merged = open.clone();
-
-		merged.url = String::from("https://github.com/hack-ink/maestro/pull/172");
-		merged.state = String::from("MERGED");
-
-		assert_eq!(
-			orchestrator::select_owned_branch_head_review_state(vec![merged, open.clone()]),
-			orchestrator::BranchHeadReviewStateResolution::Matched(Box::new(open)),
-		);
-	}
-
-	#[test]
-	fn branch_head_recovery_blocks_ambiguous_multiple_open_pull_requests() {
-		let open_one = sample_pull_request_review_state(
-			"https://github.com/hack-ink/maestro/pull/173",
-			"x/pubfi-pub-101",
-			"08a20f7dfb9526e7421a5f095b1c6adec84e52d6",
-			Some("APPROVED"),
-			"MERGEABLE",
-			"CLEAN",
-			Some("SUCCESS"),
-			0,
-		);
-		let mut open_two = open_one.clone();
-
-		open_two.url = String::from("https://github.com/hack-ink/maestro/pull/174");
-
-		assert_eq!(
-			orchestrator::select_owned_branch_head_review_state(vec![open_one, open_two]),
-			orchestrator::BranchHeadReviewStateResolution::Ambiguous,
-		);
-	}
-
-	#[test]
-	fn pull_request_branch_lookup_args_include_explicit_limit() {
-		let args = orchestrator::pull_request_branch_lookup_args("x/pubfi-pub-101");
-
-		assert_eq!(
-			args,
-			vec![
-				String::from("pr"),
-				String::from("list"),
-				String::from("--head"),
-				String::from("x/pubfi-pub-101"),
-				String::from("--state"),
-				String::from("all"),
-				String::from("--limit"),
-				orchestrator::PULL_REQUEST_BRANCH_LOOKUP_LIMIT.to_string(),
-				String::from("--json"),
-				String::from("url,state,headRefOid,headRepositoryOwner,headRepository"),
-			]
 		);
 	}
 

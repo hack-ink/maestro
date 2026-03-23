@@ -82,7 +82,10 @@ In either invalid case, `maestro` must fail the attempt rather than infer which 
 - The run is not complete until `issue_terminal_finalize` succeeds against the matching terminal path. A saved plan reaching `phase = "done"` or an agent summary message is not a substitute.
 - Issues that carry the configured `needs_attention_label` must remain ineligible for future automatic selection until a human clears the label.
 - `issue_review_handoff` and the human-attention exit are mutually exclusive terminal signals for the same turn.
-- Before a live run starts, `maestro` must preflight the local GitHub CLI dependency used for review handoff inspection instead of discovering a missing `gh` binary only after an otherwise successful turn.
+- Generic live dispatch for a startable issue must not require GitHub authority before the lane actually attempts a PR-backed review handoff.
+- `maestro` must preflight the local GitHub CLI dependency and configured GitHub token authority at the PR-backed review boundary itself:
+  - when a normal lane is about to validate and write back `issue_review_handoff`
+  - when a retained post-review lane is about to re-enter `review_repair`
 - Comment bodies should remain repository-controlled or agent-authored, but all tool calls must be journaled by `maestro` for recovery and audit.
 - Structured comment fields such as `workspace_path` must use repository-relative paths; absolute host paths should be rejected before writing to the tracker.
 - Dynamic tool names must satisfy the `codex app-server` identifier restriction `^[a-zA-Z0-9_-]+$`; dotted names are invalid.
