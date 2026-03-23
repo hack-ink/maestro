@@ -4107,6 +4107,10 @@ fn build_developer_instructions(
 		sections.push(format!("File: {relative_path}\n{contents}"));
 	}
 
+	if !workflow.body().trim().is_empty() {
+		sections.push(format!("Workflow policy\n{}", workflow.body()));
+	}
+
 	sections.push(String::from(
 		"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
 	));
@@ -5909,7 +5913,7 @@ mod tests {
 	fn temp_project_layout() -> (TempDir, ServiceConfig, WorkflowDocument) {
 		temp_project_layout_with_tracker_project_slug_and_read_first(
 			"pubfi",
-			&[("AGENTS.md", "Read me first.\n")],
+			&[],
 			"Follow the repository policy.\n",
 		)
 	}
@@ -5947,7 +5951,7 @@ mod tests {
 	) -> (TempDir, ServiceConfig, WorkflowDocument) {
 		temp_project_layout_with_tracker_project_slug_and_read_first(
 			project_slug,
-			&[("AGENTS.md", "Read me first.\n")],
+			&[],
 			"Follow the repository policy.\n",
 		)
 	}
@@ -5969,7 +5973,7 @@ mod tests {
 		temp_project_layout_with_tracker_project_slug_max_turns_and_read_first(
 			"pubfi",
 			max_turns,
-			&[("AGENTS.md", "Read me first.\n")],
+			&[],
 			"Follow the repository policy.\n",
 		)
 	}
@@ -6094,10 +6098,15 @@ mod tests {
 		workflow_body: &str,
 		max_turns: u32,
 	) -> String {
-		let read_first =
-			read_first.iter().map(|path| format!("\"{path}\"")).collect::<Vec<_>>().join(", ");
+		let context = if read_first.is_empty() {
+			String::new()
+		} else {
+			let read_first =
+				read_first.iter().map(|path| format!("\"{path}\"")).collect::<Vec<_>>().join(", ");
 
-		format!(
+			format!("\n[context]\nread_first = [{read_first}]")
+		};
+		let mut markdown = format!(
 			r#"
 +++
 version = 1
@@ -6118,13 +6127,21 @@ max_turns = {max_turns}
 max_retry_backoff_ms = 300000
 max_concurrent_agents = 1
 max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
-
-[context]
-read_first = [{read_first}]
 +++
 
 {workflow_body}"#
-		)
+		);
+
+		if !context.is_empty() {
+			markdown = markdown.replace(
+				"max_concurrent_agents_by_state = { \"In Progress\" = 1 }\n+++",
+				&format!(
+					"max_concurrent_agents_by_state = {{ \"In Progress\" = 1 }}{context}\n+++"
+				),
+			);
+		}
+
+		markdown
 	}
 
 	#[test]
@@ -6154,7 +6171,7 @@ read_first = [{read_first}]
 			.expect("initial workflow load should succeed");
 
 		let updated_workflow =
-			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Updated workflow policy.\n", 1)
+			sample_workflow_markdown("pubfi", &[], "Updated workflow policy.\n", 1)
 				.replace("max_attempts = 3", "max_attempts = 5");
 
 		fs::write(config.repo_root().join("WORKFLOW.md"), updated_workflow)
@@ -6214,12 +6231,12 @@ read_first = [{read_first}]
 	fn active_child_reconciliation_keeps_spawn_time_workflow_until_exit() {
 		let (_temp_dir, config, _workflow) = temp_project_layout();
 		let active_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Spawn-time workflow policy.\n", 1)
+			&sample_workflow_markdown("pubfi", &[], "Spawn-time workflow policy.\n", 1)
 				.replace("max_attempts = 3", "max_attempts = 5"),
 		)
 		.expect("workflow should parse");
 		let current_workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Current workflow policy.\n", 1)
+			&sample_workflow_markdown("pubfi", &[], "Current workflow policy.\n", 1)
 				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]"),
 		)
 		.expect("workflow should parse");
@@ -6289,6 +6306,10 @@ read_first = [{read_first}]
 			.iter()
 			.map(|(relative_path, contents)| format!("File: {relative_path}\n{contents}"))
 			.collect::<Vec<_>>();
+
+		if !workflow.body().trim().is_empty() {
+			sections.push(format!("Workflow policy\n{}", workflow.body()));
+		}
 
 		sections.push(String::from(
 			"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
@@ -7246,7 +7267,7 @@ read_first = [{read_first}]
 	#[test]
 	fn blocked_retry_still_allows_other_daemon_work_when_capacity_remains() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n", 1)
+			&sample_workflow_markdown("pubfi", &[], "Multi-slot daemon policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
 		)
 		.expect("workflow should parse");
@@ -7307,7 +7328,7 @@ read_first = [{read_first}]
 	#[test]
 	fn blocked_future_retry_excludes_all_queued_retries_before_normal_fallback() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot daemon policy.\n", 1)
+			&sample_workflow_markdown("pubfi", &[], "Multi-slot daemon policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
 		)
 		.expect("workflow should parse");
@@ -7589,11 +7610,10 @@ read_first = [{read_first}]
 	#[test]
 	fn due_continuation_retry_releases_when_issue_moves_to_different_startable_state() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Continuation retry policy.\n", 1)
-				.replace(
-					"startable_states = [\"Todo\"]",
-					"startable_states = [\"Todo\", \"Backlog\"]",
-				),
+			&sample_workflow_markdown("pubfi", &[], "Continuation retry policy.\n", 1).replace(
+				"startable_states = [\"Todo\"]",
+				"startable_states = [\"Todo\", \"Backlog\"]",
+			),
 		)
 		.expect("workflow should parse");
 		let (_temp_dir, config, _default_workflow) = temp_project_layout();
@@ -7634,7 +7654,7 @@ read_first = [{read_first}]
 	#[test]
 	fn due_continuation_retry_stays_queued_when_stale_startable_issue_hits_in_progress_state_cap() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Continuation retry policy.\n", 1)
+			&sample_workflow_markdown("pubfi", &[], "Continuation retry policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2"),
 		)
 		.expect("workflow should parse");
@@ -7959,7 +7979,7 @@ read_first = [{read_first}]
 			orchestrator::build_developer_instructions(&config, &workflow, &issue_run, None)
 				.expect("developer instructions should build");
 
-		assert!(instructions.contains("File: AGENTS.md\nRead me first.\n"));
+		assert!(instructions.contains("Workflow policy\nFollow the repository policy.\n"));
 		assert!(instructions.contains("Keep pre-edit discovery bounded"));
 		assert!(instructions.contains("Do not browse upstream references"));
 		assert!(instructions.contains("Tracker tool contract"));
@@ -7973,7 +7993,6 @@ read_first = [{read_first}]
 		assert!(instructions.contains("mark a saved plan `phase = \"done\"`"));
 		assert!(!instructions.contains("you may end the turn without"));
 		assert!(!instructions.contains("WORKFLOW.md\n"));
-		assert!(!instructions.contains("Follow the repository policy."));
 	}
 
 	#[test]
@@ -8084,9 +8103,6 @@ max_turns = 4
 max_retry_backoff_ms = 300000
 max_concurrent_agents = 1
 max_concurrent_agents_by_state = { "In Progress" = 1 }
-
-[context]
-read_first = ["AGENTS.md"]
 +++
 
 Custom workflow.
@@ -8138,12 +8154,12 @@ Custom workflow.
 	#[test]
 	fn developer_instructions_match_trimmed_prompt_shape() {
 		let read_first_files = [
-			("AGENTS.md", "Read me first.\n"),
 			("docs/index.md", "Use the documentation index.\n"),
+			("docs/guide/index.md", "Use the guide index.\n"),
 		];
 		let (_temp_dir, config, workflow) = temp_project_layout_with_read_first(
 			&read_first_files,
-			"This workflow body should never be appended.\n",
+			"This workflow body should be appended.\n",
 		);
 		let issue = sample_issue("Todo", &[]);
 		let issue_run = orchestrator::IssueRunPlan {
@@ -8625,7 +8641,7 @@ Custom workflow.
 	#[test]
 	fn candidate_selection_allows_multi_slot_dispatch_when_configured() {
 		let workflow_source =
-			sample_workflow_markdown("pubfi", &["AGENTS.md"], "Multi-slot workflow policy.\n", 1);
+			sample_workflow_markdown("pubfi", &[], "Multi-slot workflow policy.\n", 1);
 
 		assert!(workflow_source.contains("max_concurrent_agents = 1"));
 
@@ -8667,18 +8683,13 @@ Custom workflow.
 	fn candidate_selection_honors_per_state_concurrency_overrides_for_projected_in_progress_state()
 	{
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown(
-				"pubfi",
-				&["AGENTS.md"],
-				"State-scoped workflow policy.\n",
-				1,
-			)
-			.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]")
-			.replace("max_concurrent_agents = 1", "max_concurrent_agents = 3")
-			.replace(
-				r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
-				r#"max_concurrent_agents_by_state = { "Backlog" = 2, "In Progress" = 1 }"#,
-			),
+			&sample_workflow_markdown("pubfi", &[], "State-scoped workflow policy.\n", 1)
+				.replace("startable_states = [\"Todo\"]", "startable_states = [\"Backlog\"]")
+				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 3")
+				.replace(
+					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,
+					r#"max_concurrent_agents_by_state = { "Backlog" = 2, "In Progress" = 1 }"#,
+				),
 		)
 		.expect("workflow should parse");
 		let (_temp_dir, config, _default_workflow) = temp_project_layout();
@@ -8712,7 +8723,7 @@ Custom workflow.
 	#[test]
 	fn candidate_selection_skips_issue_claimed_by_another_process() {
 		let workflow = WorkflowDocument::parse_markdown(
-			&sample_workflow_markdown("pubfi", &["AGENTS.md"], "Claim-aware workflow policy.\n", 1)
+			&sample_workflow_markdown("pubfi", &[], "Claim-aware workflow policy.\n", 1)
 				.replace("max_concurrent_agents = 1", "max_concurrent_agents = 2")
 				.replace(
 					r#"max_concurrent_agents_by_state = { "In Progress" = 1 }"#,

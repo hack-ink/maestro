@@ -29,12 +29,7 @@ validation_commands = [
   "cargo make lint",
   "cargo make test",
 ]
-
-[context]
-read_first = ["AGENTS.md", "docs/index.md"]
 +++
-
-Read `AGENTS.md` first.
 
 Use `cargo make` whenever an equivalent task exists.
 

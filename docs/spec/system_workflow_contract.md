@@ -170,7 +170,7 @@ Supported keys:
 - `read_first`
   - type: array of string
   - optional
-  - default: `["AGENTS.md"]`
+  - default: `[]`
 
 Paths are repository-relative.
 
@@ -218,12 +218,7 @@ validation_commands = [
   "cargo make lint",
   "cargo make test",
 ]
-
-[context]
-read_first = ["AGENTS.md", "docs/index.md"]
 +++
-
-Read `AGENTS.md` first.
 Use `cargo make` whenever an equivalent task exists.
 Use the issue-scoped tracker tools autonomously when tracker updates are required.
 ```
@@ -231,7 +226,8 @@ Use the issue-scoped tracker tools autonomously when tracker updates are require
 ## Body semantics
 
 - The Markdown body is repository policy text.
-- Issue-scoped developer instructions should rely on `context.read_first` files plus the explicit tracker tool contract by default instead of inlining the raw body.
+- Issue-scoped developer instructions should include the `WORKFLOW.md` body plus the explicit tracker tool contract by default.
 - The body should contain durable repo rules, not ephemeral run notes.
 - The body should instruct the coding agent to use the issue-scoped tracker tools autonomously when tracker writes are part of the repo workflow.
+- `context.read_first` defaults to empty and should be reserved for optional extra repo-local files beyond the `WORKFLOW.md` body.
 - If the repository expects PR-backed review handoff, the body should state that the lane must produce a reviewable PR before the success state can be reached.
