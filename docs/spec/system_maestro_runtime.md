@@ -125,7 +125,10 @@ After each `app-server` turn completes, `maestro` must resolve one continuation 
   - terminal fallback when the agent never reached the point of writing the tracker
 - The service must never grant the coding agent broad tracker write access outside the currently leased issue.
 - Before starting a live run, the service must reconcile stale local leases and any terminal workspace mappings against current tracker state.
-- Before starting a live run, the service must fail fast if the local `gh` CLI needed for PR-backed review handoff inspection is unavailable.
+- Generic live dispatch must not require GitHub CLI or token authority before the lane actually attempts PR-backed review handoff.
+- The service must fail fast on missing `gh` CLI or GitHub token authority only at the GitHub-dependent review boundary:
+  - when a normal lane is about to validate and persist PR-backed review handoff
+  - when a retained post-review lane is about to re-enter review repair
 
 ## Linear writeback model
 
@@ -241,7 +244,7 @@ The local runtime store may keep only the data needed to operate safely during t
 This runtime state is process-memory only. `maestro` must not require a durable local database file for normal operation or restart recovery.
 The local runtime store must not become the operator-facing source of workflow truth.
 For daemon-child supervision, the active lane may also carry a short-lived workspace heartbeat marker at `.workspaces/<ISSUE>/.maestro-run-activity`. That marker is advisory, keyed to the current `run_id` plus `attempt`, and exists so the daemon can observe child activity across process boundaries, reconstruct a still-live retained lane after parent restart, and preserve retry-budget accounting without reviving a durable local state database.
-For post-review ownership, a retained lane may also carry a local `.workspaces/<ISSUE>/.maestro-review-handoff` marker recording the authoritative PR URL, branch lineage, and validated PR head OID that completed the `In Review` handoff. That marker exists only to rebind the retained lane to its owned PR state; it does not replace tracker or GitHub as the authoritative sources of workflow truth.
+For post-review ownership, a retained lane may also carry a local `.workspaces/<ISSUE>/.maestro-review-handoff` marker recording the authoritative PR URL, branch lineage, and validated PR head OID that completed the `In Review` handoff. That marker exists only to rebind the retained lane to its owned PR state; it does not replace tracker or GitHub as the authoritative sources of workflow truth, and post-review ownership must not be reconstructed later from branch-name or current-head heuristics alone when that marker is missing.
 For live execution, the current single project dispatch slot must still remain mutually exclusive across concurrent `maestro` processes. The runtime may enforce that exclusion with a short-lived workspace-root lock anchor, and daemon parents may hand that guard to the spawned `run --once` child so the active lane keeps exclusive ownership even if the parent restarts. That handoff currently requires Unix file-descriptor inheritance, so daemon mode is a Unix-only operator surface in this phase. Restart recovery must not depend on any durable lease database.
 
 ## Supported operator visibility surface

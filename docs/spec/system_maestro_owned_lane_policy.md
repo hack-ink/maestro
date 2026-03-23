@@ -108,6 +108,7 @@ This action requires:
 - the retained workspace still exists
 - the retained workspace still matches the owned issue and branch
 - the tracker or review signals clearly indicate the same lane should continue
+- an explicit retained review-handoff lineage marker is still present when the lane already crossed into post-review ownership
 - retained post-review re-entry can still prove the same PR lineage, even when the current
   repair attempt advances to a newer head on that same PR
 

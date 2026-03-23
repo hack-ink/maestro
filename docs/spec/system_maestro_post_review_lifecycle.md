@@ -56,7 +56,7 @@ Post-`In Review` classification may use only these signal groups:
   - whether delivery closeout already ran
   - whether workspace and branch cleanup remain pending
 
-In the current XY-173 slice, the retained lane persists its validated review handoff as a local `.maestro-review-handoff` marker and exposes the resulting post-review classification through the existing local `status` surface. That slice is intentionally read-only: it classifies the lane and reports the decision without performing repair, landing, closeout, or cleanup.
+In the current XY-173 slice, the retained lane persists its validated review handoff as a local `.maestro-review-handoff` marker and exposes the resulting post-review classification through the existing local `status` surface. That slice is intentionally read-only: it classifies the lane and reports the decision without performing repair, landing, closeout, or cleanup. When that explicit marker is missing, post-review ownership must block as unresolved instead of rebinding from branch-name or current-head-only heuristics.
 
 If these signals disagree and the disagreement cannot be resolved without guessing operator intent, the runtime must use `manual_intervention_required`.
 
