@@ -61,12 +61,14 @@ enum Command {
 enum RunIssueDispatchMode {
 	Normal,
 	Retry,
+	ReviewRepair,
 }
 impl From<RunIssueDispatchMode> for IssueDispatchMode {
 	fn from(value: RunIssueDispatchMode) -> Self {
 		match value {
 			RunIssueDispatchMode::Normal => Self::Normal,
 			RunIssueDispatchMode::Retry => Self::Retry,
+			RunIssueDispatchMode::ReviewRepair => Self::ReviewRepair,
 		}
 	}
 }

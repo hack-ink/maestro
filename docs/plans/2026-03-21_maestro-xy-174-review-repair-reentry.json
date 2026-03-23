@@ -1,0 +1,132 @@
+{
+  "spec": {
+    "schema": "plan/1",
+    "plan_id": "maestro-xy-174-review-repair-reentry",
+    "goal": "Implement the next post-In-Review autonomy slice by letting Maestro re-enter an owned retained lane that currently classifies as needs_review_repair, run a bounded review-repair loop in the same workspace and branch, push the repaired head, and request review again without human relay.",
+    "success_criteria": [
+      "Maestro can detect an owned retained post-review lane whose classification is needs_review_repair and select it ahead of normal pre-review issue dispatch.",
+      "The selected retained lane reuses the existing workspace, branch, and PR identity instead of re-running the pre-review start path.",
+      "The resumed lane uses an explicit bounded review-repair execution contract that repairs the current PR head, reruns repo-native verification, pushes a new head, and re-requests review without issuing a new issue_review_handoff or moving the issue out of In Review.",
+      "A non-converging repair exits through the existing human-attention path instead of looping indefinitely.",
+      "Docs, plan evidence, and targeted tests cover retained review-repair re-entry and bounded failure behavior."
+    ],
+    "constraints": [
+      "Keep XY-174 scoped to review-repair re-entry only; do not merge PRs, close out tracker state, or clean up workspaces in this issue.",
+      "Do not reintroduce pre-review GitHub preflight into generic candidate dispatch; GitHub authority should apply only to review-handoff and post-review paths.",
+      "Preserve the root checkout's local WORKFLOW.md modification by working only in .workspaces/XY-174.",
+      "Stay aligned with the accepted XY-160 post-review lifecycle and XY-176 owned-lane policy instead of inventing new ad hoc states.",
+      "If the safest implementation requires changing the accepted post-review state model or broadening into landing/closeout behavior, stop and route back through plan-writing."
+    ],
+    "defaults": {
+      "retained_lane_entrypoint": "only retained In Review lanes that classify as needs_review_repair are eligible for XY-174 re-entry",
+      "execution_surface": "reuse existing app-server run path where possible, but introduce a distinct dispatch mode and prompt/tool contract for post-review repair",
+      "bounded_repair_limit": "reuse existing review-prepare/review-repair convergence expectations and stop on non-convergence rather than open-ended retries"
+    },
+    "tasks": [
+      {
+        "id": "task-1",
+        "title": "Pin the retained review-repair dispatch contract",
+        "status": "done",
+        "objective": "Define how Maestro selects a retained post-review lane for repair, what runtime metadata must be carried into that run, and where the new dispatch mode cleanly separates from pre-review dispatch and generic retry semantics.",
+        "inputs": [
+          "XY-174 issue scope",
+          "Accepted XY-160 post-review lifecycle",
+          "Accepted XY-176 manual-intervention policy",
+          "Current XY-173 post-review classifier and retained-lane validation",
+          "Current run_project_once / prepare_issue_run dispatch flow"
+        ],
+        "outputs": [
+          "A concrete dispatch contract for retained review-repair re-entry",
+          "A bounded runtime input set for review-repair execution"
+        ],
+        "verification": [
+          "Targeted unit tests or dry-run planning tests covering retained review-repair selection",
+          "cargo make fmt-check"
+        ],
+        "depends_on": []
+      },
+      {
+        "id": "task-2",
+        "title": "Implement bounded retained-lane review repair re-entry",
+        "status": "done",
+        "objective": "Add the new dispatch mode, re-entry prompt/tool contract, and execution plumbing so Maestro can repair the current PR head in the retained workspace, push the repaired head, and request review again while preserving the existing manual-attention failure path.",
+        "inputs": [
+          "Task 1 dispatch contract",
+          "Current orchestrator app-server execution path",
+          "Current tracker tool bridge review handoff model",
+          "Current GitHub review-request integration"
+        ],
+        "outputs": [
+          "Runtime implementation for retained review-repair re-entry",
+          "Tests covering successful repair re-entry and bounded non-converging exits"
+        ],
+        "verification": [
+          "Targeted review-repair re-entry tests",
+          "cargo make fmt-check",
+          "cargo make lint"
+        ],
+        "depends_on": [
+          "task-1"
+        ]
+      },
+      {
+        "id": "task-3",
+        "title": "Align docs and finish verification",
+        "status": "done",
+        "objective": "Update specs and plan evidence so the accepted post-review lifecycle, owned-lane policy, and operator expectations match the implemented review-repair re-entry slice.",
+        "inputs": [
+          "Task 1 and Task 2 changes",
+          "Current runtime and workflow specs"
+        ],
+        "outputs": [
+          "Updated specs/docs for retained review-repair re-entry",
+          "Plan evidence for implementation and verification outcomes"
+        ],
+        "verification": [
+          "cargo make fmt-check",
+          "cargo make lint",
+          "cargo make test",
+          "git diff --check"
+        ],
+        "depends_on": [
+          "task-2"
+        ]
+      }
+    ],
+    "replan_policy": {
+      "owner": "plan-writing",
+      "triggers": [
+        "Retained review-repair re-entry cannot be implemented safely without changing the accepted post-review state machine or adding new lifecycle states.",
+        "The current tracker tool bridge or app-server contract cannot express bounded review-repair re-entry without a broader protocol redesign.",
+        "The smallest safe implementation would merge landing or closeout behavior into the same dispatch mode."
+      ]
+    }
+  },
+  "state": {
+    "phase": "done",
+    "current_task_id": null,
+    "next_task_id": null,
+    "blockers": [],
+    "evidence": [
+      "2026-03-21: Task-1 pinned a distinct IssueDispatchMode::ReviewRepair path that selects retained post-review lanes classified as needs_review_repair ahead of normal pre-review candidate dispatch, while keeping pre-review normal/retry dispatch semantics separate.",
+      "2026-03-21: Task-2 implemented bounded review-repair re-entry across src/orchestrator.rs, src/agent/app_server.rs, src/agent.rs, and src/agent/tracker_tool_bridge.rs. The retained lane now reuses the existing workspace and PR lineage, exposes issue_review_repair_complete plus issue_terminal_finalize(path=review_repair), refreshes the local review-handoff marker to the repaired PR head, and keeps the tracker issue in In Review instead of re-running issue_review_handoff.",
+      "2026-03-21: Added targeted regression coverage for review-repair selection, prompts, continuation, and marker refresh, including plan_project_issue_run_prefers_post_review_repair_lane_over_normal_candidate, review_repair_prompts_require_same_pr_repair_completion, continuation_guard_allows_review_repair_continuation_while_issue_remains_in_review, and review_repair_apply_persists_updated_handoff_marker_without_tracker_transition.",
+      "2026-03-21: Task-3 aligned docs by updating docs/spec/system_maestro_post_review_lifecycle.md and docs/spec/system_maestro_owned_lane_policy.md to describe retained review-repair completion, same-PR lineage refresh, and the requirement to keep the tracker issue in In Review through repair re-entry.",
+      "2026-03-21: Fresh verification passed on the XY-174 lane: cargo make fmt-check, cargo make lint, cargo make test, python3 /Users/xavier/.codex/skills/plan-writing/scripts/validate_plan_contract.py --path /Users/xavier/code/trusted/y/hack-ink/maestro/.workspaces/XY-174/docs/plans/2026-03-21_maestro-xy-174-review-repair-reentry.json, python3 /Users/xavier/.codex/skills/plan-execution/scripts/read_plan_contract.py --path /Users/xavier/code/trusted/y/hack-ink/maestro/.workspaces/XY-174/docs/plans/2026-03-21_maestro-xy-174-review-repair-reentry.json, git diff --check.",
+      "2026-03-21: Review-repair batch for PR #23 closed the first upstream feedback by removing issue_transition from retained review-repair tool surfaces, deferring review-handoff marker refresh until the authoritative repair comment lands, and switching continuation prompts to the configured tracker.success_state. Fresh targeted regressions plus cargo make fmt-check, cargo make lint, cargo make test, plan validate/read-back, and three full local self-review rounds all passed before the repaired head was prepared for push."
+    ],
+    "last_updated": "2026-03-21T10:57:00Z",
+    "replan_reason": null,
+    "context_snapshot": {
+      "issue": "XY-174",
+      "workspace": ".workspaces/XY-174",
+      "branch": "x/maestro-xy-174",
+      "baseline_origin_main": "b8cc8dd66f96206bf6ca65528db68d65e691e4a4",
+      "key_findings": [
+        "Current XY-173 code classifies retained post-review lanes but does not select them for execution.",
+        "Current live execution contract is still pre-review oriented: it moves the issue to In Progress and requires issue_review_handoff plus issue_terminal_finalize(review_handoff).",
+        "XY-174 should add a distinct retained review-repair dispatch contract instead of broadening generic retry or pre-review normal dispatch."
+      ]
+    }
+  }
+}

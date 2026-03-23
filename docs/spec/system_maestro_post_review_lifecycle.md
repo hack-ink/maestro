@@ -101,6 +101,12 @@ While in `review_repair`:
 - the repaired head must pass the local pre-review gate before being pushed
 - once a new head is pushed, the lane returns to `review_wait` for that new head
 
+In the current XY-174 slice, a retained repair run finishes by recording an explicit
+`issue_review_repair_complete` action for the same PR URL, then finalizing the run with
+the `review_repair` terminal path. Applying that completion refreshes the local
+`.maestro-review-handoff` marker to the repaired PR head while keeping the tracker issue
+in `In Review`; it does not re-run the original `issue_review_handoff` state transition.
+
 If the retained lane is missing or no longer provably belongs to the same issue and PR lineage, the runtime must not invent a fresh lane silently. It must require human intervention or a separately defined recovery path.
 
 ### `ready_to_land`

@@ -22,7 +22,8 @@ use crate::{
 	agent::{
 		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, AppServerRunResult,
 		ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
-		ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, ReviewHandoffContext,
+		ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+		ISSUE_TRANSITION_TOOL_NAME, ReviewExecutionMode, ReviewHandoffContext,
 		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,
 		TurnContinuationGuard,
 	},
@@ -222,6 +223,7 @@ struct IssueTurnContinuationGuard<'a, T> {
 	issue_identifier: &'a str,
 	initial_issue_state: &'a str,
 	retry_project_slug: &'a str,
+	dispatch_mode: IssueDispatchMode,
 }
 impl<T> TurnContinuationGuard for IssueTurnContinuationGuard<'_, T>
 where
@@ -232,6 +234,14 @@ where
 			return Ok(false);
 		};
 		let tracker_policy = self.workflow.frontmatter().tracker();
+
+		if self.dispatch_mode == IssueDispatchMode::ReviewRepair {
+			return Ok(issue.project_slug.as_deref() == Some(self.retry_project_slug)
+				&& issue.state.name == tracker_policy.success_state()
+				&& !issue.has_label(tracker_policy.opt_out_label())
+				&& !issue.has_label(tracker_policy.needs_attention_label()));
+		}
+
 		let issue_remains_active = issue.project_slug.as_deref() == Some(self.retry_project_slug)
 			&& issue.state.name == tracker_policy.in_progress_state()
 			&& !issue.has_label(tracker_policy.opt_out_label())
@@ -252,6 +262,27 @@ where
 	}
 
 	fn validate_continuation_boundary(&self, turn_count: u32) -> crate::prelude::Result<()> {
+		if self.dispatch_mode == IssueDispatchMode::ReviewRepair {
+			let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
+				return Ok(());
+			};
+			let tracker_policy = self.workflow.frontmatter().tracker();
+
+			if issue.project_slug.as_deref() == Some(self.retry_project_slug)
+				&& issue.state.name == tracker_policy.success_state()
+				&& !issue.has_label(tracker_policy.opt_out_label())
+				&& !issue.has_label(tracker_policy.needs_attention_label())
+			{
+				return Ok(());
+			}
+
+			eyre::bail!(
+				"Turn {} for issue `{}` ended without keeping the tracker issue in `{}`; a clean retained review-repair continuation boundary is only valid while the lane remains in review.",
+				turn_count,
+				self.issue_identifier,
+				tracker_policy.success_state()
+			);
+		}
 		if turn_count != 1 {
 			return Ok(());
 		}
@@ -348,6 +379,7 @@ struct DaemonRunChild {
 	attempt_number: i64,
 	initial_issue_state: String,
 	retry_project_slug: String,
+	dispatch_mode: IssueDispatchMode,
 	from_retry_queue: bool,
 	workflow: WorkflowDocument,
 }
@@ -370,6 +402,7 @@ struct RetryEntry {
 	issue_id: String,
 	retry_project_slug: String,
 	continuation_initial_issue_state: Option<String>,
+	dispatch_mode: IssueDispatchMode,
 	kind: RetryKind,
 	attempt: u32,
 	ready_at: Instant,
@@ -831,6 +864,7 @@ struct PullRequestStatusCheckRollup {
 pub(crate) enum IssueDispatchMode {
 	Normal,
 	Retry,
+	ReviewRepair,
 }
 impl IssueDispatchMode {
 	fn allows_issue(
@@ -852,6 +886,7 @@ impl IssueDispatchMode {
 				state_store,
 				hint,
 			),
+			Self::ReviewRepair => Ok(issue_passes_review_repair_dispatch_policy(issue, workflow)),
 		}
 	}
 }
@@ -1439,6 +1474,7 @@ where
 						child_ref,
 						&daemon_child.retry_project_slug,
 						&daemon_child.initial_issue_state,
+						daemon_child.dispatch_mode,
 						exit_status,
 					)?;
 				}
@@ -1643,6 +1679,7 @@ where
 				attempt_number: summary.attempt_number,
 				initial_issue_state: summary.initial_issue_state,
 				retry_project_slug: summary.retry_project_slug,
+				dispatch_mode: summary.dispatch_mode,
 				from_retry_queue,
 				workflow: workflow.clone(),
 			});
@@ -1817,6 +1854,7 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 			match request.dispatch_mode {
 				IssueDispatchMode::Normal => "normal",
 				IssueDispatchMode::Retry => "retry",
+				IssueDispatchMode::ReviewRepair => "review-repair",
 			},
 		])
 		.args(["--run-id", request.preferred_run_id])
@@ -1872,19 +1910,12 @@ where
 			continue;
 		};
 
-		if !issue_passes_retry_retention_policy(
+		if !issue_passes_retry_entry_retention_policy(
 			&issue,
-			&first_entry.retry_project_slug,
 			project,
 			workflow,
 			state_store,
-			RetryIssueStateHint {
-				preferred_issue_state: (first_entry.kind == RetryKind::Continuation)
-					.then_some(workflow.frontmatter().tracker().in_progress_state()),
-				preferred_initial_issue_state: first_entry
-					.continuation_initial_issue_state
-					.as_deref(),
-			},
+			&first_entry,
 		)? {
 			retry_queue.release(&first_entry.issue_id);
 
@@ -1910,7 +1941,8 @@ where
 			break;
 		}
 
-		let preferred_issue_state = (entry.kind == RetryKind::Continuation)
+		let preferred_issue_state = (entry.kind == RetryKind::Continuation
+			&& entry.dispatch_mode != IssueDispatchMode::ReviewRepair)
 			.then_some(workflow.frontmatter().tracker().in_progress_state());
 		let Some(summary) = run_target_issue_once(TargetIssueRunContext {
 			tracker,
@@ -1925,7 +1957,7 @@ where
 			preferred_issue_claim_fd: None,
 			preferred_dispatch_slot_fd: None,
 			preferred_dispatch_slot_index: None,
-			dispatch_mode: IssueDispatchMode::Retry,
+			dispatch_mode: entry.dispatch_mode,
 			preferred_run_identity: None,
 			preferred_retry_budget_base: None,
 		})?
@@ -1954,6 +1986,46 @@ fn queued_retry_issue_ids(retry_queue: &RetryQueue) -> Vec<String> {
 	retry_queue.ordered_entries().into_iter().map(|entry| entry.issue_id).collect()
 }
 
+fn issue_passes_review_repair_retention_policy(
+	issue: &TrackerIssue,
+	retry_project_slug: &str,
+	workflow: &WorkflowDocument,
+) -> bool {
+	issue.project_slug.as_deref() == Some(retry_project_slug)
+		&& issue_passes_review_repair_dispatch_policy(issue, workflow)
+}
+
+fn issue_passes_retry_entry_retention_policy(
+	issue: &TrackerIssue,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	entry: &RetryEntry,
+) -> crate::prelude::Result<bool> {
+	if entry.dispatch_mode == IssueDispatchMode::ReviewRepair {
+		return Ok(issue_passes_review_repair_retention_policy(
+			issue,
+			&entry.retry_project_slug,
+			workflow,
+		));
+	}
+
+	let preferred_issue_state = (entry.kind == RetryKind::Continuation)
+		.then_some(workflow.frontmatter().tracker().in_progress_state());
+
+	issue_passes_retry_retention_policy(
+		issue,
+		&entry.retry_project_slug,
+		project,
+		workflow,
+		state_store,
+		RetryIssueStateHint {
+			preferred_issue_state,
+			preferred_initial_issue_state: entry.continuation_initial_issue_state.as_deref(),
+		},
+	)
+}
+
 fn retry_entry_is_temporarily_blocked<T>(
 	tracker: &T,
 	project: &ServiceConfig,
@@ -1967,19 +2039,8 @@ where
 	let Some(issue) = refresh_issue(tracker, &entry.issue_id)? else {
 		return Ok(false);
 	};
-	let preferred_issue_state = (entry.kind == RetryKind::Continuation)
-		.then_some(workflow.frontmatter().tracker().in_progress_state());
-	let retained = issue_passes_retry_retention_policy(
-		&issue,
-		&entry.retry_project_slug,
-		project,
-		workflow,
-		state_store,
-		RetryIssueStateHint {
-			preferred_issue_state,
-			preferred_initial_issue_state: entry.continuation_initial_issue_state.as_deref(),
-		},
-	)?;
+	let retained =
+		issue_passes_retry_entry_retention_policy(&issue, project, workflow, state_store, entry)?;
 
 	if !retained {
 		return Ok(false);
@@ -1989,10 +2050,13 @@ where
 	}
 
 	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
+	let preferred_issue_state = (entry.kind == RetryKind::Continuation
+		&& entry.dispatch_mode != IssueDispatchMode::ReviewRepair)
+		.then_some(workflow.frontmatter().tracker().in_progress_state());
 	let planned_issue_state = planned_issue_state_for_dispatch(
 		workflow,
 		&issue,
-		IssueDispatchMode::Retry,
+		entry.dispatch_mode,
 		preferred_issue_state,
 	);
 
@@ -2004,6 +2068,7 @@ fn schedule_retry_after_child_exit<T>(
 	child: ChildRunRef<'_>,
 	retry_project_slug: &str,
 	initial_issue_state: &str,
+	dispatch_mode: IssueDispatchMode,
 	exit_status: ExitStatus,
 ) -> crate::prelude::Result<()>
 where
@@ -2027,20 +2092,26 @@ where
 	};
 	let continuation_pending =
 		exit_status.success() && run_attempt.status() == CONTINUATION_PENDING_RUN_STATUS;
-	let preferred_issue_state = continuation_pending
-		.then_some(context.workflow.frontmatter().tracker().in_progress_state());
+	let retained = if dispatch_mode == IssueDispatchMode::ReviewRepair {
+		issue_passes_review_repair_retention_policy(&issue, retry_project_slug, context.workflow)
+	} else {
+		let preferred_issue_state = continuation_pending
+			.then_some(context.workflow.frontmatter().tracker().in_progress_state());
 
-	if !issue_passes_retry_retention_policy(
-		&issue,
-		retry_project_slug,
-		context.project,
-		context.workflow,
-		context.state_store,
-		RetryIssueStateHint {
-			preferred_issue_state,
-			preferred_initial_issue_state: continuation_pending.then_some(initial_issue_state),
-		},
-	)? {
+		issue_passes_retry_retention_policy(
+			&issue,
+			retry_project_slug,
+			context.project,
+			context.workflow,
+			context.state_store,
+			RetryIssueStateHint {
+				preferred_issue_state,
+				preferred_initial_issue_state: continuation_pending.then_some(initial_issue_state),
+			},
+		)?
+	};
+
+	if !retained {
 		context.retry_queue.release(issue_id);
 
 		return Ok(());
@@ -2084,6 +2155,7 @@ where
 		issue_id: issue_id.to_owned(),
 		retry_project_slug: retry_project_slug.to_owned(),
 		continuation_initial_issue_state,
+		dispatch_mode,
 		kind,
 		attempt: attempt.max(1),
 		ready_at: Instant::now() + delay,
@@ -2652,14 +2724,23 @@ where
 		break;
 	}
 
-	let selected_issue = selected_retry_issue.or(select_issue_candidate_with_exclusions(
-		issues,
+	let selected_post_review_issue = select_post_review_repair_issue_candidate(
+		tracker,
+		project,
 		workflow,
 		state_store,
-		project.id(),
 		excluded_issue_ids,
-	)?
-	.map(|issue| (issue, IssueDispatchMode::Normal)));
+	)?;
+	let selected_issue = selected_retry_issue
+		.or(selected_post_review_issue.map(|issue| (issue, IssueDispatchMode::ReviewRepair)))
+		.or(select_issue_candidate_with_exclusions(
+			issues,
+			workflow,
+			state_store,
+			project.id(),
+			excluded_issue_ids,
+		)?
+		.map(|issue| (issue, IssueDispatchMode::Normal)));
 	let Some((issue, dispatch_mode)) = selected_issue else {
 		let _ = resolve_tracker_project(tracker, project.tracker().project_slug())?;
 
@@ -2711,6 +2792,83 @@ where
 	};
 
 	Ok(Some(issue_run))
+}
+
+fn select_post_review_repair_issue_candidate<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	excluded_issue_ids: &[&str],
+) -> crate::prelude::Result<Option<TrackerIssue>>
+where
+	T: IssueTracker,
+{
+	let review_state_inspector = GhPullRequestReviewStateInspector {
+		github_token_env_var: project.github().token_env_var().map(str::to_owned),
+	};
+
+	select_post_review_repair_issue_candidate_with_inspector(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		excluded_issue_ids,
+		&review_state_inspector,
+	)
+}
+
+fn select_post_review_repair_issue_candidate_with_inspector<T, I>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	excluded_issue_ids: &[&str],
+	review_state_inspector: &I,
+) -> crate::prelude::Result<Option<TrackerIssue>>
+where
+	T: IssueTracker,
+	I: PullRequestReviewStateInspector,
+{
+	let lanes = build_post_review_lane_statuses(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		review_state_inspector,
+	)?;
+	let candidate_issue_ids = lanes
+		.iter()
+		.filter(|lane| lane.classification == "needs_review_repair")
+		.filter(|lane| !excluded_issue_ids.contains(&lane.issue_id.as_str()))
+		.map(|lane| lane.issue_id.clone())
+		.collect::<Vec<_>>();
+
+	if candidate_issue_ids.is_empty() {
+		return Ok(None);
+	}
+
+	let issues = tracker.refresh_issues(&candidate_issue_ids)?;
+	let mut issues_by_id =
+		issues.into_iter().map(|issue| (issue.id.clone(), issue)).collect::<HashMap<_, _>>();
+
+	for lane in lanes {
+		if lane.classification != "needs_review_repair" {
+			continue;
+		}
+		if excluded_issue_ids.contains(&lane.issue_id.as_str()) {
+			continue;
+		}
+		if state_store.issue_has_active_shared_claim(project.id(), &lane.issue_id)? {
+			continue;
+		}
+
+		if let Some(issue) = issues_by_id.remove(&lane.issue_id) {
+			return Ok(Some(issue));
+		}
+	}
+
+	Ok(None)
 }
 
 fn run_target_issue_once<T>(
@@ -3131,6 +3289,20 @@ fn validate_review_handoff_runtime(
 	Ok(())
 }
 
+fn validate_review_repair_runtime(
+	project: &ServiceConfig,
+	dry_run: bool,
+) -> crate::prelude::Result<()> {
+	if dry_run {
+		return Ok(());
+	}
+
+	validate_command_available("gh", "retained review-repair re-entry")?;
+	resolve_configured_env_var("github.token_env_var", project.github().token_env_var())?;
+
+	Ok(())
+}
+
 fn validate_daemon_runtime() -> crate::prelude::Result<()> {
 	#[cfg(unix)]
 	{
@@ -3144,7 +3316,6 @@ fn validate_daemon_runtime() -> crate::prelude::Result<()> {
 	}
 }
 
-#[cfg(test)]
 fn validate_command_available(command: &str, purpose: &str) -> crate::prelude::Result<()> {
 	let output = Command::new(command).arg("--version").output().map_err(|error| {
 		eyre::eyre!("Required command `{command}` is unavailable for {purpose}: {error}")
@@ -3256,18 +3427,12 @@ where
 		.to_owned();
 	let model =
 		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
+	let review_context = build_review_run_context(project, issue_run)?;
 	let tracker_tool_bridge = TrackerToolBridge::with_run_context(
 		tracker,
 		&issue_run.issue,
 		workflow,
-		ReviewHandoffContext {
-			attempt_number: issue_run.attempt_number,
-			branch_name: issue_run.workspace.branch_name.clone(),
-			run_id: issue_run.run_id.clone(),
-			workspace_path: relative_workspace_path(project, &issue_run.workspace),
-			cwd: issue_run.workspace.path.clone(),
-			github_token_env_var: project.github().token_env_var().map(str::to_owned),
-		},
+		review_context.clone(),
 	);
 	let continuation_guard = IssueTurnContinuationGuard {
 		tracker,
@@ -3277,6 +3442,7 @@ where
 		issue_identifier: &issue_run.issue.identifier,
 		initial_issue_state: &issue_run.initial_issue_state,
 		retry_project_slug: &issue_run.retry_project_slug,
+		dispatch_mode: issue_run.dispatch_mode,
 	};
 	let run_result = agent::execute_app_server_run(
 		&AppServerRunRequest {
@@ -3287,14 +3453,29 @@ where
 			cwd: issue_run.workspace.path.display().to_string(),
 			approval_policy: workflow.frontmatter().agent().approval_policy().to_owned(),
 			sandbox: workflow.frontmatter().agent().sandbox().to_owned(),
-			developer_instructions: build_developer_instructions(project, workflow, issue_run)?,
-			user_input: build_user_input(&issue_run.issue, workflow, issue_run),
+			developer_instructions: build_developer_instructions(
+				project,
+				workflow,
+				issue_run,
+				review_context.recorded_pr_url.as_deref(),
+			)?,
+			user_input: build_user_input(
+				&issue_run.issue,
+				workflow,
+				issue_run,
+				review_context.recorded_pr_url.as_deref(),
+			),
 			model: model.clone(),
 			personality: workflow.frontmatter().agent().personality().map(str::to_owned),
 			service_tier: workflow.frontmatter().agent().service_tier().map(str::to_owned),
 			max_turns: workflow.frontmatter().execution().max_turns(),
 			timeout: ACTIVE_RUN_IDLE_TIMEOUT,
-			continuation_user_input: Some(build_continuation_user_input(&issue_run.issue)),
+			continuation_user_input: Some(build_continuation_user_input(
+				&issue_run.issue,
+				issue_run.dispatch_mode,
+				review_context.recorded_pr_url.as_deref(),
+				workflow.frontmatter().tracker().success_state(),
+			)),
 			activity_marker_path: Some(issue_run.workspace.path.clone()),
 			dynamic_tool_handler: Some(&tracker_tool_bridge),
 			continuation_guard: Some(&continuation_guard),
@@ -3340,6 +3521,14 @@ where
 				label: workflow.frontmatter().tracker().needs_attention_label().to_owned(),
 				run_id: issue_run.run_id.clone(),
 			}));
+		},
+		RunCompletionDisposition::ReviewRepair => {
+			run_validation_commands(
+				workflow.frontmatter().execution().validation_commands(),
+				&issue_run.workspace.path,
+			)?;
+
+			tracker_tool_bridge.apply_review_repair()?;
 		},
 	}
 
@@ -3409,6 +3598,7 @@ fn planned_issue_state_for_dispatch(
 					.to_owned()
 			})
 			.unwrap_or_else(|| issue.state.name.clone()),
+		IssueDispatchMode::ReviewRepair => issue.state.name.clone(),
 	}
 }
 
@@ -3670,6 +3860,17 @@ fn issue_passes_dispatch_policy(issue: &TrackerIssue, workflow: &WorkflowDocumen
 	true
 }
 
+fn issue_passes_review_repair_dispatch_policy(
+	issue: &TrackerIssue,
+	workflow: &WorkflowDocument,
+) -> bool {
+	let tracker_policy = workflow.frontmatter().tracker();
+
+	issue.state.name == tracker_policy.success_state()
+		&& !issue.has_label(tracker_policy.opt_out_label())
+		&& !issue.has_label(tracker_policy.needs_attention_label())
+}
+
 fn issue_passes_retry_dispatch_policy(
 	issue: &TrackerIssue,
 	retry_project_slug: &str,
@@ -3890,6 +4091,7 @@ fn build_developer_instructions(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
+	recorded_pr_url: Option<&str>,
 ) -> crate::prelude::Result<String> {
 	let continuation_guidance = if workflow.frontmatter().execution().max_turns() > 1 {
 		"\n- If more implementation work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` may continue the same lane in a later turn."
@@ -3909,22 +4111,40 @@ fn build_developer_instructions(
 		"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
 	));
 
-	sections.push(format!(
-		"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",
-		issue = issue_run.issue.identifier,
-		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
-		comment_tool = ISSUE_COMMENT_TOOL_NAME,
-		label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
-		review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
-		terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
-		in_progress = workflow.frontmatter().tracker().in_progress_state(),
-		run_id = issue_run.run_id,
-		attempt = issue_run.attempt_number,
-		branch = issue_run.workspace.branch_name,
-		success = workflow.frontmatter().tracker().success_state(),
-		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
-		continuation_guidance = continuation_guidance,
-	));
+	let tracker_contract = match issue_run.dispatch_mode {
+		IssueDispatchMode::ReviewRepair => format!(
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}` on retained PR `{pr_url}`.\n- This run resumes an existing `{success}` lane. Do not move the issue back to `{in_progress}` and do not call `{review_handoff_tool}`.\n- Repair the current PR head on branch `{branch}`, run the repository validation needed to justify a fresh review, push the repaired head, resolve only the GitHub review threads you actually fixed, and request fresh review on the same PR.\n- After the repaired head is pushed and fresh review is requested, call `{review_repair_tool}` with PR `{pr_url}` and a short result summary, then call `{terminal_finalize_tool}` with path `review_repair`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify.\n- Keep the tracker issue in `{success}`. `maestro` will handle the later landing and closeout lifecycle.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",
+			issue = issue_run.issue.identifier,
+			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
+			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			success = workflow.frontmatter().tracker().success_state(),
+			branch = issue_run.workspace.branch_name,
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			continuation_guidance = continuation_guidance,
+		),
+		_ => format!(
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",
+			issue = issue_run.issue.identifier,
+			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
+			comment_tool = ISSUE_COMMENT_TOOL_NAME,
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			run_id = issue_run.run_id,
+			attempt = issue_run.attempt_number,
+			branch = issue_run.workspace.branch_name,
+			success = workflow.frontmatter().tracker().success_state(),
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			continuation_guidance = continuation_guidance,
+		),
+	};
+
+	sections.push(tracker_contract);
 
 	Ok(sections.join("\n\n"))
 }
@@ -3933,42 +4153,117 @@ fn build_user_input(
 	issue: &TrackerIssue,
 	workflow: &WorkflowDocument,
 	issue_run: &IssueRunPlan,
+	recorded_pr_url: Option<&str>,
 ) -> String {
 	let continuation_guidance = if workflow.frontmatter().execution().max_turns() > 1 {
 		"\n- If more work still remains at the current turn boundary, you may end the turn without `{terminal_finalize_tool}` and `maestro` will decide whether to continue the lane."
 	} else {
 		""
 	};
+	let description = if issue.description.trim().is_empty() {
+		String::from("(no description)")
+	} else {
+		issue.description.clone()
+	};
 
-	format!(
-		"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}",
-		identifier = issue.identifier,
-		title = issue.title,
-		description = if issue.description.trim().is_empty() {
-			String::from("(no description)")
-		} else {
-			issue.description.clone()
-		},
-		transition_tool = ISSUE_TRANSITION_TOOL_NAME,
-		comment_tool = ISSUE_COMMENT_TOOL_NAME,
-		label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
-		review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
-		terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
-		in_progress = workflow.frontmatter().tracker().in_progress_state(),
-		run_id = issue_run.run_id,
-		attempt = issue_run.attempt_number,
-		branch = issue_run.workspace.branch_name,
-		success = workflow.frontmatter().tracker().success_state(),
-		needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
-		continuation_guidance = continuation_guidance,
-	)
+	match issue_run.dispatch_mode {
+		IssueDispatchMode::ReviewRepair => format!(
+			"Continue retained review repair for Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nCurrent PR:\n- `{pr_url}`\n\nExecution checklist:\n- Resume from the current branch and PR state in this workspace. Do not move the issue back to `{in_progress}`.\n- Read the current review feedback on `{pr_url}`, fix the branch `{branch}`, and keep scope limited to the outstanding review repair.\n- Run the repository validation needed to justify a fresh review request.\n- Commit the repair, push the same branch, resolve only the GitHub review threads you actually fixed, and request fresh review on `{pr_url}`.\n- Call `{review_repair_tool}` with `{pr_url}` and a short result summary, then call `{terminal_finalize_tool}` with path `review_repair`.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`.\n- Keep the issue in `{success}` and do not mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}",
+			identifier = issue.identifier,
+			title = issue.title,
+			description = description,
+			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			branch = issue_run.workspace.branch_name,
+			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			success = workflow.frontmatter().tracker().success_state(),
+			continuation_guidance = continuation_guidance,
+		),
+		_ => format!(
+			"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}",
+			identifier = issue.identifier,
+			title = issue.title,
+			description = description,
+			transition_tool = ISSUE_TRANSITION_TOOL_NAME,
+			comment_tool = ISSUE_COMMENT_TOOL_NAME,
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			run_id = issue_run.run_id,
+			attempt = issue_run.attempt_number,
+			branch = issue_run.workspace.branch_name,
+			success = workflow.frontmatter().tracker().success_state(),
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			continuation_guidance = continuation_guidance,
+		),
+	}
 }
 
-fn build_continuation_user_input(issue: &TrackerIssue) -> String {
-	format!(
-		"Continue working on Linear issue {identifier} in the current thread and workspace.\n\nContinuation checklist:\n- Resume from the current repository state instead of restarting broad discovery.\n- Keep changes scoped to the same issue lane.\n- If the implementation is review-ready, finish the PR-backed tracker handoff before ending the turn.\n- If the issue requires manual attention, record the manual-attention tracker path before ending the turn.\n- If more work still remains after this turn, you may end the turn without terminal finalization and Maestro will decide whether to continue.",
-		identifier = issue.identifier
-	)
+fn build_continuation_user_input(
+	issue: &TrackerIssue,
+	dispatch_mode: IssueDispatchMode,
+	recorded_pr_url: Option<&str>,
+	success_state: &str,
+) -> String {
+	match dispatch_mode {
+		IssueDispatchMode::ReviewRepair => format!(
+			"Continue retained review repair for Linear issue {identifier} in the current thread and workspace.\n\nContinuation checklist:\n- Resume from the current repository state and outstanding review feedback on `{pr_url}`.\n- Keep changes scoped to the same retained review lane and do not move the issue out of `{success}`.\n- If the repaired head is ready, push it, request fresh review on `{pr_url}`, call `{review_repair_tool}`, and then call `{terminal_finalize_tool}` with path `review_repair`.\n- If the issue requires manual attention, record the manual-attention tracker path before ending the turn.\n- If more work still remains after this turn, you may end the turn without terminal finalization and Maestro will decide whether to continue.",
+			identifier = issue.identifier,
+			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
+			success = success_state,
+			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+		),
+		_ => format!(
+			"Continue working on Linear issue {identifier} in the current thread and workspace.\n\nContinuation checklist:\n- Resume from the current repository state instead of restarting broad discovery.\n- Keep changes scoped to the same issue lane.\n- If the implementation is review-ready, finish the PR-backed tracker handoff before ending the turn.\n- If the issue requires manual attention, record the manual-attention tracker path before ending the turn.\n- If more work still remains after this turn, you may end the turn without terminal finalization and Maestro will decide whether to continue.",
+			identifier = issue.identifier
+		),
+	}
+}
+
+fn build_review_run_context(
+	project: &ServiceConfig,
+	issue_run: &IssueRunPlan,
+) -> crate::prelude::Result<ReviewHandoffContext> {
+	match issue_run.dispatch_mode {
+		IssueDispatchMode::ReviewRepair => {
+			validate_review_repair_runtime(project, false)?;
+
+			let review_handoff = state::read_review_handoff_marker(&issue_run.workspace.path)?
+				.ok_or_else(|| {
+					eyre::eyre!(
+						"Retained review-repair run `{}` for issue `{}` requires an existing `.maestro-review-handoff` marker.",
+						issue_run.run_id,
+						issue_run.issue.identifier
+					)
+				})?;
+
+			Ok(ReviewHandoffContext {
+				attempt_number: issue_run.attempt_number,
+				branch_name: issue_run.workspace.branch_name.clone(),
+				run_id: issue_run.run_id.clone(),
+				workspace_path: relative_workspace_path(project, &issue_run.workspace),
+				cwd: issue_run.workspace.path.clone(),
+				github_token_env_var: project.github().token_env_var().map(str::to_owned),
+				mode: ReviewExecutionMode::Repair,
+				recorded_pr_url: Some(review_handoff.pr_url().to_owned()),
+			})
+		},
+		_ => Ok(ReviewHandoffContext {
+			attempt_number: issue_run.attempt_number,
+			branch_name: issue_run.workspace.branch_name.clone(),
+			run_id: issue_run.run_id.clone(),
+			workspace_path: relative_workspace_path(project, &issue_run.workspace),
+			cwd: issue_run.workspace.path.clone(),
+			github_token_env_var: project.github().token_env_var().map(str::to_owned),
+			mode: ReviewExecutionMode::Handoff,
+			recorded_pr_url: None,
+		}),
+	}
 }
 
 fn run_validation_commands(commands: &[String], cwd: &Path) -> crate::prelude::Result<()> {
@@ -4641,6 +4936,27 @@ where
 			&workspace.path.display().to_string(),
 		)?;
 
+		if issue_passes_review_repair_dispatch_policy(&issue, workflow) {
+			match state::read_run_activity_marker_snapshot(&workspace.path)? {
+				Some(marker) if workspace_activity_marker_is_fresh(&marker, now_unix_epoch) => {
+					state_store.record_run_attempt(
+						marker.run_id(),
+						&issue.id,
+						marker.attempt_number(),
+						"running",
+					)?;
+					state_store.upsert_lease(
+						project.id(),
+						&issue.id,
+						marker.run_id(),
+						&issue.state.name,
+					)?;
+
+					continue;
+				},
+				_ => {},
+			}
+		}
 		if issue_passes_retry_dispatch_policy(
 			&issue,
 			&retry_project_slug,
@@ -5064,10 +5380,11 @@ mod tests {
 		orchestrator::{
 			self, BranchHeadReviewStateResolution, GhPullRequestReviewStateInspector,
 			ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
-			ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision,
-			PostReviewLaneSnapshot, PullRequestCommitConnection, PullRequestCommitNode,
-			PullRequestCommitPayload, PullRequestPageInfo, PullRequestRepository,
-			PullRequestRepositoryOwner, PullRequestReviewRequestConnection, PullRequestReviewState,
+			ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision, PostReviewLaneSnapshot,
+			PullRequestCommitConnection, PullRequestCommitNode, PullRequestCommitPayload,
+			PullRequestPageInfo, PullRequestRepository, PullRequestRepositoryOwner,
+			PullRequestReviewRequestConnection, PullRequestReviewState,
 			PullRequestReviewStateInspector, PullRequestReviewStateNode,
 			PullRequestReviewThreadConnection, PullRequestReviewThreadNode,
 			PullRequestStatusCheckRollup, RunSummary,
@@ -6339,6 +6656,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("failure retry should schedule");
@@ -6387,6 +6705,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 4 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("first failure after continuations should still schedule");
@@ -6399,6 +6718,89 @@ read_first = [{read_first}]
 		assert_eq!(
 			orchestrator::retry_delay(entry.kind, entry.attempt, &workflow),
 			Duration::from_millis(10_000)
+		);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_records_failure_retry_for_review_repair_issue() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-review-repair";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "failed")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			&issue.state.name,
+			orchestrator::IssueDispatchMode::ReviewRepair,
+			exit_status,
+		)
+		.expect("review-repair failure retry should schedule");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.dispatch_mode, orchestrator::IssueDispatchMode::ReviewRepair);
+		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn queued_review_repair_retry_stays_blocked_until_due() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::ReviewRepair,
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("future review-repair retry should stay queued");
+
+		assert!(matches!(
+			decision,
+			orchestrator::RetryDispatchDecision::Blocked { excluded_issue_ids }
+				if excluded_issue_ids == vec![issue.id.clone()]
+		));
+		assert!(
+			retry_queue.entries.contains_key(&issue.id),
+			"review-repair retries should keep their queued backoff window until ready"
 		);
 	}
 
@@ -6436,6 +6838,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 3 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -6474,6 +6877,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("continuation retry should schedule");
@@ -6513,6 +6917,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("continuation retry should tolerate a stale startable tracker reread");
@@ -6552,6 +6957,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("completed successful runs should not schedule another retry");
@@ -6591,6 +6997,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("retry scheduling should stay resilient to project lookup blips");
@@ -6637,6 +7044,7 @@ read_first = [{read_first}]
 			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
 			"pubfi",
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("retry scheduling should release lanes that moved to another project");
@@ -6678,6 +7086,7 @@ read_first = [{read_first}]
 			},
 			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
 			&issue.state.name,
+			orchestrator::IssueDispatchMode::Retry,
 			exit_status,
 		)
 		.expect("retry scheduling should succeed");
@@ -6718,6 +7127,7 @@ read_first = [{read_first}]
 				.project_slug
 				.clone()
 				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			from_retry_queue: true,
 			workflow: workflow.clone(),
 		}];
@@ -6730,6 +7140,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -6769,6 +7180,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -6808,6 +7220,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -6864,6 +7277,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -6945,6 +7359,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -6956,6 +7371,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(120),
@@ -7011,6 +7427,7 @@ read_first = [{read_first}]
 			issue_id: stale_issue.id.clone(),
 			retry_project_slug: String::from("pubfi"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now(),
@@ -7022,6 +7439,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now(),
@@ -7073,6 +7491,7 @@ read_first = [{read_first}]
 			issue_id: issue.id.clone(),
 			retry_project_slug: String::from("pubfi"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 2,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -7110,6 +7529,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -7143,6 +7563,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: Some(issue.state.name.clone()),
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Continuation,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -7188,6 +7609,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: Some(String::from("Todo")),
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Continuation,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -7241,6 +7663,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: Some(issue.state.name.clone()),
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Continuation,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -7282,6 +7705,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now() + Duration::from_secs(60),
@@ -7316,6 +7740,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -7353,6 +7778,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -7418,6 +7844,7 @@ read_first = [{read_first}]
 				.clone()
 				.expect("sample issue should carry a project slug"),
 			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
 			kind: orchestrator::RetryKind::Failure,
 			attempt: 1,
 			ready_at: Instant::now(),
@@ -7529,7 +7956,7 @@ read_first = [{read_first}]
 			retry_budget_base: 0,
 		};
 		let instructions =
-			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
+			orchestrator::build_developer_instructions(&config, &workflow, &issue_run, None)
 				.expect("developer instructions should build");
 
 		assert!(instructions.contains("File: AGENTS.md\nRead me first.\n"));
@@ -7569,12 +7996,113 @@ read_first = [{read_first}]
 			run_id: String::from("pub-101-attempt-1-123"),
 			retry_budget_base: 0,
 		};
-		let user_input = orchestrator::build_user_input(&issue, &workflow, &issue_run);
-		let continuation_input = orchestrator::build_continuation_user_input(&issue);
+		let user_input = orchestrator::build_user_input(&issue, &workflow, &issue_run, None);
+		let continuation_input = orchestrator::build_continuation_user_input(
+			&issue,
+			orchestrator::IssueDispatchMode::Normal,
+			None,
+			workflow.frontmatter().tracker().success_state(),
+		);
 
 		assert!(user_input.contains("you may end the turn without"));
 		assert!(continuation_input.contains("you may end the turn without terminal finalization"));
 		assert!(!user_input.contains("Do not end the turn"));
+	}
+
+	#[test]
+	fn review_repair_prompts_require_same_pr_repair_completion() {
+		let (_temp_dir, config, workflow) = temp_project_layout_with_max_turns(4);
+		let issue = sample_issue("In Review", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			issue_state: String::from("In Review"),
+			initial_issue_state: String::from("In Review"),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: String::from("PUB-101"),
+				path: config.workspace_root().join("PUB-101"),
+				reused_existing: true,
+			},
+			retry_project_slug: String::from("pubfi"),
+			dispatch_mode: orchestrator::IssueDispatchMode::ReviewRepair,
+			attempt_number: 2,
+			run_id: String::from("pub-101-attempt-2-123"),
+			retry_budget_base: 0,
+		};
+		let pr_url = "https://github.com/helixbox/maestro/pull/77";
+		let developer_instructions = orchestrator::build_developer_instructions(
+			&config,
+			&workflow,
+			&issue_run,
+			Some(pr_url),
+		)
+		.expect("review repair developer instructions should build");
+		let user_input =
+			orchestrator::build_user_input(&issue, &workflow, &issue_run, Some(pr_url));
+		let continuation_input = orchestrator::build_continuation_user_input(
+			&issue,
+			orchestrator::IssueDispatchMode::ReviewRepair,
+			Some(pr_url),
+			workflow.frontmatter().tracker().success_state(),
+		);
+
+		assert!(developer_instructions.contains(ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME));
+		assert!(developer_instructions.contains("Do not move the issue back to `In Progress`"));
+		assert!(developer_instructions.contains("do not call `issue_review_handoff`"));
+		assert!(user_input.contains(pr_url));
+		assert!(user_input.contains("resolve only the GitHub review threads you actually fixed"));
+		assert!(continuation_input.contains("request fresh review"));
+		assert!(continuation_input.contains("In Review"));
+		assert!(continuation_input.contains("review_repair"));
+	}
+
+	#[test]
+	fn review_repair_continuation_prompt_uses_configured_success_state() {
+		let workflow = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+startable_states = ["Todo"]
+in_progress_state = "In Progress"
+success_state = "Ready For QA"
+failure_state = "Todo"
+opt_out_label = "maestro:manual-only"
+needs_attention_label = "maestro:needs-attention"
+
+[agent]
+transport = "stdio://"
+sandbox = "workspace-write"
+approval_policy = "never"
+
+[execution]
+max_attempts = 3
+max_turns = 4
+max_retry_backoff_ms = 300000
+max_concurrent_agents = 1
+max_concurrent_agents_by_state = { "In Progress" = 1 }
+
+[context]
+read_first = ["AGENTS.md"]
++++
+
+Custom workflow.
+"#,
+		)
+		.expect("workflow should parse");
+		let issue = sample_issue("Ready For QA", &[]);
+		let continuation_input = orchestrator::build_continuation_user_input(
+			&issue,
+			orchestrator::IssueDispatchMode::ReviewRepair,
+			Some("https://github.com/helixbox/maestro/pull/77"),
+			workflow.frontmatter().tracker().success_state(),
+		);
+
+		assert!(continuation_input.contains("Ready For QA"));
+		assert!(!continuation_input.contains("do not move the issue out of `In Review`"));
 	}
 
 	#[test]
@@ -7598,10 +8126,10 @@ read_first = [{read_first}]
 			retry_budget_base: 0,
 		};
 		let developer_instructions =
-			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
+			orchestrator::build_developer_instructions(&config, &workflow, &issue_run, None)
 				.expect("developer instructions should build");
 		let user_input =
-			orchestrator::build_user_input(&sample_issue("Todo", &[]), &workflow, &issue_run);
+			orchestrator::build_user_input(&sample_issue("Todo", &[]), &workflow, &issue_run, None);
 
 		assert!(!developer_instructions.contains("you may end the turn without"));
 		assert!(!user_input.contains("you may end the turn without"));
@@ -7635,7 +8163,7 @@ read_first = [{read_first}]
 			retry_budget_base: 0,
 		};
 		let instructions =
-			orchestrator::build_developer_instructions(&config, &workflow, &issue_run)
+			orchestrator::build_developer_instructions(&config, &workflow, &issue_run, None)
 				.expect("developer instructions should build");
 
 		assert_eq!(
@@ -7670,6 +8198,7 @@ read_first = [{read_first}]
 			issue_identifier: &issue.identifier,
 			initial_issue_state: &issue.state.name,
 			retry_project_slug: resolved_project_slug,
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 		};
 
 		assert!(
@@ -7697,6 +8226,7 @@ read_first = [{read_first}]
 				.project_slug
 				.as_deref()
 				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 		};
 		let error = guard
 			.validate_continuation_boundary(1)
@@ -7733,6 +8263,7 @@ read_first = [{read_first}]
 				.project_slug
 				.as_deref()
 				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 		};
 
 		assert!(
@@ -7774,6 +8305,7 @@ read_first = [{read_first}]
 				.project_slug
 				.as_deref()
 				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 		};
 
 		assert!(
@@ -7785,6 +8317,38 @@ read_first = [{read_first}]
 			guard
 				.should_continue_turn(2)
 				.expect("a stale pre-write reread should remain tolerated after turn one")
+		);
+	}
+
+	#[test]
+	fn continuation_guard_allows_review_repair_continuation_while_issue_remains_in_review() {
+		let (_temp_dir, _config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let tracker_tool_bridge = TrackerToolBridge::new(&tracker, &issue, &workflow);
+		let guard = orchestrator::IssueTurnContinuationGuard {
+			tracker: &tracker,
+			tracker_tool_bridge: &tracker_tool_bridge,
+			workflow: &workflow,
+			issue_id: &issue.id,
+			issue_identifier: &issue.identifier,
+			initial_issue_state: &issue.state.name,
+			retry_project_slug: issue
+				.project_slug
+				.as_deref()
+				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::ReviewRepair,
+		};
+
+		assert!(
+			guard.should_continue_turn(2).expect(
+				"retained review-repair lane should continue while issue remains in review"
+			)
+		);
+
+		guard.validate_continuation_boundary(2).expect(
+			"review-repair continuation boundary should stay valid while the issue remains in review",
 		);
 	}
 
@@ -7809,6 +8373,7 @@ read_first = [{read_first}]
 				.project_slug
 				.as_deref()
 				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::Normal,
 		};
 
 		assert!(
@@ -7951,6 +8516,110 @@ read_first = [{read_first}]
 		.expect("candidate selection should succeed");
 
 		assert!(selected.is_none(), "project-level dispatch slot should block new selection");
+	}
+
+	#[test]
+	fn plan_project_issue_run_prefers_post_review_repair_lane_over_normal_candidate() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let normal_issue = sample_issue_with_sort_fields(
+			"issue-1",
+			"PUB-101",
+			"Todo",
+			&[],
+			Some(1),
+			"2026-03-13T04:16:17.133Z",
+		);
+		let repair_issue = sample_issue_with_sort_fields(
+			"issue-2",
+			"PUB-102",
+			"In Review",
+			&[],
+			Some(3),
+			"2026-03-13T04:18:17.133Z",
+		);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![normal_issue.clone(), repair_issue.clone()],
+			vec![
+				vec![repair_issue.clone()],
+				vec![repair_issue.clone()],
+				vec![repair_issue.clone()],
+			],
+		);
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&repair_issue.identifier, false)
+			.expect("workspace should exist");
+		let head_oid = git_output(&workspace.path, &["rev-parse", "HEAD"]);
+		let pr_url = "https://github.com/hack-ink/maestro/pull/174";
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&repair_issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		state::write_review_handoff_marker(
+			&workspace.path,
+			&sample_review_handoff_marker(&workspace.branch_name, pr_url, &head_oid),
+		)
+		.expect("review handoff marker should write");
+
+		let inspector =
+			FakePullRequestReviewStateInspector::new(vec![Ok(sample_pull_request_review_state(
+				pr_url,
+				&workspace.branch_name,
+				&head_oid,
+				Some("CHANGES_REQUESTED"),
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			))]);
+		let selected = orchestrator::select_post_review_repair_issue_candidate_with_inspector(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&[],
+			&inspector,
+		)
+		.expect("post-review repair selection should succeed")
+		.expect("repair lane should be selected");
+
+		assert_eq!(selected.identifier, repair_issue.identifier);
+
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![repair_issue.clone()],
+			vec![vec![repair_issue.clone()], vec![repair_issue.clone()]],
+		);
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &repair_issue.id,
+			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
+			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::ReviewRepair,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})
+		.expect("targeted review-repair planning should succeed")
+		.expect("review-repair issue run should plan");
+
+		assert_eq!(summary.issue_identifier, repair_issue.identifier);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::ReviewRepair);
+		assert_eq!(summary.issue_state, "In Review");
 	}
 
 	#[test]
@@ -12312,6 +12981,43 @@ read_first = [{read_first}]
 				.is_some(),
 			"workspace mapping should be reconstructed from the retained lane"
 		);
+	}
+
+	#[test]
+	fn recover_runtime_state_recovers_fresh_review_repair_activity_marker() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker = FakeTracker::new(vec![issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&issue.identifier, false)
+			.expect("review-repair workspace should exist");
+
+		state::write_run_activity_marker(&workspace.path, "run-review-repair", 1)
+			.expect("fresh activity marker should write");
+
+		let recovered = orchestrator::recover_runtime_state_from_tracker_and_workspaces(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("runtime recovery should succeed");
+
+		assert!(
+			recovered.active_issues.is_empty(),
+			"fresh review-repair activity should rebuild the lease instead of requeueing the lane"
+		);
+
+		let lease = state_store
+			.lease_for_issue(&issue.id)
+			.expect("lease lookup should succeed")
+			.expect("fresh review-repair lane should rebuild its lease");
+
+		assert_eq!(lease.run_id(), "run-review-repair");
+		assert_eq!(lease.issue_state(), workflow.frontmatter().tracker().success_state());
 	}
 
 	#[test]
