@@ -213,7 +213,7 @@ impl<'a> TrackerToolBridge<'a> {
 	fn build_tool_specs(&self) -> Vec<DynamicToolSpec> {
 		let mut tool_specs = match self.review_context.as_ref().map(|context| context.mode) {
 			Some(ReviewExecutionMode::Repair) => self.comment_tool_specs(),
-			Some(ReviewExecutionMode::DeliveryCloseout) => self.comment_tool_specs(),
+			Some(ReviewExecutionMode::DeliveryCloseout) => self.delivery_closeout_base_tool_specs(),
 			Some(ReviewExecutionMode::Handoff) => {
 				let mut tool_specs = self.base_tool_specs();
 
@@ -243,6 +243,14 @@ impl<'a> TrackerToolBridge<'a> {
 	}
 
 	fn base_tool_specs(&self) -> Vec<DynamicToolSpec> {
+		let mut tool_specs = vec![self.transition_tool_spec()];
+
+		tool_specs.extend(self.comment_tool_specs());
+
+		tool_specs
+	}
+
+	fn delivery_closeout_base_tool_specs(&self) -> Vec<DynamicToolSpec> {
 		let mut tool_specs = vec![self.transition_tool_spec()];
 
 		tool_specs.extend(self.comment_tool_specs());
@@ -882,6 +890,14 @@ impl<'a> TrackerToolBridge<'a> {
 
 	fn allowed_transition_states(&self) -> Vec<&str> {
 		let tracker = self.workflow.frontmatter().tracker();
+
+		if matches!(
+			self.review_context.as_ref().map(|context| context.mode),
+			Some(ReviewExecutionMode::DeliveryCloseout)
+		) {
+			return tracker.resolved_completed_state().into_iter().collect();
+		}
+
 		let success_state = tracker.success_state();
 		let mut states = tracker
 			.startable_states()
@@ -3448,6 +3464,66 @@ Use the tracker tools.
 		assert!(tool_names.contains(&String::from(ISSUE_LABEL_ADD_TOOL_NAME)));
 		assert!(tool_names.contains(&String::from(ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME)));
 		assert!(tool_names.contains(&String::from(ISSUE_TERMINAL_FINALIZE_TOOL_NAME)));
+	}
+
+	#[test]
+	fn delivery_closeout_tool_surface_includes_issue_transition_for_completed_state() {
+		let mut issue = sample_review_issue();
+
+		issue
+			.team
+			.states
+			.push(TrackerState { id: String::from("state-done"), name: String::from("Done") });
+
+		let tracker = tracker_with_current_issue_snapshot(&issue);
+		let workflow = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "maestro"
+startable_states = ["Todo"]
+in_progress_state = "In Progress"
+success_state = "In Review"
+failure_state = "Todo"
+terminal_states = ["Done", "Canceled"]
+opt_out_label = "maestro:manual-only"
+needs_attention_label = "maestro:needs-attention"
++++
+
+Use the tracker tools.
+"#,
+		)
+		.expect("workflow should parse");
+		let pr_url = "https://github.com/helixbox/maestro/pull/260";
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let bridge = TrackerToolBridge::with_run_context(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_delivery_closeout_context_in(temp_dir.path(), pr_url),
+		);
+		let tool_names = DynamicToolHandler::tool_specs(&bridge)
+			.into_iter()
+			.map(|tool| tool.name)
+			.collect::<Vec<_>>();
+		let transition_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "Done" }),
+		);
+		let invalid_transition_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "In Progress" }),
+		);
+
+		assert!(tool_names.contains(&String::from(ISSUE_TRANSITION_TOOL_NAME)));
+		assert!(transition_response.success);
+		assert!(!invalid_transition_response.success);
+		assert_eq!(tracker.state_updates.borrow().as_slice(), [String::from("state-done")]);
 	}
 
 	#[test]

@@ -1860,9 +1860,16 @@ fn issue_passes_post_review_retention_policy(
 	issue: &TrackerIssue,
 	retry_project_slug: &str,
 	workflow: &WorkflowDocument,
+	dispatch_mode: IssueDispatchMode,
 ) -> bool {
 	issue.project_slug.as_deref() == Some(retry_project_slug)
-		&& issue_passes_review_repair_dispatch_policy(issue, workflow)
+		&& match dispatch_mode {
+			IssueDispatchMode::ReviewRepair =>
+				issue_passes_review_repair_dispatch_policy(issue, workflow),
+			IssueDispatchMode::DeliveryCloseout =>
+				issue_passes_delivery_closeout_dispatch_policy(issue, workflow),
+			_ => false,
+		}
 }
 
 fn issue_passes_retry_entry_retention_policy(
@@ -1880,6 +1887,7 @@ fn issue_passes_retry_entry_retention_policy(
 			issue,
 			&entry.retry_project_slug,
 			workflow,
+			entry.dispatch_mode,
 		));
 	}
 
@@ -1972,7 +1980,12 @@ where
 		dispatch_mode,
 		IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
 	) {
-		issue_passes_post_review_retention_policy(&issue, retry_project_slug, context.workflow)
+		issue_passes_post_review_retention_policy(
+			&issue,
+			retry_project_slug,
+			context.workflow,
+			dispatch_mode,
+		)
 	} else {
 		let preferred_issue_state = continuation_pending
 			.then_some(context.workflow.frontmatter().tracker().in_progress_state());
@@ -3887,7 +3900,13 @@ fn issue_passes_delivery_closeout_dispatch_policy(
 	issue: &TrackerIssue,
 	workflow: &WorkflowDocument,
 ) -> bool {
-	issue_passes_review_repair_dispatch_policy(issue, workflow)
+	let tracker_policy = workflow.frontmatter().tracker();
+	let completed_state = tracker_policy.resolved_completed_state();
+	let issue_state = issue.state.name.as_str();
+
+	(issue_state == tracker_policy.success_state() || Some(issue_state) == completed_state)
+		&& !issue.has_label(tracker_policy.opt_out_label())
+		&& !issue.has_label(tracker_policy.needs_attention_label())
 }
 
 fn issue_passes_retry_dispatch_policy(
@@ -4114,16 +4133,7 @@ fn cleanup_completed_post_review_lane(
 	let workspace_manager =
 		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
 
-	if let Err(error) =
-		delete_remote_branch_if_present(&issue_run.workspace.path, &issue_run.workspace.branch_name)
-	{
-		tracing::warn!(
-			issue = issue_run.issue.identifier,
-			branch = issue_run.workspace.branch_name,
-			error = %error,
-			"Failed to delete retained remote branch during post-review cleanup; continuing with local workspace removal."
-		);
-	}
+	delete_remote_branch_if_present(&issue_run.workspace.path, &issue_run.workspace.branch_name)?;
 
 	cleanup_terminal_workspace(
 		state_store,
@@ -5078,7 +5088,7 @@ where
 			&workspace.path.display().to_string(),
 		)?;
 
-		if issue_passes_review_repair_dispatch_policy(&issue, workflow) {
+		if issue_passes_delivery_closeout_dispatch_policy(&issue, workflow) {
 			match state::read_run_activity_marker_snapshot(&workspace.path)? {
 				Some(marker) if workspace_activity_marker_is_fresh(&marker, now_unix_epoch) => {
 					state_store.record_run_attempt(
@@ -6892,6 +6902,48 @@ max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
 			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
 
 		assert_eq!(entry.dispatch_mode, orchestrator::IssueDispatchMode::ReviewRepair);
+		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
+	fn schedule_retry_after_child_exit_records_failure_retry_for_delivery_closeout_issue_after_tracker_completion()
+	 {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Done", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-delivery-closeout";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "failed")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			"In Review",
+			orchestrator::IssueDispatchMode::DeliveryCloseout,
+			exit_status,
+		)
+		.expect("delivery-closeout failure retry should schedule after tracker completion");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.dispatch_mode, orchestrator::IssueDispatchMode::DeliveryCloseout);
 		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
 		assert_eq!(entry.attempt, 1);
 	}
@@ -13315,6 +13367,99 @@ Custom workflow.
 				.expect("workspace lookup should succeed")
 				.is_none(),
 			"terminal mapping should be cleared after cleanup"
+		);
+	}
+
+	#[test]
+	fn cleanup_completed_post_review_lane_preserves_workspace_when_remote_delete_fails() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+		let issue = sample_issue("Done", &[]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let remote_root =
+			config.repo_root().parent().expect("repo root should have a parent").join("origin.git");
+
+		assert!(
+			Command::new("git")
+				.args(["init", "--bare"])
+				.arg(&remote_root)
+				.status()
+				.expect("git init --bare should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(&remote_root)
+				.args(["config", "receive.denyDeletes", "true"])
+				.status()
+				.expect("git config should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(config.repo_root())
+				.args(["remote", "add", "origin", remote_root.to_string_lossy().as_ref()])
+				.status()
+				.expect("git remote add should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(config.repo_root())
+				.args(["push", "-u", "origin", "main"])
+				.status()
+				.expect("git push should run")
+				.success()
+		);
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				"main",
+				&config.repo_root().display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			issue_state: issue.state.name.clone(),
+			initial_issue_state: String::from("In Review"),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("main"),
+				issue_identifier: issue.identifier.clone(),
+				path: config.repo_root().to_path_buf(),
+				reused_existing: true,
+			},
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::DeliveryCloseout,
+			attempt_number: 1,
+			run_id: String::from("run-delivery-closeout-cleanup"),
+			retry_budget_base: 0,
+		};
+		let error =
+			orchestrator::cleanup_completed_post_review_lane(&config, &state_store, &issue_run)
+				.expect_err("remote branch delete failures must stop cleanup");
+
+		assert!(
+			error.to_string().contains("Failed to delete retained remote branch"),
+			"cleanup should surface the remote delete failure"
+		);
+		assert!(
+			config.repo_root().exists(),
+			"cleanup must preserve the retained workspace when remote delete fails"
+		);
+		assert!(
+			state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace lookup should succeed")
+				.is_some(),
+			"workspace mapping must remain so cleanup can retry later"
 		);
 	}
 
