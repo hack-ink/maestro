@@ -479,7 +479,7 @@ fn default_max_concurrent_agents() -> u32 {
 }
 
 fn default_read_first() -> Vec<String> {
-	vec![String::from("AGENTS.md")]
+	Vec::new()
 }
 
 #[cfg(test)]
@@ -510,7 +510,7 @@ max_concurrent_agents_by_state = { "In Progress" = 1 }
 validation_commands = ["cargo make test"]
 +++
 
-Read `AGENTS.md` first.
+Start with the repo's documented routing entrypoint when one exists.
 Use `cargo make`.
 			"#,
 		)
@@ -527,7 +527,10 @@ Use `cargo make`.
 			document.frontmatter().execution().state_concurrency_limit("In Progress"),
 			Some(1)
 		);
-		assert_eq!(document.body(), "Read `AGENTS.md` first.\nUse `cargo make`.");
+		assert_eq!(
+			document.body(),
+			"Start with the repo's documented routing entrypoint when one exists.\nUse `cargo make`."
+		);
 	}
 
 	#[test]
@@ -545,7 +548,7 @@ provider = "linear"
 project_slug = "pubfi"
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		)
 		.expect("workflow document should be written");
@@ -570,7 +573,7 @@ terminal_states = ["Released", "Canceled"]
 completed_state = "Released"
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		)
 		.expect("workflow document should parse");
@@ -592,7 +595,7 @@ project_slug = "pubfi"
 terminal_states = ["Done", "Canceled", "Duplicate"]
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		)
 		.expect("workflow document should parse");
@@ -614,7 +617,7 @@ project_slug = "pubfi"
 terminal_states = ["Released", "Canceled"]
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		)
 		.expect("workflow document should parse without a resolved completed_state");
@@ -637,7 +640,7 @@ terminal_states = ["Released", "Canceled"]
 completed_state = "Done"
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		);
 		let error = result.expect_err("completed_state must belong to terminal_states");
@@ -661,7 +664,7 @@ provider = "linear"
 project = "pubfi"
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		);
 		let error = result.expect_err("legacy `project` key should be rejected");
@@ -682,7 +685,7 @@ project_slug = "pubfi"
 project = "legacy-pubfi"
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 			"#,
 		);
 		let error =
@@ -693,7 +696,7 @@ Read `AGENTS.md` first.
 
 	#[test]
 	fn rejects_missing_frontmatter() {
-		let result = WorkflowDocument::parse_markdown("Read `AGENTS.md` first.");
+		let result = WorkflowDocument::parse_markdown("Read the repo policy first.");
 
 		assert!(result.is_err());
 	}
@@ -721,10 +724,10 @@ max_retry_backoff_ms = 120000
 validation_commands = ["cargo make test"]
 
 [context]
-read_first = ["AGENTS.md", "README.md"]
+read_first = ["docs/index.md", "README.md"]
 +++
 
-Read `AGENTS.md` first.
+Read the repo policy first.
 Then validate the lane.
 			"#,
 		)

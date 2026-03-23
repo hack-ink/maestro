@@ -41,7 +41,6 @@ For the recommended first deployment, keep the live local config at `tmp/maestro
   tmp/maestro.toml
 
 /path/to/hack-ink/maestro/
-  AGENTS.md
   WORKFLOW.md
 
 /path/to/hack-ink/maestro/.workspaces/
@@ -103,7 +102,7 @@ At minimum, the target repo should define:
 - `[agent]` policy such as sandbox and approval mode
 - `[execution] max_attempts`
 - `[execution] max_retry_backoff_ms`
-- `[context] read_first = ["AGENTS.md"]` if repo policy should be loaded into issue-scoped instructions without relying on raw workflow-body inlining
+- optional `[context] read_first = [...]` only when the repo truly needs extra repo-local files loaded in addition to the `WORKFLOW.md` body; treat this as a Maestro-local extension, not as the primary policy surface
 
 The target Linear team should also expose:
 

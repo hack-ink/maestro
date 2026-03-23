@@ -7,6 +7,7 @@ The split below is by question type, not by human-versus-agent audience.
 
 ## Read order
 
+- Use `cargo make` whenever an equivalent repo task exists. When task details matter, inspect `Makefile.toml` directly or run `cargo make --list-all-steps`.
 - Read `docs/governance.md` for document contracts and placement rules.
 - Read `Makefile.toml` when the task depends on repo task names or execution entrypoints.
 - Then choose one primary lane:
