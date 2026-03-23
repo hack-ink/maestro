@@ -4100,15 +4100,15 @@ fn build_developer_instructions(
 	};
 	let mut sections = Vec::new();
 
+	if !workflow.body().trim().is_empty() {
+		sections.push(format!("Workflow policy\n{}", workflow.body()));
+	}
+
 	for relative_path in workflow.frontmatter().context().read_first() {
 		let absolute_path = project.repo_root().join(relative_path);
 		let contents = fs::read_to_string(&absolute_path)?;
 
 		sections.push(format!("File: {relative_path}\n{contents}"));
-	}
-
-	if !workflow.body().trim().is_empty() {
-		sections.push(format!("Workflow policy\n{}", workflow.body()));
 	}
 
 	sections.push(String::from(
@@ -6302,18 +6302,20 @@ max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
 		} else {
 			""
 		};
-		let mut sections = read_first_files
-			.iter()
-			.map(|(relative_path, contents)| format!("File: {relative_path}\n{contents}"))
-			.collect::<Vec<_>>();
+		let mut sections = Vec::new();
 
 		if !workflow.body().trim().is_empty() {
 			sections.push(format!("Workflow policy\n{}", workflow.body()));
 		}
 
+		sections.extend(
+			read_first_files
+				.iter()
+				.map(|(relative_path, contents)| format!("File: {relative_path}\n{contents}")),
+		);
 		sections.push(String::from(
-			"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
-		));
+				"Execution discipline\n- Keep pre-edit discovery bounded to the smallest code surface that can satisfy the current issue.\n- Start with the implementation files directly implicated by the issue before reading broader docs or repo-wide guidance.\n- Do not browse upstream references or general repository documentation unless a concrete ambiguity blocks the change.\n- Once the relevant change surface is identified, patch code and run validation instead of continuing broad searches.",
+			));
 
 		sections.push(format!(
 			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}`.\n- At the start of execution, call `{transition_tool}` to move the issue to `{in_progress}` and add a brief `{comment_tool}` comment that you started work on run `{run_id}` attempt `{attempt}`.\n- When the implementation is ready, commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- After the PR is ready, call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not move the issue directly to `{success}` with `{transition_tool}`. `maestro` will complete the success writeback only after its own validation passes.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",

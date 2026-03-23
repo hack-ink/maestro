@@ -15,7 +15,7 @@ Defines: The file location, parse model, supported frontmatter structure, and th
 
 - `WORKFLOW.md` consists of TOML frontmatter followed by Markdown body text.
 - The TOML frontmatter delimiter is `+++`.
-- The Markdown body is human-readable policy text that `maestro` may append to developer instructions.
+- The Markdown body is the primary repository-owned policy and prompt body that `maestro` injects into developer instructions.
 - The frontmatter is the only machine-readable section of the file.
 
 ## Daemon reload semantics
@@ -29,6 +29,8 @@ Defines: The file location, parse model, supported frontmatter structure, and th
 
 - Upstream Symphony examples use YAML frontmatter. `maestro` intentionally uses TOML frontmatter instead.
 - This divergence is deliberate and stable. Do not translate back to YAML only for stylistic upstream parity.
+- Upstream Symphony treats the `WORKFLOW.md` body as the primary repo-owned prompt and policy surface. `maestro` follows that model.
+- `maestro` also supports `[context].read_first` as an optional local extension for extra repo-local context files. This extra-context surface is not part of the upstream Symphony spec and must not replace the primary `WORKFLOW.md` body.
 
 ## Required top-level fields
 
@@ -163,7 +165,7 @@ Supported keys:
 
 ## `[context]`
 
-Purpose: Define additional repo-local context files that `maestro` should load early.
+Purpose: Define optional additional repo-local context files that `maestro` should load alongside the primary `WORKFLOW.md` body.
 
 Supported keys:
 
@@ -226,8 +228,8 @@ Use the issue-scoped tracker tools autonomously when tracker updates are require
 ## Body semantics
 
 - The Markdown body is repository policy text.
-- Issue-scoped developer instructions should include the `WORKFLOW.md` body plus the explicit tracker tool contract by default.
+- Issue-scoped developer instructions should include the `WORKFLOW.md` body first, then any optional `context.read_first` files, then the explicit tracker tool contract.
 - The body should contain durable repo rules, not ephemeral run notes.
 - The body should instruct the coding agent to use the issue-scoped tracker tools autonomously when tracker writes are part of the repo workflow.
-- `context.read_first` defaults to empty and should be reserved for optional extra repo-local files beyond the `WORKFLOW.md` body.
+- `context.read_first` defaults to empty and should be reserved for optional extra repo-local files beyond the primary `WORKFLOW.md` body.
 - If the repository expects PR-backed review handoff, the body should state that the lane must produce a reviewable PR before the success state can be reached.

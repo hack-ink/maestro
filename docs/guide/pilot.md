@@ -102,7 +102,7 @@ At minimum, the target repo should define:
 - `[agent]` policy such as sandbox and approval mode
 - `[execution] max_attempts`
 - `[execution] max_retry_backoff_ms`
-- optional `[context] read_first = [...]` only when the repo truly needs extra repo-local files loaded in addition to the `WORKFLOW.md` body
+- optional `[context] read_first = [...]` only when the repo truly needs extra repo-local files loaded in addition to the `WORKFLOW.md` body; treat this as a Maestro-local extension, not as the primary policy surface
 
 The target Linear team should also expose:
 

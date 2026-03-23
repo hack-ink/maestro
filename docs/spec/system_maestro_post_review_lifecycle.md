@@ -14,7 +14,7 @@ Defines: Post-`In Review` lane phases, phase-to-action-class mapping, authoritat
   - workflow policy stays repository-owned
   - a successful worker run may end at a workflow-defined handoff state rather than `Done`
   - operator-visible observability and explicit trust posture remain runtime concerns
-- Repo-local files referenced through `WORKFLOW.md [context.read_first]` and the checked-in workflow skills are local execution constraints and adapter surfaces. They are not the core domain model of this lifecycle.
+- Maestro-local extensions such as `WORKFLOW.md [context.read_first]` and the checked-in workflow skills are local execution constraints and adapter surfaces. They are not the core domain model of this lifecycle, and they do not replace the primary `WORKFLOW.md` body defined by Symphony.
 
 ## Relationship to other specs
 

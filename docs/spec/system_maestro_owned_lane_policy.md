@@ -15,7 +15,7 @@ Defines: The stable decision classes, authoritative signals, human-handoff bound
   - execution happens in isolated per-issue workspaces
   - workflow policy is repository-owned
   - observability and trust posture are explicit runtime concerns
-- Repo-local files referenced through `WORKFLOW.md [context.read_first]` and the installed workflow skills are execution-context inputs for a compliant Maestro implementation. They are not the core domain model of this policy.
+- Maestro-local extensions such as `WORKFLOW.md [context.read_first]` and the installed workflow skills are execution-context inputs for a compliant implementation. They are not the core domain model of this policy, and they do not replace the primary `WORKFLOW.md` body defined by Symphony.
 
 ## Scope
 
