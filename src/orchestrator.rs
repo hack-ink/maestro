@@ -6,7 +6,7 @@ use std::{
 	error::Error,
 	fmt::{self, Display, Formatter},
 	fs::{self, File},
-	io::{ErrorKind, Read as _, Write as _},
+	io::{ErrorKind, Read as _, Write},
 	net::{SocketAddr, TcpListener, TcpStream},
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
@@ -54,6 +54,8 @@ const CONTINUATION_PENDING_RUN_STATUS: &str = "continuation_pending";
 const TERMINAL_GUARDED_RUN_STATUS: &str = "terminal_guarded";
 const TERMINAL_GUARD_MARKER_FILE: &str = ".maestro-terminal-guarded";
 const OPERATOR_STATE_ENDPOINT_PATH: &str = "/state";
+const OPERATOR_STATE_MAX_REQUEST_BYTES: usize = 8_192;
+const OPERATOR_STATE_HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 const PULL_REQUEST_REVIEW_STATE_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: String) {
   repository(owner: $owner, name: $name) {
@@ -1127,17 +1129,43 @@ fn handle_operator_state_endpoint_connection(
 	stream.set_read_timeout(Some(Duration::from_millis(250)))?;
 	stream.set_write_timeout(Some(Duration::from_millis(250)))?;
 
-	let mut buffer = [0_u8; 4_096];
-	let bytes_read = stream.read(&mut buffer)?;
+	let request = read_operator_state_request_headers(&mut stream)?;
 	let body = snapshot_json
 		.lock()
 		.map_err(|error| eyre::eyre!("Operator state snapshot lock poisoned: {error}"))?
 		.clone();
-	let response = build_operator_state_http_response(&buffer[..bytes_read], body.as_deref())?;
+	let response = build_operator_state_http_response(&request, body.as_deref())?;
 
 	stream.write_all(&response)?;
 
 	Ok(())
+}
+
+fn read_operator_state_request_headers(stream: &mut TcpStream) -> crate::prelude::Result<Vec<u8>> {
+	let mut request = Vec::with_capacity(1_024);
+
+	loop {
+		if request
+			.windows(OPERATOR_STATE_HEADER_TERMINATOR.len())
+			.any(|window| window == OPERATOR_STATE_HEADER_TERMINATOR)
+		{
+			return Ok(request);
+		}
+		if request.len() >= OPERATOR_STATE_MAX_REQUEST_BYTES {
+			eyre::bail!("Operator state endpoint request headers exceeded the size limit.");
+		}
+
+		let mut buffer = [0_u8; 1_024];
+
+		match stream.read(&mut buffer) {
+			Ok(0) => return Ok(request),
+			Ok(bytes_read) => request.extend_from_slice(&buffer[..bytes_read]),
+			Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+				eyre::bail!("Timed out while reading operator state endpoint request headers.");
+			},
+			Err(error) => return Err(error.into()),
+		}
+	}
 }
 
 fn build_operator_state_http_response(
@@ -5905,8 +5933,11 @@ mod tests {
 	use std::{
 		cell::RefCell,
 		env, fs,
+		io::{Read as _, Write},
+		net::{Shutdown, TcpListener, TcpStream},
 		path::{Path, PathBuf},
 		process::{self, Command},
+		sync::{Arc, Mutex},
 		thread,
 		time::{Duration, Instant},
 	};
@@ -9967,6 +9998,36 @@ Custom workflow.
 		assert_eq!(served_snapshot["active_runs"][0]["run_id"], "run-1");
 		assert_eq!(served_snapshot["active_runs"][0]["phase"], "executing");
 		assert_eq!(served_snapshot["workspaces"][0]["workspace_path"], "workspaces/PUB-101");
+	}
+
+	#[test]
+	fn operator_state_endpoint_reads_complete_headers_before_parsing() {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+		let address = listener.local_addr().expect("listener address should resolve");
+		let snapshot_json = Arc::new(Mutex::new(Some(br#"{"status":"ok"}"#.to_vec())));
+		let server_snapshot_json = Arc::clone(&snapshot_json);
+		let server = thread::spawn(move || {
+			let (stream, _) = listener.accept().expect("listener should accept a connection");
+
+			orchestrator::handle_operator_state_endpoint_connection(stream, &server_snapshot_json)
+				.expect("handler should accept segmented headers");
+		});
+		let mut client = TcpStream::connect(address).expect("client should connect");
+		let mut response = String::new();
+
+		client.write_all(b"GET /st").expect("client should write first request fragment");
+
+		thread::sleep(Duration::from_millis(10));
+
+		client
+			.write_all(b"ate HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			.expect("client should write second request fragment");
+		client.shutdown(Shutdown::Write).expect("client should close the request body stream");
+		client.read_to_string(&mut response).expect("client should read response");
+		server.join().expect("server thread should complete");
+
+		assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+		assert!(response.ends_with("{\"status\":\"ok\"}"));
 	}
 
 	#[test]
