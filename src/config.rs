@@ -2,7 +2,6 @@
 
 use std::{
 	env, fs,
-	net::ToSocketAddrs,
 	path::{Path, PathBuf},
 };
 
@@ -187,9 +186,6 @@ impl ProjectOperatorHttpConfig {
 		if trimmed != self.listen_address {
 			eyre::bail!("`operator_http.listen_address` must not include surrounding whitespace.");
 		}
-		if trimmed.to_socket_addrs().is_err() {
-			eyre::bail!("`operator_http.listen_address` must resolve to a valid socket address.");
-		}
 
 		Ok(())
 	}
@@ -350,6 +346,30 @@ mod tests {
 		assert_eq!(
 			config.operator_http().map(|operator_http| operator_http.listen_address()),
 			Some("127.0.0.1:8900")
+		);
+	}
+
+	#[test]
+	fn accepts_hostname_operator_http_listener_without_dns_lookup() {
+		let config = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[operator_http]
+				listen_address = "example.invalid:8900"
+			"#,
+		)
+		.expect("hostname listener should parse without resolving DNS");
+
+		assert_eq!(
+			config.operator_http().map(|operator_http| operator_http.listen_address()),
+			Some("example.invalid:8900")
 		);
 	}
 
