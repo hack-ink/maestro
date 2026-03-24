@@ -111,7 +111,6 @@ The MVP thread start request owns these fields:
 - `approvalPolicy`
 - `sandbox`
 - `developerInstructions`
-- `model` when configured
 - `personality` when configured
 - `serviceTier` when configured
 
@@ -132,9 +131,7 @@ The MVP turn start request owns these fields:
 
 - `threadId`
 - `input`
-- optional overrides for `cwd`, `approvalPolicy`, `effort`, `model`, `personality`, `serviceTier`, and sandbox policy when the run needs turn-level overrides
-
-`maestro` should send an explicit supported `effort` value instead of inheriting a potentially incompatible desktop default from the parent Codex runtime.
+- optional overrides for `cwd`, `approvalPolicy`, `personality`, `serviceTier`, and sandbox policy when the run needs turn-level overrides
 
 `TurnStartResponse` returns the accepted turn object.
 

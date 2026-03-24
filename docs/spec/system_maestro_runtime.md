@@ -147,7 +147,6 @@ Required run-start comment fields:
 - `started_at`
 - `workspace_path` as a repository-relative lane path such as `.workspaces/PUB-606`
 - `transport`
-- `model` when configured
 
 ### Completion disposition
 

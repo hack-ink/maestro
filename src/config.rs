@@ -144,19 +144,14 @@ impl ProjectGitHubConfig {
 
 /// Project-level agent defaults from service configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectAgentConfig {
 	transport: Option<String>,
-	model: Option<String>,
 }
 impl ProjectAgentConfig {
 	/// Optional app-server transport override for this project.
 	pub fn transport(&self) -> Option<&str> {
 		self.transport.as_deref()
-	}
-
-	/// Optional default model override for this project.
-	pub fn model(&self) -> Option<&str> {
-		self.model.as_deref()
 	}
 }
 
@@ -236,7 +231,6 @@ mod tests {
 
 				[agent]
 				transport = "stdio://"
-				model = "gpt-5-codex"
 			"#,
 		)
 		.expect("service config should parse");
@@ -245,7 +239,7 @@ mod tests {
 		assert_eq!(config.workflow_path(), Path::new("WORKFLOW.md"));
 		assert_eq!(config.tracker().project_slug(), "pubfi");
 		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
-		assert_eq!(config.agent().model(), Some("gpt-5-codex"));
+		assert_eq!(config.agent().transport(), Some("stdio://"));
 	}
 
 	#[test]
@@ -426,6 +420,28 @@ mod tests {
 		.expect("service config should parse");
 
 		assert_eq!(config.github().token_env_var(), None);
+	}
+
+	#[test]
+	fn rejects_legacy_agent_model_field() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[agent]
+				transport = "stdio://"
+				model = "gpt-5.4"
+			"#,
+		);
+		let error = result.expect_err("legacy `agent.model` key should be rejected");
+
+		assert!(error.to_string().contains("unknown field `model`"));
 	}
 
 	#[test]

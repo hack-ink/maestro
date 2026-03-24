@@ -75,7 +75,6 @@ token_env_var = "GITHUB_TOKEN"
 
 [agent]
 transport = "stdio://"
-model = "gpt-5-codex"
 ```
 
 Notes:
@@ -84,7 +83,7 @@ Notes:
 - `workspace_root` is where `maestro` creates per-issue clone-backed workspaces. For the first pilot, use a repo-local path such as `.workspaces`.
 - `workflow_path` is repository-relative and defaults to `WORKFLOW.md`.
 - `transport` is optional and defaults to `stdio://`.
-- `model` is optional. If present, it is passed through to `app-server` and recorded in the run-start Linear comment.
+- Maestro does not expose repo-local model or reasoning overrides. `codex app-server` inherits those defaults from `~/.codex/config.toml`.
 - `api_key_env_var` is required and must name the environment variable that stores the Linear API token.
 - `github.token_env_var` is required for PR-backed review handoff validation and post-review PR-state inspection and must name the environment variable that stores the GitHub token.
 - The recommended current tracker scope is the bounded `Maestro Pilot Ops Hardening` project in hackink Linear.

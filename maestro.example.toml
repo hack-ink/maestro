@@ -11,5 +11,4 @@ project_slug    = "1a216b6d7100"
 token_env_var = "GITHUB_TOKEN"
 
 [agent]
-model     = "gpt-5-codex"
 transport = "stdio://"

@@ -28,7 +28,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_RUN_ID: &str = "protocol-probe-run";
 const PROBE_ISSUE_ID: &str = "protocol-probe";
 const PROBE_EXPECTED_OUTPUT: &str = "PROBE_OK";
-const DEFAULT_TURN_EFFORT: &str = "high";
 const PROBE_DEVELOPER_INSTRUCTIONS: &str = "You are a protocol probe. You must call the dynamic tool `echo_probe` exactly once with the JSON argument `{\"text\":\"PROBE_OK\"}`. Do not use shell. Do not inspect files. After the tool response is returned, reply with the exact text PROBE_OK and nothing else.";
 const PROBE_USER_INPUT: &str = "Call `echo_probe` with `{\\\"text\\\":\\\"PROBE_OK\\\"}`. After the tool succeeds, reply with the exact text PROBE_OK.";
 
@@ -50,7 +49,6 @@ pub(crate) struct AppServerRunRequest<'a> {
 	pub(crate) sandbox: String,
 	pub(crate) developer_instructions: String,
 	pub(crate) user_input: String,
-	pub(crate) model: Option<String>,
 	pub(crate) personality: Option<String>,
 	pub(crate) service_tier: Option<String>,
 	pub(crate) max_turns: u32,
@@ -216,8 +214,6 @@ struct ThreadStartRequest {
 	developer_instructions: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	ephemeral: Option<bool>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	model: Option<String>,
 	#[serde(rename = "modelProvider", skip_serializing_if = "Option::is_none")]
 	model_provider: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -246,11 +242,7 @@ struct TurnStartRequest {
 	approval_policy: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	cwd: Option<String>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	effort: Option<String>,
 	input: Vec<UserInput>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	model: Option<String>,
 	#[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
 	output_schema: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -419,7 +411,6 @@ pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
 			sandbox: String::from("workspace-write"),
 			developer_instructions: PROBE_DEVELOPER_INSTRUCTIONS.to_owned(),
 			user_input: PROBE_USER_INPUT.to_owned(),
-			model: None,
 			personality: None,
 			service_tier: None,
 			max_turns: 1,
@@ -494,7 +485,6 @@ fn execute_app_server_run_inner(
 		dynamic_tools: request.dynamic_tool_handler.map(|handler| handler.tool_specs()),
 		approval_policy: Some(request.approval_policy.clone()),
 		developer_instructions: Some(request.developer_instructions.clone()),
-		model: request.model.clone(),
 		personality: request.personality.clone(),
 		sandbox: Some(request.sandbox.clone()),
 		service_tier: request.service_tier.clone().map(Value::String),
@@ -622,7 +612,6 @@ fn continuation_boundary_reached(
 fn build_turn_start_request(thread_id: &str, user_input: &str) -> TurnStartRequest {
 	TurnStartRequest {
 		thread_id: thread_id.to_owned(),
-		effort: Some(String::from(DEFAULT_TURN_EFFORT)),
 		input: vec![UserInput::Text { text: user_input.to_owned() }],
 		..TurnStartRequest::default()
 	}
@@ -1007,11 +996,10 @@ mod tests {
 	}
 
 	#[test]
-	fn turn_start_request_uses_supported_effort() {
+	fn turn_start_request_uses_default_runtime_settings() {
 		let request = super::build_turn_start_request("thread-1", "hello");
 
 		assert_eq!(request.thread_id, "thread-1");
-		assert_eq!(request.effort.as_deref(), Some(super::DEFAULT_TURN_EFFORT));
 		assert!(matches!(
 			request.input.as_slice(),
 			[super::UserInput::Text { text }] if text == "hello"

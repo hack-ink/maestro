@@ -222,6 +222,7 @@ pub enum TrackerProvider {
 
 /// Repo-local agent defaults.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowAgent {
 	#[serde(default = "default_transport")]
 	transport: String,
@@ -229,7 +230,6 @@ pub struct WorkflowAgent {
 	sandbox: String,
 	#[serde(default = "default_approval_policy")]
 	approval_policy: String,
-	model: Option<String>,
 	personality: Option<String>,
 	service_tier: Option<String>,
 }
@@ -249,11 +249,6 @@ impl WorkflowAgent {
 		&self.approval_policy
 	}
 
-	/// Optional model override.
-	pub fn model(&self) -> Option<&str> {
-		self.model.as_deref()
-	}
-
 	/// Optional personality override.
 	pub fn personality(&self) -> Option<&str> {
 		self.personality.as_deref()
@@ -271,7 +266,6 @@ impl Default for WorkflowAgent {
 			transport: default_transport(),
 			sandbox: default_sandbox(),
 			approval_policy: default_approval_policy(),
-			model: None,
 			personality: None,
 			service_tier: None,
 		}
@@ -692,6 +686,30 @@ Read the repo policy first.
 			result.expect_err("legacy `project` key should be rejected even with `project_slug`");
 
 		assert!(error.to_string().contains("unknown field `project`"));
+	}
+
+	#[test]
+	fn rejects_legacy_agent_model_field() {
+		let result = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+
+[agent]
+transport = "stdio://"
+model = "gpt-5.4"
++++
+
+Read the repo policy first.
+			"#,
+		);
+		let error = result.expect_err("legacy `agent.model` key should be rejected");
+
+		assert!(error.to_string().contains("unknown field `model`"));
 	}
 
 	#[test]
