@@ -62,6 +62,7 @@ enum RunIssueDispatchMode {
 	Normal,
 	Retry,
 	ReviewRepair,
+	DeliveryCloseout,
 }
 impl From<RunIssueDispatchMode> for IssueDispatchMode {
 	fn from(value: RunIssueDispatchMode) -> Self {
@@ -69,6 +70,7 @@ impl From<RunIssueDispatchMode> for IssueDispatchMode {
 			RunIssueDispatchMode::Normal => Self::Normal,
 			RunIssueDispatchMode::Retry => Self::Retry,
 			RunIssueDispatchMode::ReviewRepair => Self::ReviewRepair,
+			RunIssueDispatchMode::DeliveryCloseout => Self::DeliveryCloseout,
 		}
 	}
 }

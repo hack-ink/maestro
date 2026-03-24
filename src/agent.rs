@@ -9,7 +9,8 @@ pub(crate) use self::{
 		execute_app_server_run, probe_app_server,
 	},
 	tracker_tool_bridge::{
-		ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		ISSUE_COMMENT_TOOL_NAME, ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
+		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 		ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 		ISSUE_TRANSITION_TOOL_NAME, ReviewExecutionMode, ReviewHandoffContext,
 		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,

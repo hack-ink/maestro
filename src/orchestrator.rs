@@ -21,7 +21,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
 	agent::{
 		self, ACTIVE_RUN_IDLE_TIMEOUT, AppServerRunRequest, AppServerRunResult,
-		ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		ISSUE_COMMENT_TOOL_NAME, ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
+		ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 		ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 		ISSUE_TRANSITION_TOOL_NAME, ReviewExecutionMode, ReviewHandoffContext,
 		ReviewHandoffWritebackFailed, RunCompletionDisposition, TrackerToolBridge,
@@ -224,7 +225,10 @@ where
 		};
 		let tracker_policy = self.workflow.frontmatter().tracker();
 
-		if self.dispatch_mode == IssueDispatchMode::ReviewRepair {
+		if matches!(
+			self.dispatch_mode,
+			IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
+		) {
 			return Ok(issue.project_slug.as_deref() == Some(self.retry_project_slug)
 				&& issue.state.name == tracker_policy.success_state()
 				&& !issue.has_label(tracker_policy.opt_out_label())
@@ -251,7 +255,10 @@ where
 	}
 
 	fn validate_continuation_boundary(&self, turn_count: u32) -> crate::prelude::Result<()> {
-		if self.dispatch_mode == IssueDispatchMode::ReviewRepair {
+		if matches!(
+			self.dispatch_mode,
+			IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
+		) {
 			let Some(issue) = refresh_issue(self.tracker, self.issue_id)? else {
 				return Ok(());
 			};
@@ -265,11 +272,18 @@ where
 				return Ok(());
 			}
 
+			let mode_description = match self.dispatch_mode {
+				IssueDispatchMode::ReviewRepair => "retained review-repair",
+				IssueDispatchMode::DeliveryCloseout => "retained delivery-closeout",
+				_ => "retained post-review",
+			};
+
 			eyre::bail!(
-				"Turn {} for issue `{}` ended without keeping the tracker issue in `{}`; a clean retained review-repair continuation boundary is only valid while the lane remains in review.",
+				"Turn {} for issue `{}` ended without keeping the tracker issue in `{}`; a clean {} continuation boundary is only valid while the lane remains in its retained post-review state.",
 				turn_count,
 				self.issue_identifier,
-				tracker_policy.success_state()
+				tracker_policy.success_state(),
+				mode_description,
 			);
 		}
 		if turn_count != 1 {
@@ -780,6 +794,7 @@ pub(crate) enum IssueDispatchMode {
 	Normal,
 	Retry,
 	ReviewRepair,
+	DeliveryCloseout,
 }
 impl IssueDispatchMode {
 	fn allows_issue(
@@ -802,6 +817,8 @@ impl IssueDispatchMode {
 				hint,
 			),
 			Self::ReviewRepair => Ok(issue_passes_review_repair_dispatch_policy(issue, workflow)),
+			Self::DeliveryCloseout =>
+				Ok(issue_passes_delivery_closeout_dispatch_policy(issue, workflow)),
 		}
 	}
 }
@@ -1704,6 +1721,7 @@ fn spawn_run_once_child(request: SpawnRunOnceChildRequest<'_>) -> crate::prelude
 				IssueDispatchMode::Normal => "normal",
 				IssueDispatchMode::Retry => "retry",
 				IssueDispatchMode::ReviewRepair => "review-repair",
+				IssueDispatchMode::DeliveryCloseout => "delivery-closeout",
 			},
 		])
 		.args(["--run-id", request.preferred_run_id])
@@ -1791,8 +1809,11 @@ where
 		}
 
 		let preferred_issue_state = (entry.kind == RetryKind::Continuation
-			&& entry.dispatch_mode != IssueDispatchMode::ReviewRepair)
-			.then_some(workflow.frontmatter().tracker().in_progress_state());
+			&& !matches!(
+				entry.dispatch_mode,
+				IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
+			))
+		.then_some(workflow.frontmatter().tracker().in_progress_state());
 		let Some(summary) = run_target_issue_once(TargetIssueRunContext {
 			tracker,
 			project,
@@ -1835,13 +1856,20 @@ fn queued_retry_issue_ids(retry_queue: &RetryQueue) -> Vec<String> {
 	retry_queue.ordered_entries().into_iter().map(|entry| entry.issue_id).collect()
 }
 
-fn issue_passes_review_repair_retention_policy(
+fn issue_passes_post_review_retention_policy(
 	issue: &TrackerIssue,
 	retry_project_slug: &str,
 	workflow: &WorkflowDocument,
+	dispatch_mode: IssueDispatchMode,
 ) -> bool {
 	issue.project_slug.as_deref() == Some(retry_project_slug)
-		&& issue_passes_review_repair_dispatch_policy(issue, workflow)
+		&& match dispatch_mode {
+			IssueDispatchMode::ReviewRepair =>
+				issue_passes_review_repair_dispatch_policy(issue, workflow),
+			IssueDispatchMode::DeliveryCloseout =>
+				issue_passes_delivery_closeout_dispatch_policy(issue, workflow),
+			_ => false,
+		}
 }
 
 fn issue_passes_retry_entry_retention_policy(
@@ -1851,11 +1879,15 @@ fn issue_passes_retry_entry_retention_policy(
 	state_store: &StateStore,
 	entry: &RetryEntry,
 ) -> crate::prelude::Result<bool> {
-	if entry.dispatch_mode == IssueDispatchMode::ReviewRepair {
-		return Ok(issue_passes_review_repair_retention_policy(
+	if matches!(
+		entry.dispatch_mode,
+		IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
+	) {
+		return Ok(issue_passes_post_review_retention_policy(
 			issue,
 			&entry.retry_project_slug,
 			workflow,
+			entry.dispatch_mode,
 		));
 	}
 
@@ -1900,8 +1932,11 @@ where
 
 	let concurrency = ConcurrencySnapshot::new(project.id(), state_store)?;
 	let preferred_issue_state = (entry.kind == RetryKind::Continuation
-		&& entry.dispatch_mode != IssueDispatchMode::ReviewRepair)
-		.then_some(workflow.frontmatter().tracker().in_progress_state());
+		&& !matches!(
+			entry.dispatch_mode,
+			IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
+		))
+	.then_some(workflow.frontmatter().tracker().in_progress_state());
 	let planned_issue_state = planned_issue_state_for_dispatch(
 		workflow,
 		&issue,
@@ -1941,8 +1976,16 @@ where
 	};
 	let continuation_pending =
 		exit_status.success() && run_attempt.status() == CONTINUATION_PENDING_RUN_STATUS;
-	let retained = if dispatch_mode == IssueDispatchMode::ReviewRepair {
-		issue_passes_review_repair_retention_policy(&issue, retry_project_slug, context.workflow)
+	let retained = if matches!(
+		dispatch_mode,
+		IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout
+	) {
+		issue_passes_post_review_retention_policy(
+			&issue,
+			retry_project_slug,
+			context.workflow,
+			dispatch_mode,
+		)
 	} else {
 		let preferred_issue_state = continuation_pending
 			.then_some(context.workflow.frontmatter().tracker().in_progress_state());
@@ -2573,23 +2616,23 @@ where
 		break;
 	}
 
-	let selected_post_review_issue = select_post_review_repair_issue_candidate(
+	let selected_post_review_issue = select_post_review_issue_candidate(
 		tracker,
 		project,
 		workflow,
 		state_store,
 		excluded_issue_ids,
 	)?;
-	let selected_issue = selected_retry_issue
-		.or(selected_post_review_issue.map(|issue| (issue, IssueDispatchMode::ReviewRepair)))
-		.or(select_issue_candidate_with_exclusions(
+	let selected_issue = selected_retry_issue.or(selected_post_review_issue).or(
+		select_issue_candidate_with_exclusions(
 			issues,
 			workflow,
 			state_store,
 			project.id(),
 			excluded_issue_ids,
 		)?
-		.map(|issue| (issue, IssueDispatchMode::Normal)));
+		.map(|issue| (issue, IssueDispatchMode::Normal)),
+	);
 	let Some((issue, dispatch_mode)) = selected_issue else {
 		let _ = resolve_tracker_project(tracker, project.tracker().project_slug())?;
 
@@ -2643,13 +2686,13 @@ where
 	Ok(Some(issue_run))
 }
 
-fn select_post_review_repair_issue_candidate<T>(
+fn select_post_review_issue_candidate<T>(
 	tracker: &T,
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
 	state_store: &StateStore,
 	excluded_issue_ids: &[&str],
-) -> crate::prelude::Result<Option<TrackerIssue>>
+) -> crate::prelude::Result<Option<(TrackerIssue, IssueDispatchMode)>>
 where
 	T: IssueTracker,
 {
@@ -2657,7 +2700,7 @@ where
 		github_token_env_var: project.github().token_env_var().map(str::to_owned),
 	};
 
-	select_post_review_repair_issue_candidate_with_inspector(
+	select_post_review_issue_candidate_with_inspector(
 		tracker,
 		project,
 		workflow,
@@ -2665,6 +2708,40 @@ where
 		excluded_issue_ids,
 		&review_state_inspector,
 	)
+}
+
+fn select_post_review_issue_candidate_with_inspector<T, I>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	excluded_issue_ids: &[&str],
+	review_state_inspector: &I,
+) -> crate::prelude::Result<Option<(TrackerIssue, IssueDispatchMode)>>
+where
+	T: IssueTracker,
+	I: PullRequestReviewStateInspector,
+{
+	if let Some(issue) = select_post_review_repair_issue_candidate_with_inspector(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		excluded_issue_ids,
+		review_state_inspector,
+	)? {
+		return Ok(Some((issue, IssueDispatchMode::ReviewRepair)));
+	}
+
+	select_post_review_closeout_issue_candidate_with_inspector(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		excluded_issue_ids,
+		review_state_inspector,
+	)
+	.map(|issue| issue.map(|issue| (issue, IssueDispatchMode::DeliveryCloseout)))
 }
 
 fn select_post_review_repair_issue_candidate_with_inspector<T, I>(
@@ -2703,6 +2780,67 @@ where
 
 	for lane in lanes {
 		if lane.classification != "needs_review_repair" {
+			continue;
+		}
+		if excluded_issue_ids.contains(&lane.issue_id.as_str()) {
+			continue;
+		}
+		if state_store.issue_has_active_shared_claim(project.id(), &lane.issue_id)? {
+			continue;
+		}
+
+		if let Some(issue) = issues_by_id.remove(&lane.issue_id) {
+			return Ok(Some(issue));
+		}
+	}
+
+	Ok(None)
+}
+
+fn select_post_review_closeout_issue_candidate_with_inspector<T, I>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	excluded_issue_ids: &[&str],
+	review_state_inspector: &I,
+) -> crate::prelude::Result<Option<TrackerIssue>>
+where
+	T: IssueTracker,
+	I: PullRequestReviewStateInspector,
+{
+	let lanes = build_post_review_lane_statuses(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		review_state_inspector,
+	)?;
+	let candidate_issue_ids = lanes
+		.iter()
+		.filter(|lane| {
+			lane.classification == "ready_to_land"
+				|| (lane.classification == "continue"
+					&& lane.reason == "pull_request_merged_closeout_pending")
+		})
+		.filter(|lane| !excluded_issue_ids.contains(&lane.issue_id.as_str()))
+		.map(|lane| lane.issue_id.clone())
+		.collect::<Vec<_>>();
+
+	if candidate_issue_ids.is_empty() {
+		return Ok(None);
+	}
+
+	let issues = tracker.refresh_issues(&candidate_issue_ids)?;
+	let mut issues_by_id =
+		issues.into_iter().map(|issue| (issue.id.clone(), issue)).collect::<HashMap<_, _>>();
+
+	for lane in lanes {
+		let is_closeout_candidate = lane.classification == "ready_to_land"
+			|| (lane.classification == "continue"
+				&& lane.reason == "pull_request_merged_closeout_pending");
+
+		if !is_closeout_candidate {
 			continue;
 		}
 		if excluded_issue_ids.contains(&lane.issue_id.as_str()) {
@@ -3151,6 +3289,20 @@ fn validate_review_repair_runtime(
 	Ok(())
 }
 
+fn validate_delivery_closeout_runtime(
+	project: &ServiceConfig,
+	dry_run: bool,
+) -> crate::prelude::Result<()> {
+	if dry_run {
+		return Ok(());
+	}
+
+	validate_command_available("gh", "retained delivery-closeout re-entry")?;
+	resolve_configured_env_var("github.token_env_var", project.github().token_env_var())?;
+
+	Ok(())
+}
+
 fn validate_daemon_runtime() -> crate::prelude::Result<()> {
 	#[cfg(unix)]
 	{
@@ -3343,6 +3495,24 @@ where
 		return Ok(continuation_boundary_summary(project, workflow, issue_run, &run_result));
 	}
 
+	apply_run_completion_disposition(
+		project,
+		workflow,
+		state_store,
+		issue_run,
+		&tracker_tool_bridge,
+	)?;
+
+	Ok(run_summary_from_issue_run(project.id(), issue_run))
+}
+
+fn apply_run_completion_disposition(
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	issue_run: &IssueRunPlan,
+	tracker_tool_bridge: &TrackerToolBridge<'_>,
+) -> crate::prelude::Result<()> {
 	match tracker_tool_bridge.completion_disposition()? {
 		RunCompletionDisposition::ReviewHandoff => {
 			validate_review_handoff_runtime(project, false)?;
@@ -3379,9 +3549,14 @@ where
 
 			tracker_tool_bridge.apply_review_repair()?;
 		},
+		RunCompletionDisposition::DeliveryCloseout => {
+			tracker_tool_bridge.apply_delivery_closeout()?;
+
+			cleanup_completed_post_review_lane(project, state_store, issue_run)?;
+		},
 	}
 
-	Ok(run_summary_from_issue_run(project.id(), issue_run))
+	Ok(())
 }
 
 fn run_summary_from_issue_run(project_id: &str, issue_run: &IssueRunPlan) -> RunSummary {
@@ -3447,7 +3622,8 @@ fn planned_issue_state_for_dispatch(
 					.to_owned()
 			})
 			.unwrap_or_else(|| issue.state.name.clone()),
-		IssueDispatchMode::ReviewRepair => issue.state.name.clone(),
+		IssueDispatchMode::ReviewRepair | IssueDispatchMode::DeliveryCloseout =>
+			issue.state.name.clone(),
 	}
 }
 
@@ -3720,6 +3896,19 @@ fn issue_passes_review_repair_dispatch_policy(
 		&& !issue.has_label(tracker_policy.needs_attention_label())
 }
 
+fn issue_passes_delivery_closeout_dispatch_policy(
+	issue: &TrackerIssue,
+	workflow: &WorkflowDocument,
+) -> bool {
+	let tracker_policy = workflow.frontmatter().tracker();
+	let completed_state = tracker_policy.resolved_completed_state();
+	let issue_state = issue.state.name.as_str();
+
+	(issue_state == tracker_policy.success_state() || Some(issue_state) == completed_state)
+		&& !issue.has_label(tracker_policy.opt_out_label())
+		&& !issue.has_label(tracker_policy.needs_attention_label())
+}
+
 fn issue_passes_retry_dispatch_policy(
 	issue: &TrackerIssue,
 	retry_project_slug: &str,
@@ -3936,6 +4125,24 @@ fn cleanup_terminal_workspace(
 	Ok(())
 }
 
+fn cleanup_completed_post_review_lane(
+	project: &ServiceConfig,
+	state_store: &StateStore,
+	issue_run: &IssueRunPlan,
+) -> crate::prelude::Result<()> {
+	let workspace_manager =
+		WorkspaceManager::new(project.id(), project.repo_root(), project.workspace_root());
+
+	delete_remote_branch_if_present(&issue_run.workspace.path, &issue_run.workspace.branch_name)?;
+
+	cleanup_terminal_workspace(
+		state_store,
+		&workspace_manager,
+		&issue_run.issue.id,
+		&issue_run.workspace.path,
+	)
+}
+
 fn build_developer_instructions(
 	project: &ServiceConfig,
 	workflow: &WorkflowDocument,
@@ -3971,6 +4178,21 @@ fn build_developer_instructions(
 			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
 			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
 			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			success = workflow.frontmatter().tracker().success_state(),
+			branch = issue_run.workspace.branch_name,
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			continuation_guidance = continuation_guidance,
+		),
+		IssueDispatchMode::DeliveryCloseout => format!(
+			"Tracker tool contract\n- You own issue-scoped tracker writes for `{issue}` on retained PR `{pr_url}`.\n- This run resumes an approved post-review lane in `{success}`. Do not move the issue back to `{in_progress}` and do not call `{review_handoff_tool}` or `{review_repair_tool}`.\n- Land the approved PR on branch `{branch}` using the repo-native merge workflow, then finish downstream delivery closeout so the tracker issue reaches its resolved completed state.\n- After merge plus closeout are fully complete on the same PR lineage, call `{delivery_closeout_tool}` with PR `{pr_url}` and a short result summary, then call `{terminal_finalize_tool}` with path `delivery_closeout`.\n- If you determine the issue needs human attention, add label `{needs_attention}` with `{label_tool}`, explain the exact observed blocker in a comment, including the failed command and raw error when available, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not speculate about capabilities you did not directly verify.\n- Keep all tracker and PR writes scoped to this retained lane. `maestro` will validate the merged PR lineage and clean up the lane workspace afterward.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}\n- Never write to any other issue.",
+			issue = issue_run.issue.identifier,
+			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
+			review_handoff_tool = ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			delivery_closeout_tool = ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
 			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 			in_progress = workflow.frontmatter().tracker().in_progress_state(),
 			success = workflow.frontmatter().tracker().success_state(),
@@ -4035,6 +4257,19 @@ fn build_user_input(
 			success = workflow.frontmatter().tracker().success_state(),
 			continuation_guidance = continuation_guidance,
 		),
+		IssueDispatchMode::DeliveryCloseout => format!(
+			"Continue retained delivery closeout for Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nCurrent PR:\n- `{pr_url}`\n\nExecution checklist:\n- Resume from the current branch and approved PR state in this workspace. Do not move the issue back to `{in_progress}`.\n- Land `{pr_url}` with the repo-native merge workflow and then complete the downstream delivery closeout for this same issue.\n- Ensure the tracker issue reaches its resolved completed state as part of that closeout.\n- Call `{delivery_closeout_tool}` with `{pr_url}` and a short result summary, then call `{terminal_finalize_tool}` with path `delivery_closeout`.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`.\n- Keep the lane scoped to this retained post-review work and do not mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}",
+			identifier = issue.identifier,
+			title = issue.title,
+			description = description,
+			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
+			in_progress = workflow.frontmatter().tracker().in_progress_state(),
+			delivery_closeout_tool = ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			needs_attention = workflow.frontmatter().tracker().needs_attention_label(),
+			label_tool = ISSUE_LABEL_ADD_TOOL_NAME,
+			continuation_guidance = continuation_guidance,
+		),
 		_ => format!(
 			"Resolve Linear issue {identifier}: {title}\n\nDescription:\n{description}\n\nExecution checklist:\n- Move the issue to `{in_progress}` with `{transition_tool}` and leave a short `{comment_tool}` comment that includes run `{run_id}` attempt `{attempt}`.\n- Keep discovery bounded to the minimal implementation files needed for this issue; defer broader docs or upstream reading unless a concrete ambiguity blocks the change.\n- Implement the fix in the current workspace.\n- Run the repository validation needed to justify a reviewable PR.\n- Commit the lane, push branch `{branch}`, and create or update a non-draft PR for that branch.\n- Call `{review_handoff_tool}` with the PR URL and a short result summary, then call `{terminal_finalize_tool}` with path `review_handoff`. Do not move the issue directly to `{success}` with `{transition_tool}`; `maestro` will finish that writeback after its own validation passes.\n- If the issue needs manual attention, add label `{needs_attention}` with `{label_tool}`, explain why in a comment, and then call `{terminal_finalize_tool}` with path `manual_attention`. Do not call `{review_handoff_tool}` in that case; `maestro` will stop the lane as a human-required failure without automatic retry.\n- Do not report the run as complete or mark a saved plan `phase = \"done\"` until `{terminal_finalize_tool}` succeeds.{continuation_guidance}",
 			identifier = issue.identifier,
@@ -4069,6 +4304,14 @@ fn build_continuation_user_input(
 			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
 			success = success_state,
 			review_repair_tool = ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+		),
+		IssueDispatchMode::DeliveryCloseout => format!(
+			"Continue retained delivery closeout for Linear issue {identifier} in the current thread and workspace.\n\nContinuation checklist:\n- Resume from the current repository state and approved or merged PR lineage on `{pr_url}`.\n- Keep changes scoped to the same retained post-review lane and do not move the issue out of `{success}` until closeout finishes.\n- If merge plus delivery closeout are complete, call `{delivery_closeout_tool}` and then call `{terminal_finalize_tool}` with path `delivery_closeout`.\n- If the issue requires manual attention, record the manual-attention tracker path before ending the turn.\n- If more work still remains after this turn, you may end the turn without terminal finalization and Maestro will decide whether to continue.",
+			identifier = issue.identifier,
+			pr_url = recorded_pr_url.unwrap_or("(missing review handoff marker)"),
+			success = success_state,
+			delivery_closeout_tool = ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
 			terminal_finalize_tool = ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
 		),
 		_ => format!(
@@ -4106,6 +4349,29 @@ fn build_review_run_context(
 				recorded_pr_url: Some(review_handoff.pr_url().to_owned()),
 			})
 		},
+		IssueDispatchMode::DeliveryCloseout => {
+			validate_delivery_closeout_runtime(project, false)?;
+
+			let review_handoff = state::read_review_handoff_marker(&issue_run.workspace.path)?
+				.ok_or_else(|| {
+					eyre::eyre!(
+						"Retained delivery-closeout run `{}` for issue `{}` requires an existing `.maestro-review-handoff` marker.",
+						issue_run.run_id,
+						issue_run.issue.identifier
+					)
+				})?;
+
+			Ok(ReviewHandoffContext {
+				attempt_number: issue_run.attempt_number,
+				branch_name: issue_run.workspace.branch_name.clone(),
+				run_id: issue_run.run_id.clone(),
+				workspace_path: relative_workspace_path(project, &issue_run.workspace),
+				cwd: issue_run.workspace.path.clone(),
+				github_token_env_var: project.github().token_env_var().map(str::to_owned),
+				mode: ReviewExecutionMode::DeliveryCloseout,
+				recorded_pr_url: Some(review_handoff.pr_url().to_owned()),
+			})
+		},
 		_ => Ok(ReviewHandoffContext {
 			attempt_number: issue_run.attempt_number,
 			branch_name: issue_run.workspace.branch_name.clone(),
@@ -4136,6 +4402,74 @@ fn run_validation_commands(commands: &[String], cwd: &Path) -> crate::prelude::R
 	}
 
 	Ok(())
+}
+
+fn delete_remote_branch_if_present(
+	workspace_path: &Path,
+	branch_name: &str,
+) -> crate::prelude::Result<()> {
+	let remote_check = Command::new("git")
+		.arg("-C")
+		.arg(workspace_path)
+		.args(["remote", "get-url", "origin"])
+		.output()?;
+
+	if !remote_check.status.success() {
+		let stderr = String::from_utf8_lossy(&remote_check.stderr);
+
+		if stderr.contains("No such remote") {
+			return Ok(());
+		}
+
+		eyre::bail!(
+			"Failed to inspect remote cleanup authority in `{}`: {}",
+			workspace_path.display(),
+			stderr.trim()
+		);
+	}
+
+	let remote_ref = format!("refs/heads/{branch_name}");
+	let branch_check = Command::new("git")
+		.arg("-C")
+		.arg(workspace_path)
+		.args(["ls-remote", "--exit-code", "--heads", "origin", remote_ref.as_str()])
+		.output()?;
+
+	if !branch_check.status.success() {
+		if branch_check.status.code() == Some(2) {
+			return Ok(());
+		}
+
+		let stderr = String::from_utf8_lossy(&branch_check.stderr);
+
+		eyre::bail!(
+			"Failed to inspect retained remote branch `{branch_name}` in `{}`: {}",
+			workspace_path.display(),
+			stderr.trim()
+		);
+	}
+
+	let delete_output = Command::new("git")
+		.arg("-C")
+		.arg(workspace_path)
+		.args(["push", "origin", "--delete", branch_name])
+		.output()?;
+
+	if delete_output.status.success() {
+		return Ok(());
+	}
+
+	let stderr = String::from_utf8_lossy(&delete_output.stderr);
+
+	if stderr.contains("remote ref does not exist") {
+		return Ok(());
+	}
+
+	eyre::bail!(
+		"Failed to delete retained remote branch `{branch_name}` from `{}`: {}",
+		workspace_path.display(),
+		stderr.trim()
+	);
 }
 
 fn relative_workspace_path(project: &ServiceConfig, workspace: &WorkspaceSpec) -> String {
@@ -4754,7 +5088,7 @@ where
 			&workspace.path.display().to_string(),
 		)?;
 
-		if issue_passes_review_repair_dispatch_policy(&issue, workflow) {
+		if issue_passes_delivery_closeout_dispatch_policy(&issue, workflow) {
 			match state::read_run_activity_marker_snapshot(&workspace.path)? {
 				Some(marker) if workspace_activity_marker_is_fresh(&marker, now_unix_epoch) => {
 					state_store.record_run_attempt(
@@ -5197,12 +5531,12 @@ mod tests {
 		github,
 		orchestrator::{
 			self, GhPullRequestReviewStateInspector, ISSUE_COMMENT_TOOL_NAME,
-			ISSUE_LABEL_ADD_TOOL_NAME, ISSUE_REVIEW_HANDOFF_TOOL_NAME,
-			ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME, ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
-			ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision, PostReviewLaneSnapshot,
-			PullRequestCommitConnection, PullRequestCommitNode, PullRequestCommitPayload,
-			PullRequestPageInfo, PullRequestRepository, PullRequestRepositoryOwner,
-			PullRequestReviewRequestConnection, PullRequestReviewState,
+			ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
+			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, PostReviewLaneDecision,
+			PostReviewLaneSnapshot, PullRequestCommitConnection, PullRequestCommitNode,
+			PullRequestCommitPayload, PullRequestPageInfo, PullRequestRepository,
+			PullRequestRepositoryOwner, PullRequestReviewRequestConnection, PullRequestReviewState,
 			PullRequestReviewStateInspector, PullRequestReviewStateNode,
 			PullRequestReviewThreadConnection, PullRequestReviewThreadNode,
 			PullRequestStatusCheckRollup, RunSummary,
@@ -6573,6 +6907,48 @@ max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
 	}
 
 	#[test]
+	fn schedule_retry_after_child_exit_records_failure_retry_for_delivery_closeout_issue_after_tracker_completion()
+	 {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("Done", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let run_id = "run-delivery-closeout";
+
+		state_store
+			.record_run_attempt(run_id, &issue.id, 1, "failed")
+			.expect("run attempt should record");
+
+		let exit_status =
+			Command::new("sh").args(["-c", "exit 1"]).status().expect("failure exit should run");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		orchestrator::schedule_retry_after_child_exit(
+			orchestrator::ChildExitRetryContext {
+				retry_queue: &mut retry_queue,
+				tracker: &tracker,
+				project: &config,
+				workflow: &workflow,
+				state_store: &state_store,
+			},
+			orchestrator::ChildRunRef { issue_id: &issue.id, run_id, attempt_number: 1 },
+			issue.project_slug.as_deref().expect("sample issue should carry a project slug"),
+			"In Review",
+			orchestrator::IssueDispatchMode::DeliveryCloseout,
+			exit_status,
+		)
+		.expect("delivery-closeout failure retry should schedule after tracker completion");
+
+		let entry =
+			retry_queue.entries.get(&issue.id).expect("retry entry should exist for the issue");
+
+		assert_eq!(entry.dispatch_mode, orchestrator::IssueDispatchMode::DeliveryCloseout);
+		assert_eq!(entry.kind, orchestrator::RetryKind::Failure);
+		assert_eq!(entry.attempt, 1);
+	}
+
+	#[test]
 	fn queued_review_repair_retry_stays_blocked_until_due() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("In Review", &[]);
@@ -7911,6 +8287,54 @@ Custom workflow.
 	}
 
 	#[test]
+	fn delivery_closeout_prompts_require_retained_pr_closeout_completion() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			issue_state: String::from("In Review"),
+			initial_issue_state: String::from("In Review"),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("x/pubfi-pub-101"),
+				issue_identifier: issue.identifier.clone(),
+				path: config.workspace_root().join(&issue.identifier),
+				reused_existing: true,
+			},
+			retry_project_slug: String::from("pubfi"),
+			dispatch_mode: orchestrator::IssueDispatchMode::DeliveryCloseout,
+			attempt_number: 3,
+			run_id: String::from("pub-101-attempt-3-123"),
+			retry_budget_base: 0,
+		};
+		let pr_url = "https://github.com/hack-ink/maestro/pull/175";
+		let developer_instructions = orchestrator::build_developer_instructions(
+			&config,
+			&workflow,
+			&issue_run,
+			Some(pr_url),
+		)
+		.expect("delivery closeout developer instructions should build");
+		let user_input =
+			orchestrator::build_user_input(&issue, &workflow, &issue_run, Some(pr_url));
+		let continuation_input = orchestrator::build_continuation_user_input(
+			&issue,
+			orchestrator::IssueDispatchMode::DeliveryCloseout,
+			Some(pr_url),
+			workflow.frontmatter().tracker().success_state(),
+		);
+
+		assert!(developer_instructions.contains(ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME));
+		assert!(developer_instructions.contains("Land the approved PR"));
+		assert!(developer_instructions.contains("do not call `issue_review_handoff`"));
+		assert!(
+			user_input.contains("Ensure the tracker issue reaches its resolved completed state")
+		);
+		assert!(user_input.contains("delivery_closeout"));
+		assert!(continuation_input.contains("approved or merged PR lineage"));
+		assert!(continuation_input.contains("delivery_closeout"));
+	}
+
+	#[test]
 	fn single_turn_prompts_do_not_allow_nonterminal_yield_boundary() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
@@ -8466,6 +8890,108 @@ Custom workflow.
 		.expect("one issue should be selected");
 
 		assert_eq!(selected.identifier, "PUB-101");
+	}
+
+	#[test]
+	fn plan_project_issue_run_prefers_post_review_closeout_lane_over_normal_candidate() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let normal_issue = sample_issue("Todo", &[]);
+		let closeout_issue = sample_issue("In Review", &[]);
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![normal_issue.clone(), closeout_issue.clone()],
+			vec![
+				vec![closeout_issue.clone()],
+				vec![closeout_issue.clone()],
+				vec![closeout_issue.clone()],
+			],
+		);
+		let workspace_manager =
+			WorkspaceManager::new(config.id(), config.repo_root(), config.workspace_root());
+		let workspace = workspace_manager
+			.ensure_workspace(&closeout_issue.identifier, false)
+			.expect("workspace should exist");
+		let head_oid = git_output(&workspace.path, &["rev-parse", "HEAD"]);
+		let pr_url = "https://github.com/hack-ink/maestro/pull/175";
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&closeout_issue.id,
+				&workspace.branch_name,
+				&workspace.path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		state::write_review_handoff_marker(
+			&workspace.path,
+			&sample_review_handoff_marker(&workspace.branch_name, pr_url, &head_oid),
+		)
+		.expect("review handoff marker should write");
+
+		let inspector = FakePullRequestReviewStateInspector::new(vec![
+			Ok(sample_pull_request_review_state(
+				pr_url,
+				&workspace.branch_name,
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			)),
+			Ok(sample_pull_request_review_state(
+				pr_url,
+				&workspace.branch_name,
+				&head_oid,
+				Some("APPROVED"),
+				"MERGEABLE",
+				"CLEAN",
+				Some("SUCCESS"),
+				0,
+			)),
+		]);
+		let selected = orchestrator::select_post_review_issue_candidate_with_inspector(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			&[],
+			&inspector,
+		)
+		.expect("post-review closeout selection should succeed")
+		.expect("closeout lane should be selected");
+
+		assert_eq!(selected.0.identifier, closeout_issue.identifier);
+		assert_eq!(selected.1, orchestrator::IssueDispatchMode::DeliveryCloseout);
+
+		let tracker = FakeTracker::with_refresh_snapshots(
+			vec![closeout_issue.clone()],
+			vec![vec![closeout_issue.clone()], vec![closeout_issue.clone()]],
+		);
+		let summary = orchestrator::run_target_issue_once(orchestrator::TargetIssueRunContext {
+			tracker: &tracker,
+			project: &config,
+			workflow: &workflow,
+			state_store: &state_store,
+			issue_id: &closeout_issue.id,
+			preferred_issue_state: None,
+			preferred_initial_issue_state: None,
+			dry_run: true,
+			lease_preacquired: false,
+			preferred_issue_claim_fd: None,
+			preferred_dispatch_slot_fd: None,
+			preferred_dispatch_slot_index: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::DeliveryCloseout,
+			preferred_run_identity: None,
+			preferred_retry_budget_base: None,
+		})
+		.expect("targeted delivery-closeout planning should succeed")
+		.expect("delivery-closeout issue run should plan");
+
+		assert_eq!(summary.issue_identifier, closeout_issue.identifier);
+		assert_eq!(summary.dispatch_mode, orchestrator::IssueDispatchMode::DeliveryCloseout);
+		assert_eq!(summary.issue_state, "In Review");
 	}
 
 	#[test]
@@ -12841,6 +13367,99 @@ Custom workflow.
 				.expect("workspace lookup should succeed")
 				.is_none(),
 			"terminal mapping should be cleared after cleanup"
+		);
+	}
+
+	#[test]
+	fn cleanup_completed_post_review_lane_preserves_workspace_when_remote_delete_fails() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+		let issue = sample_issue("Done", &[]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let remote_root =
+			config.repo_root().parent().expect("repo root should have a parent").join("origin.git");
+
+		assert!(
+			Command::new("git")
+				.args(["init", "--bare"])
+				.arg(&remote_root)
+				.status()
+				.expect("git init --bare should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(&remote_root)
+				.args(["config", "receive.denyDeletes", "true"])
+				.status()
+				.expect("git config should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(config.repo_root())
+				.args(["remote", "add", "origin", remote_root.to_string_lossy().as_ref()])
+				.status()
+				.expect("git remote add should run")
+				.success()
+		);
+		assert!(
+			Command::new("git")
+				.arg("-C")
+				.arg(config.repo_root())
+				.args(["push", "-u", "origin", "main"])
+				.status()
+				.expect("git push should run")
+				.success()
+		);
+
+		state_store
+			.upsert_workspace(
+				config.id(),
+				&issue.id,
+				"main",
+				&config.repo_root().display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let issue_run = orchestrator::IssueRunPlan {
+			issue: issue.clone(),
+			issue_state: issue.state.name.clone(),
+			initial_issue_state: String::from("In Review"),
+			workspace: WorkspaceSpec {
+				branch_name: String::from("main"),
+				issue_identifier: issue.identifier.clone(),
+				path: config.repo_root().to_path_buf(),
+				reused_existing: true,
+			},
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			dispatch_mode: orchestrator::IssueDispatchMode::DeliveryCloseout,
+			attempt_number: 1,
+			run_id: String::from("run-delivery-closeout-cleanup"),
+			retry_budget_base: 0,
+		};
+		let error =
+			orchestrator::cleanup_completed_post_review_lane(&config, &state_store, &issue_run)
+				.expect_err("remote branch delete failures must stop cleanup");
+
+		assert!(
+			error.to_string().contains("Failed to delete retained remote branch"),
+			"cleanup should surface the remote delete failure"
+		);
+		assert!(
+			config.repo_root().exists(),
+			"cleanup must preserve the retained workspace when remote delete fails"
+		);
+		assert!(
+			state_store
+				.workspace_for_issue(&issue.id)
+				.expect("workspace lookup should succeed")
+				.is_some(),
+			"workspace mapping must remain so cleanup can retry later"
 		);
 	}
 

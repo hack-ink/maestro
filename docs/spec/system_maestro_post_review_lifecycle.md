@@ -56,7 +56,7 @@ Post-`In Review` classification may use only these signal groups:
   - whether delivery closeout already ran
   - whether workspace and branch cleanup remain pending
 
-In the current XY-173 slice, the retained lane persists its validated review handoff as a local `.maestro-review-handoff` marker and exposes the resulting post-review classification through the existing local `status` surface. That slice is intentionally read-only: it classifies the lane and reports the decision without performing repair, landing, closeout, or cleanup. When that explicit marker is missing, post-review ownership must block as unresolved instead of rebinding from branch-name or current-head-only heuristics.
+In the current runtime, the retained lane persists its validated review handoff as a local `.maestro-review-handoff` marker and uses that marker as the authoritative post-review lineage record for repair, landing, delivery closeout, and cleanup. When that explicit marker is missing, post-review ownership must block as unresolved instead of rebinding from branch-name or current-head-only heuristics.
 
 If these signals disagree and the disagreement cannot be resolved without guessing operator intent, the runtime must use `manual_intervention_required`.
 
@@ -145,7 +145,7 @@ While in `delivery_closeout`:
 - tracker closeout runs before GitHub mirror updates
 - the tracker issue transitions from `In Review` to the resolved `tracker.completed_state`
 
-Successful post-merge closeout requires a machine-readable resolved `tracker.completed_state`. Repository workflow policy resolves that target either from the explicit `tracker.completed_state` field or, if that field is omitted, from an exact `"Done"` terminal-state default. Until post-merge closeout is actually implemented, workflow parsing may remain permissive so existing repositories still load; once `delivery_closeout` consumes this field, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target whenever workflow policy still cannot resolve a valid completed state.
+Successful post-merge closeout requires a machine-readable resolved `tracker.completed_state`. Repository workflow policy resolves that target either from the explicit `tracker.completed_state` field or, if that field is omitted, from an exact `"Done"` terminal-state default. Because `delivery_closeout` now validates this field during retained post-review completion, the runtime must stop for `manual_intervention_required` instead of guessing a post-merge tracker target whenever workflow policy cannot resolve a valid completed state.
 
 If merge is authoritative but closeout fails due to a deterministic infrastructure problem with no contradictory state, the runtime may resume `delivery_closeout` later within the same owned lane. A terminal tracker state written during `delivery_closeout` does not by itself authorize workspace deletion while GitHub mirroring or deterministic cleanup are still pending. If state is contradictory, the runtime must stop for human intervention.
 
@@ -246,11 +246,11 @@ The runtime must record the resulting evidence and current phase, but must not e
 
 ## Minimum follow-on implementation split
 
-The accepted post-`In Review` lifecycle maps onto the existing follow-on issues like this:
+The accepted post-`In Review` lifecycle mapped onto the follow-on implementation issues like this:
 
 - `XY-173`: detect owned PR review state and classify `review_wait`, `review_repair`, or `ready_to_land`
 - `XY-174`: re-enter retained lanes for `review_repair`
 - `XY-175`: implement `landing`, `delivery_closeout`, and `cleanup`
 - `XY-177`: align checked-in workflow skills with the accepted lifecycle once the runtime model is stable
 
-These issues remain implementation work. This document is the authoritative lifecycle contract they should implement.
+`XY-173` through `XY-175` now exist to explain the implementation history for the current runtime; `XY-177` remains the follow-on skill-alignment task. This document remains the authoritative lifecycle contract.

@@ -25,6 +25,8 @@ pub(crate) const ISSUE_COMMENT_TOOL_NAME: &str = "issue_comment";
 pub(crate) const ISSUE_LABEL_ADD_TOOL_NAME: &str = "issue_label_add";
 pub(crate) const ISSUE_REVIEW_HANDOFF_TOOL_NAME: &str = "issue_review_handoff";
 pub(crate) const ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME: &str = "issue_review_repair_complete";
+pub(crate) const ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME: &str =
+	"issue_delivery_closeout_complete";
 pub(crate) const ISSUE_TERMINAL_FINALIZE_TOOL_NAME: &str = "issue_terminal_finalize";
 
 static GH_PULL_REQUEST_INSPECTOR: GhPullRequestInspector = GhPullRequestInspector;
@@ -211,6 +213,7 @@ impl<'a> TrackerToolBridge<'a> {
 	fn build_tool_specs(&self) -> Vec<DynamicToolSpec> {
 		let mut tool_specs = match self.review_context.as_ref().map(|context| context.mode) {
 			Some(ReviewExecutionMode::Repair) => self.comment_tool_specs(),
+			Some(ReviewExecutionMode::DeliveryCloseout) => self.delivery_closeout_base_tool_specs(),
 			Some(ReviewExecutionMode::Handoff) => {
 				let mut tool_specs = self.base_tool_specs();
 
@@ -227,6 +230,12 @@ impl<'a> TrackerToolBridge<'a> {
 		) {
 			tool_specs.extend(self.review_repair_tool_specs());
 		}
+		if matches!(
+			self.review_context.as_ref().map(|context| context.mode),
+			Some(ReviewExecutionMode::DeliveryCloseout)
+		) {
+			tool_specs.extend(self.delivery_closeout_tool_specs());
+		}
 
 		tool_specs.push(self.label_add_tool_spec());
 
@@ -234,6 +243,14 @@ impl<'a> TrackerToolBridge<'a> {
 	}
 
 	fn base_tool_specs(&self) -> Vec<DynamicToolSpec> {
+		let mut tool_specs = vec![self.transition_tool_spec()];
+
+		tool_specs.extend(self.comment_tool_specs());
+
+		tool_specs
+	}
+
+	fn delivery_closeout_base_tool_specs(&self) -> Vec<DynamicToolSpec> {
 		let mut tool_specs = vec![self.transition_tool_spec()];
 
 		tool_specs.extend(self.comment_tool_specs());
@@ -359,6 +376,47 @@ impl<'a> TrackerToolBridge<'a> {
 		]
 	}
 
+	fn delivery_closeout_tool_specs(&self) -> [DynamicToolSpec; 2] {
+		[
+			DynamicToolSpec {
+				name: ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME.to_owned(),
+				description: String::from(
+					"Record that the retained post-review lane finished merge plus delivery closeout for the same owned PR lineage.",
+				),
+				input_schema: serde_json::json!({
+					"type": "object",
+					"properties": {
+						"issue_id": { "type": "string" },
+						"issue_identifier": { "type": "string" },
+						"pr_url": { "type": "string" },
+						"summary": { "type": "string" }
+					},
+					"required": ["pr_url", "summary"],
+					"additionalProperties": false
+				}),
+			},
+			DynamicToolSpec {
+				name: ISSUE_TERMINAL_FINALIZE_TOOL_NAME.to_owned(),
+				description: String::from(
+					"Finalize the current run's terminal tracker path after either post-review delivery closeout or the manual-attention exit has been fully recorded.",
+				),
+				input_schema: serde_json::json!({
+					"type": "object",
+					"properties": {
+						"issue_id": { "type": "string" },
+						"issue_identifier": { "type": "string" },
+						"path": {
+							"type": "string",
+							"enum": ["delivery_closeout", "manual_attention"]
+						}
+					},
+					"required": ["path"],
+					"additionalProperties": false
+				}),
+			},
+		]
+	}
+
 	fn label_add_tool_spec(&self) -> DynamicToolSpec {
 		DynamicToolSpec {
 			name: ISSUE_LABEL_ADD_TOOL_NAME.to_owned(),
@@ -384,6 +442,8 @@ impl<'a> TrackerToolBridge<'a> {
 			ISSUE_COMMENT_TOOL_NAME => self.handle_comment(arguments),
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME => self.handle_review_handoff(arguments),
 			ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME => self.handle_review_repair_complete(arguments),
+			ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME =>
+				self.handle_delivery_closeout_complete(arguments),
 			ISSUE_LABEL_ADD_TOOL_NAME => self.handle_add_label(arguments),
 			ISSUE_TERMINAL_FINALIZE_TOOL_NAME => self.handle_terminal_finalize(arguments),
 			_ =>
@@ -605,6 +665,66 @@ impl<'a> TrackerToolBridge<'a> {
 		))
 	}
 
+	fn handle_delivery_closeout_complete(&self, arguments: Value) -> DynamicToolCallResponse {
+		let parsed = match serde_json::from_value::<ReviewHandoffArgs>(arguments) {
+			Ok(parsed) => parsed,
+			Err(error) => {
+				return DynamicToolCallResponse::failure(format!(
+					"Invalid `issue.delivery_closeout_complete` arguments: {error}"
+				));
+			},
+		};
+
+		if let Err(error) = self.ensure_issue_scope(&parsed.scope) {
+			return DynamicToolCallResponse::failure(error);
+		}
+
+		let Some(review_context) = self.review_context.as_ref() else {
+			return DynamicToolCallResponse::failure(String::from(
+				"`issue_delivery_closeout_complete` is unavailable for this run.",
+			));
+		};
+
+		if review_context.mode != ReviewExecutionMode::DeliveryCloseout {
+			return DynamicToolCallResponse::failure(String::from(
+				"`issue_delivery_closeout_complete` is unavailable before a retained post-review closeout run starts.",
+			));
+		}
+
+		let pr_url = parsed.pr_url.trim();
+
+		if pr_url.is_empty() {
+			return DynamicToolCallResponse::failure(String::from(
+				"`issue_delivery_closeout_complete` requires a non-empty `pr_url`.",
+			));
+		}
+
+		let summary = normalize_summary(&parsed.summary);
+
+		if summary.is_empty() {
+			return DynamicToolCallResponse::failure(String::from(
+				"`issue_delivery_closeout_complete` requires a non-empty `summary`.",
+			));
+		}
+
+		let pull_request = match self.validate_delivery_closeout_pr(review_context, pr_url) {
+			Ok(pull_request) => pull_request,
+			Err(error) => return DynamicToolCallResponse::failure(error),
+		};
+
+		self.pending_review_completion.borrow_mut().replace(
+			PendingReviewCompletion::DeliveryCloseout(PendingReviewAction {
+				pr_url: pull_request.url.clone(),
+				summary,
+			}),
+		);
+
+		DynamicToolCallResponse::success(format!(
+			"Recorded retained delivery closeout completion for issue `{}` on merged PR `{}`. Maestro will validate the merged lineage and terminal tracker state before cleaning up the lane.",
+			self.issue.identifier, pull_request.url
+		))
+	}
+
 	fn handle_add_label(&self, arguments: Value) -> DynamicToolCallResponse {
 		let parsed = match serde_json::from_value::<LabelArgs>(arguments) {
 			Ok(parsed) => parsed,
@@ -717,10 +837,11 @@ impl<'a> TrackerToolBridge<'a> {
 		let requested_path = match parsed.path.as_str() {
 			"review_handoff" => RunCompletionDisposition::ReviewHandoff,
 			"review_repair" => RunCompletionDisposition::ReviewRepair,
+			"delivery_closeout" => RunCompletionDisposition::DeliveryCloseout,
 			"manual_attention" => RunCompletionDisposition::ManualAttention,
 			other => {
 				return DynamicToolCallResponse::failure(format!(
-					"`{ISSUE_TERMINAL_FINALIZE_TOOL_NAME}` path must be `review_handoff`, `review_repair`, or `manual_attention`, not `{other}`."
+					"`{ISSUE_TERMINAL_FINALIZE_TOOL_NAME}` path must be `review_handoff`, `review_repair`, `delivery_closeout`, or `manual_attention`, not `{other}`."
 				));
 			},
 		};
@@ -769,6 +890,14 @@ impl<'a> TrackerToolBridge<'a> {
 
 	fn allowed_transition_states(&self) -> Vec<&str> {
 		let tracker = self.workflow.frontmatter().tracker();
+
+		if matches!(
+			self.review_context.as_ref().map(|context| context.mode),
+			Some(ReviewExecutionMode::DeliveryCloseout)
+		) {
+			return tracker.resolved_completed_state().into_iter().collect();
+		}
+
 		let success_state = tracker.success_state();
 		let mut states = tracker
 			.startable_states()
@@ -855,6 +984,68 @@ impl<'a> TrackerToolBridge<'a> {
 		Ok(pull_request)
 	}
 
+	fn validate_delivery_closeout_pr(
+		&self,
+		review_context: &ReviewHandoffContext,
+		pr_url: &str,
+	) -> std::result::Result<PullRequestDetails, String> {
+		let github_token = resolve_review_handoff_github_token(review_context)?;
+		let pull_request = self.pull_request_inspector.inspect_pull_request(
+			&review_context.cwd,
+			pr_url,
+			github_token.as_str(),
+		)?;
+		let local_repo = self.local_repo_inspector.inspect_local_repo(&review_context.cwd)?;
+
+		if pull_request.head_repository_owner != local_repo.repository_owner
+			|| pull_request.head_repository_name != local_repo.repository_name
+		{
+			return Err(format!(
+				"Pull request `{}` belongs to repository `{}/{}`, but the current lane repository is `{}/{}`.",
+				pull_request.url,
+				pull_request.head_repository_owner,
+				pull_request.head_repository_name,
+				local_repo.repository_owner,
+				local_repo.repository_name
+			));
+		}
+		if pull_request.head_ref_name != review_context.branch_name {
+			return Err(format!(
+				"Pull request `{}` is for branch `{}`, but the current lane branch is `{}`.",
+				pull_request.url, pull_request.head_ref_name, review_context.branch_name
+			));
+		}
+		if pull_request.head_ref_oid != local_repo.head_oid {
+			return Err(format!(
+				"Pull request `{}` points at commit `{}`, but the current lane HEAD is `{}`. Finish delivery closeout from the merged lane head.",
+				pull_request.url, pull_request.head_ref_oid, local_repo.head_oid
+			));
+		}
+		if pull_request.state != "MERGED" {
+			return Err(format!(
+				"Pull request `{}` is `{}`; it must be merged before delivery closeout completes.",
+				pull_request.url, pull_request.state
+			));
+		}
+		if pull_request.is_draft {
+			return Err(format!(
+				"Pull request `{}` is still draft; delivery closeout requires a merged non-draft PR lineage.",
+				pull_request.url
+			));
+		}
+
+		if let Some(recorded_pr_url) = review_context.recorded_pr_url.as_deref()
+			&& pull_request.url != recorded_pr_url
+		{
+			return Err(format!(
+				"Pull request `{}` does not match the retained lane PR `{}`.",
+				pull_request.url, recorded_pr_url
+			));
+		}
+
+		Ok(pull_request)
+	}
+
 	fn record_continuation_blocking_transition(&self, state: &str) {
 		if state != self.workflow.frontmatter().tracker().in_progress_state() {
 			self.record_continuation_blocking_write(format!(
@@ -923,6 +1114,8 @@ impl<'a> TrackerToolBridge<'a> {
 				Ok(RunCompletionDisposition::ReviewHandoff),
 			(false, false, Some(PendingReviewCompletion::Repair(_))) =>
 				Ok(RunCompletionDisposition::ReviewRepair),
+			(false, false, Some(PendingReviewCompletion::DeliveryCloseout(_))) =>
+				Ok(RunCompletionDisposition::DeliveryCloseout),
 			(true, true, None) => Ok(RunCompletionDisposition::ManualAttention),
 			(true, false, None) => eyre::bail!(
 				"Run `{}` requested human attention with label `{}`, but issue `{}` never recorded the required explanatory comment.",
@@ -931,14 +1124,16 @@ impl<'a> TrackerToolBridge<'a> {
 				self.issue.identifier
 			),
 			(true, _, Some(_)) => eyre::bail!(
-				"Run `{}` recorded both `issue_review_handoff` and label `{}`. Use exactly one final handoff path.",
+				"Run `{}` recorded both `{}` and label `{}`. Use exactly one final tracker exit path.",
 				review_context.run_id,
+				self.required_pr_completion_tool_name(),
 				self.workflow.frontmatter().tracker().needs_attention_label()
 			),
 			(false, false, None) => eyre::bail!(
-				"Run `{}` completed, but issue `{}` recorded neither a PR-backed review handoff nor label `{}` for human attention.",
+				"Run `{}` completed, but issue `{}` recorded neither `{}` nor label `{}` for human attention.",
 				review_context.run_id,
 				self.issue.identifier,
+				self.required_pr_completion_tool_name(),
 				self.workflow.frontmatter().tracker().needs_attention_label()
 			),
 			(false, true, None) | (false, true, Some(_)) => eyre::bail!(
@@ -1071,6 +1266,73 @@ impl<'a> TrackerToolBridge<'a> {
 		self.pending_review_completion.borrow_mut().take();
 
 		Ok(())
+	}
+
+	pub(crate) fn apply_delivery_closeout(&self) -> crate::prelude::Result<()> {
+		let Some(review_context) = self.review_context.as_ref() else {
+			eyre::bail!(
+				"Review handoff context is unavailable for issue `{}`.",
+				self.issue.identifier
+			);
+		};
+		let pending_delivery_closeout = {
+			let pending_review_completion = self.pending_review_completion.borrow();
+			let Some(PendingReviewCompletion::DeliveryCloseout(pending_delivery_closeout)) =
+				pending_review_completion.as_ref()
+			else {
+				eyre::bail!(
+					"Run `{}` completed, but issue `{}` never recorded retained delivery closeout completion.",
+					review_context.run_id,
+					self.issue.identifier
+				);
+			};
+
+			pending_delivery_closeout.clone()
+		};
+
+		self.validate_delivery_closeout_pr(review_context, &pending_delivery_closeout.pr_url)
+			.map_err(|error| eyre::eyre!(error))?;
+
+		let completed_state = self
+			.workflow
+			.frontmatter()
+			.tracker()
+			.resolved_completed_state()
+			.ok_or_else(|| {
+				eyre::eyre!(
+					"Workflow tracker policy for issue `{}` does not define a resolved completed state for delivery closeout validation.",
+					self.issue.identifier
+				)
+			})?;
+		let current_issue = self.refreshed_issue_snapshot()?.ok_or_else(|| {
+			eyre::eyre!(
+				"Failed to refresh issue `{}` during delivery closeout validation: tracker returned no current snapshot.",
+				self.issue.identifier
+			)
+		})?;
+
+		if current_issue.state.name != completed_state {
+			eyre::bail!(
+				"Delivery closeout for issue `{}` requires tracker state `{}`, but the refreshed issue is still `{}`.",
+				self.issue.identifier,
+				completed_state,
+				current_issue.state.name
+			);
+		}
+
+		self.pending_review_completion.borrow_mut().take();
+
+		Ok(())
+	}
+
+	fn required_pr_completion_tool_name(&self) -> &'static str {
+		match self.review_context.as_ref().map(|context| context.mode) {
+			Some(ReviewExecutionMode::Handoff) => ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+			Some(ReviewExecutionMode::Repair) => ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
+			Some(ReviewExecutionMode::DeliveryCloseout) =>
+				ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
+			None => ISSUE_REVIEW_HANDOFF_TOOL_NAME,
+		}
 	}
 }
 
@@ -1404,6 +1666,7 @@ struct RepositoryIdentity {
 pub(crate) enum ReviewExecutionMode {
 	Handoff,
 	Repair,
+	DeliveryCloseout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1417,6 +1680,7 @@ pub(crate) enum RunCompletionDisposition {
 	ManualAttention,
 	ReviewHandoff,
 	ReviewRepair,
+	DeliveryCloseout,
 }
 impl RunCompletionDisposition {
 	fn as_str(self) -> &'static str {
@@ -1424,6 +1688,7 @@ impl RunCompletionDisposition {
 			Self::ManualAttention => "manual_attention",
 			Self::ReviewHandoff => "review_handoff",
 			Self::ReviewRepair => "review_repair",
+			Self::DeliveryCloseout => "delivery_closeout",
 		}
 	}
 }
@@ -1444,6 +1709,7 @@ impl DynamicToolContentItem {
 enum PendingReviewCompletion {
 	Handoff(PendingReviewAction),
 	Repair(PendingReviewAction),
+	DeliveryCloseout(PendingReviewAction),
 }
 
 fn resolve_review_handoff_github_token(
@@ -1645,7 +1911,8 @@ mod tests {
 
 	use crate::{
 		agent::tracker_tool_bridge::{
-			DynamicToolHandler, ISSUE_COMMENT_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
+			DynamicToolHandler, ISSUE_COMMENT_TOOL_NAME,
+			ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME, ISSUE_LABEL_ADD_TOOL_NAME,
 			ISSUE_REVIEW_HANDOFF_TOOL_NAME, ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME,
 			ISSUE_TERMINAL_FINALIZE_TOOL_NAME, ISSUE_TRANSITION_TOOL_NAME, LocalRepoDetails,
 			LocalRepoInspector, PullRequestDetails, PullRequestInspector, ReviewExecutionMode,
@@ -1975,6 +2242,19 @@ Use the tracker tools.
 		}
 	}
 
+	fn sample_delivery_closeout_context_in(cwd: &Path, pr_url: &str) -> ReviewHandoffContext {
+		ReviewHandoffContext {
+			attempt_number: 4,
+			branch_name: String::from("x/maestro-pub-618"),
+			run_id: String::from("pub-618-attempt-4-123"),
+			workspace_path: String::from(".workspaces/PUB-618"),
+			cwd: cwd.to_path_buf(),
+			github_token_env_var: Some(String::from("HOME")),
+			mode: ReviewExecutionMode::DeliveryCloseout,
+			recorded_pr_url: Some(pr_url.to_owned()),
+		}
+	}
+
 	fn sample_pull_request() -> PullRequestDetails {
 		PullRequestDetails {
 			head_ref_name: String::from("x/maestro-pub-618"),
@@ -1993,6 +2273,114 @@ Use the tracker tools.
 			repository_name: String::from("maestro"),
 			repository_owner: String::from("helixbox"),
 		}
+	}
+
+	#[test]
+	fn delivery_closeout_apply_validates_merged_pr_and_completed_issue_state() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let mut completed_issue = sample_review_issue();
+
+		completed_issue.state =
+			TrackerState { id: String::from("state-done"), name: String::from("Done") };
+
+		let tracker = FakeTracker::with_refresh_snapshots(vec![vec![completed_issue]]);
+		let issue = sample_review_issue();
+		let workflow = sample_workflow();
+		let pr_url = "https://github.com/helixbox/maestro/pull/260";
+		let mut merged_pull_request = sample_pull_request();
+
+		merged_pull_request.url = String::from(pr_url);
+		merged_pull_request.state = String::from("MERGED");
+
+		let inspector = FakePullRequestInspector::new(vec![
+			Ok(merged_pull_request.clone()),
+			Ok(merged_pull_request),
+		]);
+		let local_repo_inspector =
+			FakeLocalRepoInspector::new(vec![Ok(sample_local_repo()), Ok(sample_local_repo())]);
+		let bridge = TrackerToolBridge::with_review_handoff_inspectors(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_delivery_closeout_context_in(temp_dir.path(), pr_url),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": pr_url,
+				"summary": "Merged the approved lane and finished delivery closeout."
+			}),
+		);
+		let finalize_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			serde_json::json!({ "path": "delivery_closeout" }),
+		);
+
+		assert!(response.success);
+		assert!(finalize_response.success);
+
+		DynamicToolHandler::validate_turn_completion(&bridge, "done")
+			.expect("delivery closeout completion should allow the turn to complete");
+
+		bridge.apply_delivery_closeout().expect("delivery closeout should validate cleanly");
+
+		assert!(tracker.comments.borrow().is_empty());
+		assert!(tracker.state_updates.borrow().is_empty());
+	}
+
+	#[test]
+	fn delivery_closeout_apply_rejects_issue_that_is_not_yet_completed() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let tracker = tracker_with_current_issue_snapshot(&sample_review_issue());
+		let issue = sample_review_issue();
+		let workflow = sample_workflow();
+		let pr_url = "https://github.com/helixbox/maestro/pull/261";
+		let mut merged_pull_request = sample_pull_request();
+
+		merged_pull_request.url = String::from(pr_url);
+		merged_pull_request.state = String::from("MERGED");
+
+		let inspector = FakePullRequestInspector::new(vec![
+			Ok(merged_pull_request.clone()),
+			Ok(merged_pull_request),
+		]);
+		let local_repo_inspector =
+			FakeLocalRepoInspector::new(vec![Ok(sample_local_repo()), Ok(sample_local_repo())]);
+		let bridge = TrackerToolBridge::with_review_handoff_inspectors(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_delivery_closeout_context_in(temp_dir.path(), pr_url),
+			&inspector,
+			&local_repo_inspector,
+		);
+		let response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_DELIVERY_CLOSEOUT_COMPLETE_TOOL_NAME,
+			serde_json::json!({
+				"pr_url": pr_url,
+				"summary": "Merged the approved lane and attempted closeout."
+			}),
+		);
+		let finalize_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TERMINAL_FINALIZE_TOOL_NAME,
+			serde_json::json!({ "path": "delivery_closeout" }),
+		);
+
+		assert!(response.success);
+		assert!(finalize_response.success);
+
+		let error = bridge
+			.apply_delivery_closeout()
+			.expect_err("delivery closeout should reject non-terminal tracker states");
+
+		assert!(error.to_string().contains("requires tracker state `Done`"));
+		assert!(error.to_string().contains("still `In Review`"));
 	}
 
 	#[test]
@@ -2474,7 +2862,7 @@ Use the tracker tools.
 		)
 		.expect_err("turn completion should reject missing terminal tracker actions");
 
-		assert!(error.to_string().contains("recorded neither a PR-backed review handoff"));
+		assert!(error.to_string().contains("recorded neither `issue_review_handoff`"));
 	}
 
 	#[test]
@@ -2929,7 +3317,7 @@ Use the tracker tools.
 			.completion_disposition()
 			.expect_err("conflicting completion signals should be rejected");
 
-		assert!(error.to_string().contains("Use exactly one final handoff path."));
+		assert!(error.to_string().contains("Use exactly one final tracker exit path."));
 	}
 
 	#[test]
@@ -3076,6 +3464,66 @@ Use the tracker tools.
 		assert!(tool_names.contains(&String::from(ISSUE_LABEL_ADD_TOOL_NAME)));
 		assert!(tool_names.contains(&String::from(ISSUE_REVIEW_REPAIR_COMPLETE_TOOL_NAME)));
 		assert!(tool_names.contains(&String::from(ISSUE_TERMINAL_FINALIZE_TOOL_NAME)));
+	}
+
+	#[test]
+	fn delivery_closeout_tool_surface_includes_issue_transition_for_completed_state() {
+		let mut issue = sample_review_issue();
+
+		issue
+			.team
+			.states
+			.push(TrackerState { id: String::from("state-done"), name: String::from("Done") });
+
+		let tracker = tracker_with_current_issue_snapshot(&issue);
+		let workflow = WorkflowDocument::parse_markdown(
+			r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "maestro"
+startable_states = ["Todo"]
+in_progress_state = "In Progress"
+success_state = "In Review"
+failure_state = "Todo"
+terminal_states = ["Done", "Canceled"]
+opt_out_label = "maestro:manual-only"
+needs_attention_label = "maestro:needs-attention"
++++
+
+Use the tracker tools.
+"#,
+		)
+		.expect("workflow should parse");
+		let pr_url = "https://github.com/helixbox/maestro/pull/260";
+		let temp_dir = TempDir::new().expect("tempdir should create");
+		let bridge = TrackerToolBridge::with_run_context(
+			&tracker,
+			&issue,
+			&workflow,
+			sample_delivery_closeout_context_in(temp_dir.path(), pr_url),
+		);
+		let tool_names = DynamicToolHandler::tool_specs(&bridge)
+			.into_iter()
+			.map(|tool| tool.name)
+			.collect::<Vec<_>>();
+		let transition_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "Done" }),
+		);
+		let invalid_transition_response = DynamicToolHandler::handle_call(
+			&bridge,
+			ISSUE_TRANSITION_TOOL_NAME,
+			serde_json::json!({ "state": "In Progress" }),
+		);
+
+		assert!(tool_names.contains(&String::from(ISSUE_TRANSITION_TOOL_NAME)));
+		assert!(transition_response.success);
+		assert!(!invalid_transition_response.success);
+		assert_eq!(tracker.state_updates.borrow().as_slice(), [String::from("state-done")]);
 	}
 
 	#[test]
