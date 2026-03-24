@@ -32,6 +32,8 @@ When you need a shorter operator snapshot, pass `--limit` to `cargo run -- statu
 
 The status snapshot now carries operator-facing liveness fields in both text and JSON output. In addition to `run_id`, `issue_id`, `thread_id`, `branch`, and `workspace_path`, each run reports a coarse `phase`, optional `wait_reason`, the last observed run and protocol activity timestamps, idle seconds, and any queued retry schedule that is still holding the lane.
 
+If you need remote read-only inspection while daemon mode is running, configure `[operator_http]` in `maestro.toml`. The listener is disabled by default; when enabled it serves the same JSON status snapshot model from `GET /state`.
+
 ## Pilot Guide
 
 For the first real pilot, target `maestro` itself before onboarding another repository. Keep the live service config at `./tmp/maestro.toml`, and keep issue workspaces under the repo-local `.workspaces/` directory. If you need a tracked template, start from `./maestro.example.toml`. Each lane is now a clone-backed workspace that keeps its own `.git` metadata inside the lane instead of relying on shared Git administrative storage. Configure secret authority through TOML by naming the required environment variables in `[tracker].api_key_env_var` and `[github].token_env_var`; `maestro` does not infer GitHub auth from ambient shell state.

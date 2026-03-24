@@ -23,6 +23,7 @@ pub struct ServiceConfig {
 	github: ProjectGitHubConfig,
 	#[serde(default)]
 	agent: ProjectAgentConfig,
+	operator_http: Option<ProjectOperatorHttpConfig>,
 }
 impl ServiceConfig {
 	/// Parse service configuration from TOML text.
@@ -76,12 +77,21 @@ impl ServiceConfig {
 		&self.agent
 	}
 
+	/// Optional operator HTTP status endpoint configuration.
+	pub fn operator_http(&self) -> Option<&ProjectOperatorHttpConfig> {
+		self.operator_http.as_ref()
+	}
+
 	fn validate(&self) -> Result<()> {
 		if self.id.trim().is_empty() {
 			eyre::bail!("Project id must not be empty.");
 		}
 
 		self.tracker.validate()?;
+
+		if let Some(operator_http) = self.operator_http() {
+			operator_http.validate()?;
+		}
 
 		self.github.validate()
 	}
@@ -152,6 +162,32 @@ impl ProjectAgentConfig {
 	/// Optional app-server transport override for this project.
 	pub fn transport(&self) -> Option<&str> {
 		self.transport.as_deref()
+	}
+}
+
+/// Optional operator HTTP status endpoint settings.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectOperatorHttpConfig {
+	listen_address: String,
+}
+impl ProjectOperatorHttpConfig {
+	/// Socket address where the read-only operator state endpoint listens.
+	pub fn listen_address(&self) -> &str {
+		&self.listen_address
+	}
+
+	fn validate(&self) -> Result<()> {
+		let trimmed = self.listen_address.trim();
+
+		if trimmed.is_empty() {
+			eyre::bail!("`operator_http.listen_address` must not be empty.");
+		}
+		if trimmed != self.listen_address {
+			eyre::bail!("`operator_http.listen_address` must not include surrounding whitespace.");
+		}
+
+		Ok(())
 	}
 }
 
@@ -240,6 +276,7 @@ mod tests {
 		assert_eq!(config.tracker().project_slug(), "pubfi");
 		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
 		assert_eq!(config.agent().transport(), Some("stdio://"));
+		assert!(config.operator_http().is_none());
 	}
 
 	#[test]
@@ -286,6 +323,75 @@ mod tests {
 		.expect("service config should parse");
 
 		assert_eq!(config.github().token_env_var(), Some("HOME"));
+	}
+
+	#[test]
+	fn parses_optional_operator_http_listener() {
+		let config = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[operator_http]
+				listen_address = "127.0.0.1:8900"
+			"#,
+		)
+		.expect("service config should parse");
+
+		assert_eq!(
+			config.operator_http().map(|operator_http| operator_http.listen_address()),
+			Some("127.0.0.1:8900")
+		);
+	}
+
+	#[test]
+	fn accepts_hostname_operator_http_listener_without_dns_lookup() {
+		let config = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[operator_http]
+				listen_address = "example.invalid:8900"
+			"#,
+		)
+		.expect("hostname listener should parse without resolving DNS");
+
+		assert_eq!(
+			config.operator_http().map(|operator_http| operator_http.listen_address()),
+			Some("example.invalid:8900")
+		);
+	}
+
+	#[test]
+	fn rejects_blank_operator_http_listener_address() {
+		let error = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[operator_http]
+				listen_address = ""
+			"#,
+		)
+		.expect_err("blank operator http listener should be rejected");
+
+		assert!(error.to_string().contains("operator_http.listen_address"));
 	}
 
 	#[test]
