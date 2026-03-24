@@ -1781,7 +1781,7 @@ where
 		}
 
 		let Some(issue) = refresh_issue(tracker, &first_entry.issue_id)? else {
-			retry_queue.release(&first_entry.issue_id);
+			clear_retry_schedule_and_release(retry_queue, state_store, &first_entry.issue_id)?;
 
 			continue;
 		};
@@ -1793,7 +1793,7 @@ where
 			state_store,
 			&first_entry,
 		)? {
-			retry_queue.release(&first_entry.issue_id);
+			clear_retry_schedule_and_release(retry_queue, state_store, &first_entry.issue_id)?;
 
 			continue;
 		}
@@ -1848,7 +1848,7 @@ where
 				continue;
 			}
 
-			retry_queue.release(&entry.issue_id);
+			clear_retry_schedule_and_release(retry_queue, state_store, &entry.issue_id)?;
 
 			continue;
 		};
@@ -5258,8 +5258,14 @@ fn operator_run_status(
 	run: ProjectRunStatus,
 	now_unix_epoch: i64,
 ) -> crate::prelude::Result<OperatorRunStatus> {
-	let marker =
-		run.workspace_path().map(state::read_run_activity_marker_snapshot).transpose()?.flatten();
+	let marker = run
+		.workspace_path()
+		.map(state::read_run_activity_marker_snapshot)
+		.transpose()?
+		.flatten()
+		.filter(|marker| {
+			marker.run_id() == run.run_id() && marker.attempt_number() == run.attempt_number()
+		});
 	let process_id = marker.as_ref().and_then(RunActivityMarker::process_id);
 	let process_alive = process_id.map(process_is_alive);
 	let last_run_activity_unix_epoch = max_optional_i64(
@@ -7888,6 +7894,67 @@ max_concurrent_agents_by_state = {{ "In Progress" = 1 }}
 	}
 
 	#[test]
+	fn future_retry_claim_release_clears_persisted_retry_marker() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Review", &[]);
+		let tracker =
+			FakeTracker::with_refresh_snapshots(vec![issue.clone()], vec![vec![issue.clone()]]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_path = config.workspace_root().join("PUB-101");
+		let mut retry_queue = orchestrator::RetryQueue::default();
+
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		state::write_run_retry_schedule(
+			&workspace_path,
+			"run-1",
+			1,
+			"failure",
+			OffsetDateTime::now_utc().unix_timestamp() + 60,
+		)
+		.expect("retry schedule should write");
+
+		retry_queue.upsert(orchestrator::RetryEntry {
+			issue_id: issue.id.clone(),
+			retry_project_slug: issue
+				.project_slug
+				.clone()
+				.expect("sample issue should carry a project slug"),
+			continuation_initial_issue_state: None,
+			dispatch_mode: orchestrator::IssueDispatchMode::Retry,
+			kind: orchestrator::RetryKind::Failure,
+			attempt: 1,
+			ready_at: Instant::now() + Duration::from_secs(60),
+		});
+
+		let decision = orchestrator::plan_due_retry_run(
+			&mut retry_queue,
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("retry planning should succeed");
+
+		assert!(matches!(decision, orchestrator::RetryDispatchDecision::Continue));
+		assert!(retry_queue.is_empty(), "non-active issue should release the queued claim early");
+
+		let marker = state::read_run_activity_marker_snapshot(&workspace_path)
+			.expect("marker should load")
+			.expect("marker should still exist");
+
+		assert_eq!(marker.retry_kind(), None);
+		assert_eq!(marker.retry_ready_at_unix_epoch(), None);
+	}
+
+	#[test]
 	fn due_continuation_retry_dispatches_when_issue_still_reflects_startable_state() {
 		let (_temp_dir, config, workflow) = temp_project_layout();
 		let issue = sample_issue("Todo", &[]);
@@ -9378,6 +9445,50 @@ Custom workflow.
 
 		assert_eq!(run.phase, "stalled");
 		assert_eq!(run.wait_reason.as_deref(), Some("app_server_idle_timeout"));
+	}
+
+	#[test]
+	fn operator_status_snapshot_ignores_marker_from_newer_attempt_for_historical_run() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("Todo", &[]);
+		let workspace_path = config.workspace_root().join("PUB-101");
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "failed")
+			.expect("historical run should record");
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+		state::write_run_activity_marker_for_process(&workspace_path, "run-2", 2, process::id())
+			.expect("newer attempt marker should write");
+		state::write_run_retry_schedule(
+			&workspace_path,
+			"run-2",
+			2,
+			"failure",
+			OffsetDateTime::now_utc().unix_timestamp() + 60,
+		)
+		.expect("retry schedule marker should write");
+
+		let snapshot = orchestrator::build_operator_status_snapshot(&config, &state_store, 10)
+			.expect("snapshot should build");
+		let run = snapshot.recent_runs.first().expect("recent run should exist");
+
+		assert_eq!(run.run_id, "run-1");
+		assert_eq!(run.phase, "failed");
+		assert_eq!(run.wait_reason, None);
+		assert_eq!(run.process_id, None);
+		assert_eq!(run.process_alive, None);
+		assert_eq!(run.retry_kind, None);
+		assert_eq!(run.next_retry_at, None);
 	}
 
 	#[test]
