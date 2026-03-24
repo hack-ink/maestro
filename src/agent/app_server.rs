@@ -131,6 +131,7 @@ struct RunRecorder<'a> {
 	run_id: &'a str,
 	attempt_number: i64,
 	activity_marker_path: Option<&'a PathBuf>,
+	thread_id: Option<String>,
 	next_sequence: i64,
 }
 impl<'a> RunRecorder<'a> {
@@ -140,13 +141,35 @@ impl<'a> RunRecorder<'a> {
 		attempt_number: i64,
 		activity_marker_path: Option<&'a PathBuf>,
 	) -> Self {
-		Self { state_store, run_id, attempt_number, activity_marker_path, next_sequence: 1 }
+		Self {
+			state_store,
+			run_id,
+			attempt_number,
+			activity_marker_path,
+			thread_id: None,
+			next_sequence: 1,
+		}
 	}
 
 	fn mark_activity(&self) -> Result<()> {
 		if let Some(marker_path) = self.activity_marker_path {
 			write_activity_marker_best_effort(marker_path, self.run_id, self.attempt_number);
 		};
+
+		Ok(())
+	}
+
+	fn set_thread_id(&mut self, thread_id: &str) -> Result<()> {
+		self.thread_id = Some(thread_id.to_owned());
+
+		if let Some(marker_path) = self.activity_marker_path {
+			write_thread_marker_best_effort(
+				marker_path,
+				self.run_id,
+				self.attempt_number,
+				thread_id,
+			);
+		}
 
 		Ok(())
 	}
@@ -159,6 +182,9 @@ impl<'a> RunRecorder<'a> {
 				marker_path,
 				self.run_id,
 				self.attempt_number,
+				self.thread_id.as_deref(),
+				self.next_sequence,
+				event_type,
 			);
 		}
 
@@ -437,16 +463,43 @@ fn write_protocol_activity_marker_best_effort(
 	marker_path: &Path,
 	run_id: &str,
 	attempt_number: i64,
+	thread_id: Option<&str>,
+	event_count: i64,
+	event_type: &str,
 ) {
-	if let Err(error) =
-		state::write_run_protocol_activity_marker(marker_path, run_id, attempt_number)
-	{
+	if let Err(error) = state::write_run_protocol_activity_marker(
+		marker_path,
+		run_id,
+		attempt_number,
+		thread_id,
+		event_count,
+		event_type,
+	) {
 		tracing::warn!(
 			?error,
 			run_id,
 			attempt_number,
 			marker_path = %marker_path.display(),
 			"Failed to update workspace protocol-activity marker."
+		);
+	}
+}
+
+fn write_thread_marker_best_effort(
+	marker_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	thread_id: &str,
+) {
+	if let Err(error) =
+		state::write_run_thread_marker(marker_path, run_id, attempt_number, thread_id)
+	{
+		tracing::warn!(
+			?error,
+			run_id,
+			attempt_number,
+			marker_path = %marker_path.display(),
+			"Failed to update workspace thread marker."
 		);
 	}
 }
@@ -479,6 +532,7 @@ fn execute_app_server_run_inner(
 	let thread_id = thread_response.thread.id.clone();
 
 	state_store.update_run_thread(&request.run_id, &thread_id)?;
+	recorder.set_thread_id(&thread_id)?;
 	recorder.mark_activity()?;
 
 	flush_pending_messages(&mut client, &mut recorder, Some(&thread_id))?;

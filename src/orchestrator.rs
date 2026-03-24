@@ -5547,6 +5547,30 @@ fn operator_run_status(
 		retry_ready_at_unix_epoch,
 		now_unix_epoch,
 	);
+	let thread_id = run
+		.thread_id()
+		.or_else(|| marker.as_ref().and_then(RunActivityMarker::thread_id))
+		.map(str::to_owned);
+	let use_marker_protocol_summary =
+		run.event_count() == 0 && run.last_event_type().is_none() && run.last_event_at().is_none();
+	let last_event_type = if use_marker_protocol_summary {
+		marker.as_ref().and_then(RunActivityMarker::last_event_type).map(str::to_owned)
+	} else {
+		run.last_event_type().map(str::to_owned)
+	};
+	let last_event_at = if use_marker_protocol_summary {
+		marker
+			.as_ref()
+			.and_then(RunActivityMarker::last_protocol_activity_unix_epoch)
+			.and_then(|unix_epoch| format_optional_unix_timestamp(Some(unix_epoch)))
+	} else {
+		run.last_event_at().map(str::to_owned)
+	};
+	let event_count = if use_marker_protocol_summary {
+		marker.as_ref().map_or(0, RunActivityMarker::event_count)
+	} else {
+		run.event_count()
+	};
 
 	Ok(OperatorRunStatus {
 		run_id: run.run_id().to_owned(),
@@ -5555,7 +5579,7 @@ fn operator_run_status(
 		status: run.status().to_owned(),
 		phase,
 		wait_reason,
-		thread_id: run.thread_id().map(str::to_owned),
+		thread_id,
 		active_lease: run.active_lease(),
 		updated_at: run.updated_at().to_owned(),
 		last_run_activity_at: format_optional_unix_timestamp(last_run_activity_unix_epoch),
@@ -5563,9 +5587,9 @@ fn operator_run_status(
 			last_protocol_activity_unix_epoch,
 		),
 		idle_for_seconds,
-		last_event_type: run.last_event_type().map(str::to_owned),
-		last_event_at: run.last_event_at().map(str::to_owned),
-		event_count: run.event_count(),
+		last_event_type,
+		last_event_at,
+		event_count,
 		process_id,
 		process_alive,
 		retry_kind,
@@ -9884,6 +9908,56 @@ Custom workflow.
 	}
 
 	#[test]
+	fn live_operator_status_snapshot_hydrates_active_run_thread_and_event_metadata_from_marker() {
+		let (_temp_dir, config, workflow) = temp_project_layout();
+		let issue = sample_issue("In Progress", &[]);
+		let tracker = FakeTracker::new(vec![issue.clone()]);
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let workspace_path = config.workspace_root().join(&issue.identifier);
+
+		fs::create_dir_all(&workspace_path).expect("workspace path should exist");
+		state::write_run_activity_marker(&workspace_path, "run-1", 1)
+			.expect("activity marker should write");
+		state::write_run_thread_marker(&workspace_path, "run-1", 1, "thread-1")
+			.expect("thread marker should write");
+		state::write_run_protocol_activity_marker(
+			&workspace_path,
+			"run-1",
+			1,
+			Some("thread-1"),
+			2,
+			"turn/completed",
+		)
+		.expect("protocol summary should write");
+
+		let recovered_state = orchestrator::recover_runtime_state_from_tracker_and_workspaces(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+		)
+		.expect("runtime recovery should succeed");
+
+		orchestrator::hydrate_status_snapshot_state(&config, &state_store, recovered_state)
+			.expect("status hydration should succeed");
+
+		let snapshot = orchestrator::build_live_operator_status_snapshot(
+			&tracker,
+			&config,
+			&workflow,
+			&state_store,
+			10,
+		)
+		.expect("snapshot should build");
+
+		assert_eq!(snapshot.active_runs.len(), 1);
+		assert_eq!(snapshot.active_runs[0].thread_id.as_deref(), Some("thread-1"));
+		assert_eq!(snapshot.active_runs[0].event_count, 2);
+		assert_eq!(snapshot.active_runs[0].last_event_type.as_deref(), Some("turn/completed"));
+		assert!(snapshot.active_runs[0].last_event_at.is_some());
+	}
+
+	#[test]
 	fn operator_status_text_renders_human_readable_sections() {
 		let snapshot = orchestrator::OperatorStatusSnapshot {
 			project_id: String::from("pubfi"),
@@ -13700,8 +13774,15 @@ Custom workflow.
 			.record_run_attempt(run_id, &issue.id, 1, "failed")
 			.expect("run should exit as failed before daemon inspects it");
 
-		state::write_run_protocol_activity_marker(&workspace_path, run_id, 1)
-			.expect("protocol marker should write");
+		state::write_run_protocol_activity_marker(
+			&workspace_path,
+			run_id,
+			1,
+			None,
+			1,
+			"thread/status/changed",
+		)
+		.expect("protocol marker should write");
 
 		let last_protocol_activity =
 			state::read_run_protocol_activity_marker(&workspace_path, run_id, 1)

@@ -947,6 +947,9 @@ pub(crate) struct RunActivityMarker {
 	process_id: Option<u32>,
 	last_activity_unix_epoch: Option<i64>,
 	last_protocol_activity_unix_epoch: Option<i64>,
+	thread_id: Option<String>,
+	event_count: Option<i64>,
+	last_event_type: Option<String>,
 	retry_budget_attempt_count: Option<i64>,
 	retry_kind: Option<String>,
 	retry_ready_at_unix_epoch: Option<i64>,
@@ -970,6 +973,18 @@ impl RunActivityMarker {
 
 	pub(crate) fn last_protocol_activity_unix_epoch(&self) -> Option<i64> {
 		self.last_protocol_activity_unix_epoch
+	}
+
+	pub(crate) fn thread_id(&self) -> Option<&str> {
+		self.thread_id.as_deref()
+	}
+
+	pub(crate) fn event_count(&self) -> i64 {
+		self.event_count.unwrap_or(0)
+	}
+
+	pub(crate) fn last_event_type(&self) -> Option<&str> {
+		self.last_event_type.as_deref()
 	}
 
 	pub(crate) fn retry_kind(&self) -> Option<&str> {
@@ -1187,6 +1202,9 @@ struct RunActivityMarkerRecord {
 	process_id: Option<u32>,
 	last_activity_unix_epoch: Option<i64>,
 	last_protocol_activity_unix_epoch: Option<i64>,
+	thread_id: Option<String>,
+	event_count: Option<i64>,
+	last_event_type: Option<String>,
 	retry_budget_attempt_count: Option<i64>,
 	retry_kind: Option<String>,
 	retry_ready_at_unix_epoch: Option<i64>,
@@ -1235,17 +1253,49 @@ pub(crate) fn write_run_protocol_activity_marker(
 	workspace_path: &Path,
 	run_id: &str,
 	attempt_number: i64,
+	thread_id: Option<&str>,
+	event_count: i64,
+	last_event_type: &str,
 ) -> Result<()> {
 	let now = OffsetDateTime::now_utc().unix_timestamp();
+	let mut marker = read_run_activity_marker_record(workspace_path)?.unwrap_or_default();
 
-	write_run_activity_marker_at(
-		workspace_path,
-		run_id,
-		attempt_number,
-		process::id(),
-		now,
-		Some(now),
-	)
+	marker.run_id = Some(run_id.to_owned());
+	marker.attempt_number = Some(attempt_number);
+
+	marker.process_id.get_or_insert_with(process::id);
+
+	marker.last_activity_unix_epoch = Some(now);
+	marker.last_protocol_activity_unix_epoch = Some(now);
+	marker.thread_id = thread_id.map(str::to_owned).or(marker.thread_id);
+	marker.event_count = Some(event_count);
+	marker.last_event_type = Some(last_event_type.to_owned());
+
+	write_run_activity_marker_record(workspace_path, &marker)?;
+
+	Ok(())
+}
+
+pub(crate) fn write_run_thread_marker(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	thread_id: &str,
+) -> Result<()> {
+	fs::create_dir_all(workspace_path)?;
+
+	let mut marker = read_run_activity_marker_record(workspace_path)?.unwrap_or_default();
+
+	marker.run_id = Some(run_id.to_owned());
+	marker.attempt_number = Some(attempt_number);
+
+	marker.process_id.get_or_insert_with(process::id);
+
+	marker.thread_id = Some(thread_id.to_owned());
+
+	write_run_activity_marker_record(workspace_path, &marker)?;
+
+	Ok(())
 }
 
 pub(crate) fn read_run_activity_marker(
@@ -1343,6 +1393,9 @@ pub(crate) fn read_run_activity_marker_snapshot(
 			process_id: marker.process_id,
 			last_activity_unix_epoch: marker.last_activity_unix_epoch,
 			last_protocol_activity_unix_epoch: marker.last_protocol_activity_unix_epoch,
+			thread_id: marker.thread_id,
+			event_count: marker.event_count,
+			last_event_type: marker.last_event_type,
 			retry_budget_attempt_count: marker.retry_budget_attempt_count,
 			retry_kind: marker.retry_kind,
 			retry_ready_at_unix_epoch: marker.retry_ready_at_unix_epoch,
@@ -1638,6 +1691,9 @@ fn write_run_activity_marker_at(
 		last_protocol_activity_unix_epoch: last_protocol_activity_unix_epoch.or_else(|| {
 			same_run_marker.and_then(|marker| marker.last_protocol_activity_unix_epoch)
 		}),
+		thread_id: same_run_marker.and_then(|marker| marker.thread_id.clone()),
+		event_count: same_run_marker.and_then(|marker| marker.event_count),
+		last_event_type: same_run_marker.and_then(|marker| marker.last_event_type.clone()),
 		retry_budget_attempt_count: existing_marker
 			.as_ref()
 			.and_then(|marker| marker.retry_budget_attempt_count),
@@ -1679,6 +1735,9 @@ fn read_run_activity_marker_record(
 				marker.last_activity_unix_epoch = value.parse::<i64>().ok(),
 			"last_protocol_activity_unix_epoch" =>
 				marker.last_protocol_activity_unix_epoch = value.parse::<i64>().ok(),
+			"thread_id" => marker.thread_id = Some(value.to_owned()),
+			"event_count" => marker.event_count = value.parse::<i64>().ok(),
+			"last_event_type" => marker.last_event_type = Some(value.to_owned()),
 			"retry_budget_attempt_count" =>
 				marker.retry_budget_attempt_count = value.parse::<i64>().ok(),
 			"retry_kind" => marker.retry_kind = Some(value.to_owned()),
@@ -1722,6 +1781,15 @@ fn serialize_run_activity_marker_record(marker: &RunActivityMarkerRecord) -> Str
 		body.push_str(&format!(
 			"last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n"
 		));
+	}
+	if let Some(thread_id) = &marker.thread_id {
+		body.push_str(&format!("thread_id={thread_id}\n"));
+	}
+	if let Some(event_count) = marker.event_count {
+		body.push_str(&format!("event_count={event_count}\n"));
+	}
+	if let Some(last_event_type) = &marker.last_event_type {
+		body.push_str(&format!("last_event_type={last_event_type}\n"));
 	}
 	if let Some(retry_budget_attempt_count) = marker.retry_budget_attempt_count {
 		body.push_str(&format!("retry_budget_attempt_count={retry_budget_attempt_count}\n"));
@@ -2296,6 +2364,34 @@ mod tests {
 
 		assert_eq!(cleared.retry_kind(), None);
 		assert_eq!(cleared.retry_ready_at_unix_epoch(), None);
+	}
+
+	#[test]
+	fn run_activity_marker_round_trips_thread_and_protocol_summary_fields() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+
+		state::write_run_activity_marker_for_process(temp_dir.path(), "run-1", 1, process::id())
+			.expect("activity marker should write");
+		state::write_run_thread_marker(temp_dir.path(), "run-1", 1, "thread-1")
+			.expect("thread marker should write");
+		state::write_run_protocol_activity_marker(
+			temp_dir.path(),
+			"run-1",
+			1,
+			Some("thread-1"),
+			3,
+			"turn/completed",
+		)
+		.expect("protocol summary should write");
+
+		let marker = state::read_run_activity_marker_snapshot(temp_dir.path())
+			.expect("marker snapshot should load")
+			.expect("marker snapshot should exist");
+
+		assert_eq!(marker.thread_id(), Some("thread-1"));
+		assert_eq!(marker.event_count(), 3);
+		assert_eq!(marker.last_event_type(), Some("turn/completed"));
+		assert!(marker.last_protocol_activity_unix_epoch().is_some());
 	}
 
 	#[test]

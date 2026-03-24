@@ -254,6 +254,11 @@ The operator snapshot also exposes coarse liveness semantics so you do not have 
 
 When present, compare `last_run_activity_at`, `last_protocol_activity_at`, and `idle_for_seconds` before assuming a lane is stuck. Quiet work with fresh activity is different from a stale lane with no recent protocol progress.
 
+For the active-run fields:
+
+- `thread_id` stays `null` only until the worker creates the Codex thread for the current run. Once that thread exists, `status` should show the live thread id even when the command is running in a fresh process.
+- `event_count = 0`, `last_event_type = null`, and `last_event_at = null` are normal only before the first protocol event of the current run. After protocol traffic starts, those fields should advance monotonically from the active-run journal or its persisted workspace marker.
+
 If you pass `--limit`, it only caps the recent-run section. Active runs remain uncapped in both the human-readable and JSON status views so the currently leased lanes stay visible.
 
 There is no longer a supported SQLite fallback for normal recovery. If `status` is insufficient, use the tracker plus retained workspace lane directly:
