@@ -235,6 +235,15 @@ cargo run -- status --json --config ./tmp/maestro.toml
 
 Use the human-readable view when you need the current leased run, retained workspace, and recent attempt summary at a glance. Use `--json` when you want a machine-readable snapshot with stable identifiers such as `run_id`, `issue_id`, `thread_id`, `branch`, and repository-relative `workspace_path`.
 
+The operator snapshot also exposes coarse liveness semantics so you do not have to infer progress from workspace file churn alone:
+
+- `phase = executing`: the lane is actively running
+- `phase = waiting_continuation`: the worker ended cleanly at a turn boundary and Maestro may resume it
+- `phase = retry_backoff`: the lane is not dead; Maestro has a queued retry and reports `retry_kind`, `wait_reason`, and `next_retry_at`
+- `phase = stalled`: the lane crossed the app-server idle timeout and needs inspection
+
+When present, compare `last_run_activity_at`, `last_protocol_activity_at`, and `idle_for_seconds` before assuming a lane is stuck. Quiet work with fresh activity is different from a stale lane with no recent protocol progress.
+
 If you pass `--limit`, it only caps the recent-run section. Active runs remain uncapped in both the human-readable and JSON status views so the currently leased lanes stay visible.
 
 There is no longer a supported SQLite fallback for normal recovery. If `status` is insufficient, use the tracker plus retained workspace lane directly:
