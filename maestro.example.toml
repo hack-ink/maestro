@@ -12,3 +12,8 @@ token_env_var = "GITHUB_TOKEN"
 
 [agent]
 transport = "stdio://"
+
+# Optional read-only operator snapshot endpoint for daemon mode.
+# Omit this block to keep the endpoint disabled.
+[operator_http]
+listen_address = "127.0.0.1:8900"

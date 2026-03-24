@@ -6,10 +6,16 @@ use std::{
 	error::Error,
 	fmt::{self, Display, Formatter},
 	fs::{self, File},
-	io::ErrorKind,
+	io::{ErrorKind, Read as _, Write as _},
+	net::{SocketAddr, TcpListener, TcpStream},
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
-	slice, thread,
+	slice,
+	sync::{
+		Arc, Mutex,
+		mpsc::{self, Receiver, Sender},
+	},
+	thread::{self, JoinHandle},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -47,6 +53,7 @@ const FAILURE_RETRY_BASE_DELAY_MS: u64 = 10_000;
 const CONTINUATION_PENDING_RUN_STATUS: &str = "continuation_pending";
 const TERMINAL_GUARDED_RUN_STATUS: &str = "terminal_guarded";
 const TERMINAL_GUARD_MARKER_FILE: &str = ".maestro-terminal-guarded";
+const OPERATOR_STATE_ENDPOINT_PATH: &str = "/state";
 const PULL_REQUEST_REVIEW_STATE_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!, $reviewThreadsAfter: String) {
   repository(owner: $owner, name: $name) {
@@ -452,6 +459,63 @@ struct DaemonTickContext {
 	workspace_manager: WorkspaceManager,
 }
 
+struct OperatorStateEndpoint {
+	listen_address: SocketAddr,
+	snapshot_json: Arc<Mutex<Option<Vec<u8>>>>,
+	shutdown_tx: Sender<()>,
+	server_thread: Option<JoinHandle<()>>,
+}
+impl OperatorStateEndpoint {
+	fn start(listen_address: &str) -> crate::prelude::Result<Self> {
+		let listener = TcpListener::bind(listen_address).map_err(|error| {
+			eyre::eyre!("Failed to bind operator state endpoint on `{listen_address}`: {error}")
+		})?;
+		let listen_address = listener.local_addr().map_err(|error| {
+			eyre::eyre!(
+				"Failed to resolve operator state endpoint address for `{listen_address}`: {error}"
+			)
+		})?;
+
+		listener
+			.set_nonblocking(true)
+			.map_err(|error| eyre::eyre!("Failed to configure operator state endpoint: {error}"))?;
+
+		let snapshot_json = Arc::new(Mutex::new(None));
+		let shared_snapshot_json = Arc::clone(&snapshot_json);
+		let (shutdown_tx, shutdown_rx) = mpsc::channel();
+		let server_thread = thread::spawn(move || {
+			run_operator_state_endpoint(listener, shared_snapshot_json, shutdown_rx);
+		});
+
+		Ok(Self { listen_address, snapshot_json, shutdown_tx, server_thread: Some(server_thread) })
+	}
+
+	fn listen_address(&self) -> SocketAddr {
+		self.listen_address
+	}
+
+	fn publish_snapshot(&self, snapshot: &OperatorStatusSnapshot) -> crate::prelude::Result<()> {
+		let snapshot_json = serde_json::to_vec(snapshot)?;
+		let mut guard = self
+			.snapshot_json
+			.lock()
+			.map_err(|error| eyre::eyre!("Operator state snapshot lock poisoned: {error}"))?;
+
+		*guard = Some(snapshot_json);
+
+		Ok(())
+	}
+}
+impl Drop for OperatorStateEndpoint {
+	fn drop(&mut self) {
+		let _ = self.shutdown_tx.send(());
+
+		if let Some(server_thread) = self.server_thread.take() {
+			let _ = server_thread.join();
+		}
+	}
+}
+
 #[derive(Clone)]
 struct CachedWorkflowDocument {
 	path: PathBuf,
@@ -478,7 +542,7 @@ struct TerminalFailureOutcome {
 	retry_guarded_by_state: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct OperatorStatusSnapshot {
 	project_id: String,
 	run_limit: usize,
@@ -936,6 +1000,8 @@ pub(crate) fn run_daemon(
 	let Some(config_path) = resolve_config_path(config_path)? else {
 		eyre::bail!("No maestro config found. Pass --config or create tmp/maestro.toml.");
 	};
+	let operator_state_endpoint =
+		start_operator_state_endpoint(&ServiceConfig::from_path(&config_path)?)?;
 	let state_store = StateStore::open_in_memory()?;
 	let mut active_children = Vec::new();
 	let mut retry_queue = RetryQueue::default();
@@ -947,6 +1013,14 @@ pub(crate) fn run_daemon(
 		"Starting daemon poll loop."
 	);
 
+	if let Some(operator_state_endpoint) = operator_state_endpoint.as_ref() {
+		tracing::info!(
+			listen_address = %operator_state_endpoint.listen_address(),
+			path = OPERATOR_STATE_ENDPOINT_PATH,
+			"Operator state endpoint enabled."
+		);
+	}
+
 	loop {
 		let tick_started_at = Instant::now();
 
@@ -956,7 +1030,13 @@ pub(crate) fn run_daemon(
 				&state_store,
 				&mut active_children,
 				&mut retry_queue,
-				context,
+				&context,
+			)?;
+
+			publish_operator_state_snapshot(
+				operator_state_endpoint.as_ref(),
+				&context,
+				&state_store,
 			)
 		}) {
 			Ok(()) => {},
@@ -998,18 +1078,8 @@ pub(crate) fn print_status(
 
 	hydrate_status_snapshot_state(&config, &state_store, recovered_state)?;
 
-	let mut snapshot = build_operator_status_snapshot(&config, &state_store, limit)?;
-	let review_state_inspector = GhPullRequestReviewStateInspector {
-		github_token_env_var: config.github().token_env_var().map(str::to_owned),
-	};
-
-	snapshot.post_review_lanes = build_post_review_lane_statuses(
-		&tracker,
-		&config,
-		&workflow,
-		&state_store,
-		&review_state_inspector,
-	)?;
+	let snapshot =
+		build_live_operator_status_snapshot(&tracker, &config, &workflow, &state_store, limit)?;
 
 	if json {
 		println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -1018,6 +1088,118 @@ pub(crate) fn print_status(
 	}
 
 	Ok(())
+}
+
+fn run_operator_state_endpoint(
+	listener: TcpListener,
+	snapshot_json: Arc<Mutex<Option<Vec<u8>>>>,
+	shutdown_rx: Receiver<()>,
+) {
+	loop {
+		if shutdown_rx.try_recv().is_ok() {
+			return;
+		}
+
+		match listener.accept() {
+			Ok((stream, _peer_addr)) => {
+				if let Err(error) =
+					handle_operator_state_endpoint_connection(stream, &snapshot_json)
+				{
+					tracing::warn!(?error, "Operator state endpoint request failed.");
+				}
+			},
+			Err(error) if error.kind() == ErrorKind::WouldBlock => {
+				thread::sleep(Duration::from_millis(20));
+			},
+			Err(error) => {
+				tracing::warn!(?error, "Operator state endpoint accept failed.");
+
+				thread::sleep(Duration::from_millis(50));
+			},
+		}
+	}
+}
+
+fn handle_operator_state_endpoint_connection(
+	mut stream: TcpStream,
+	snapshot_json: &Arc<Mutex<Option<Vec<u8>>>>,
+) -> crate::prelude::Result<()> {
+	stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+	stream.set_write_timeout(Some(Duration::from_millis(250)))?;
+
+	let mut buffer = [0_u8; 4_096];
+	let bytes_read = stream.read(&mut buffer)?;
+	let body = snapshot_json
+		.lock()
+		.map_err(|error| eyre::eyre!("Operator state snapshot lock poisoned: {error}"))?
+		.clone();
+	let response = build_operator_state_http_response(&buffer[..bytes_read], body.as_deref())?;
+
+	stream.write_all(&response)?;
+
+	Ok(())
+}
+
+fn build_operator_state_http_response(
+	request: &[u8],
+	snapshot_json: Option<&[u8]>,
+) -> crate::prelude::Result<Vec<u8>> {
+	let request = String::from_utf8_lossy(request);
+	let mut request_line = request.lines();
+	let Some(request_line) = request_line.next() else {
+		return Ok(http_response_bytes(
+			"400 Bad Request",
+			"text/plain; charset=utf-8",
+			b"missing request line",
+		));
+	};
+	let mut parts = request_line.split_whitespace();
+	let Some(method) = parts.next() else {
+		return Ok(http_response_bytes(
+			"400 Bad Request",
+			"text/plain; charset=utf-8",
+			b"missing method",
+		));
+	};
+	let Some(path) = parts.next() else {
+		return Ok(http_response_bytes(
+			"400 Bad Request",
+			"text/plain; charset=utf-8",
+			b"missing path",
+		));
+	};
+
+	if method != "GET" {
+		return Ok(http_response_bytes(
+			"405 Method Not Allowed",
+			"text/plain; charset=utf-8",
+			b"method not allowed",
+		));
+	}
+	if path != OPERATOR_STATE_ENDPOINT_PATH {
+		return Ok(http_response_bytes("404 Not Found", "text/plain; charset=utf-8", b"not found"));
+	}
+
+	Ok(match snapshot_json {
+		Some(snapshot_json) => http_response_bytes("200 OK", "application/json", snapshot_json),
+		None => http_response_bytes(
+			"503 Service Unavailable",
+			"text/plain; charset=utf-8",
+			b"operator snapshot unavailable",
+		),
+	})
+}
+
+fn http_response_bytes(status_line: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+	let mut response = format!(
+		"HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+		body.len()
+	)
+	.into_bytes();
+
+	response.extend_from_slice(body);
+
+	response
 }
 
 fn query_pull_request_review_state_page(
@@ -1236,7 +1418,7 @@ fn run_daemon_tick(
 	state_store: &StateStore,
 	active_children: &mut Vec<DaemonRunChild>,
 	retry_queue: &mut RetryQueue,
-	context: DaemonTickContext,
+	context: &DaemonTickContext,
 ) -> crate::prelude::Result<()> {
 	inspect_or_clear_active_children(
 		active_children,
@@ -1277,6 +1459,34 @@ fn run_daemon_tick(
 	}
 
 	Ok(())
+}
+
+fn publish_operator_state_snapshot(
+	operator_state_endpoint: Option<&OperatorStateEndpoint>,
+	context: &DaemonTickContext,
+	state_store: &StateStore,
+) -> crate::prelude::Result<()> {
+	let Some(operator_state_endpoint) = operator_state_endpoint else {
+		return Ok(());
+	};
+	let snapshot = build_live_operator_status_snapshot(
+		&context.tracker,
+		&context.config,
+		&context.workflow,
+		state_store,
+		DEFAULT_STATUS_RUN_LIMIT,
+	)?;
+
+	operator_state_endpoint.publish_snapshot(&snapshot)
+}
+
+fn start_operator_state_endpoint(
+	config: &ServiceConfig,
+) -> crate::prelude::Result<Option<OperatorStateEndpoint>> {
+	config
+		.operator_http()
+		.map(|operator_http| OperatorStateEndpoint::start(operator_http.listen_address()))
+		.transpose()
 }
 
 fn inspect_or_clear_active_children<T>(
@@ -4574,6 +4784,32 @@ fn build_operator_status_snapshot(
 	})
 }
 
+fn build_live_operator_status_snapshot<T>(
+	tracker: &T,
+	project: &ServiceConfig,
+	workflow: &WorkflowDocument,
+	state_store: &StateStore,
+	limit: usize,
+) -> crate::prelude::Result<OperatorStatusSnapshot>
+where
+	T: IssueTracker,
+{
+	let review_state_inspector = GhPullRequestReviewStateInspector {
+		github_token_env_var: project.github().token_env_var().map(str::to_owned),
+	};
+	let mut snapshot = build_operator_status_snapshot(project, state_store, limit)?;
+
+	snapshot.post_review_lanes = build_post_review_lane_statuses(
+		tracker,
+		project,
+		workflow,
+		state_store,
+		&review_state_inspector,
+	)?;
+
+	Ok(snapshot)
+}
+
 fn build_post_review_lane_statuses<T, I>(
 	tracker: &T,
 	project: &ServiceConfig,
@@ -6221,6 +6457,56 @@ mod tests {
 			config.tracker().api_key_env_var(),
 		))
 		.expect("service config with github token authority should parse")
+	}
+
+	fn service_config_with_operator_http_listener(
+		config: &ServiceConfig,
+		listen_address: &str,
+	) -> ServiceConfig {
+		let github_config =
+			config.github().token_env_var().map_or_else(String::new, |token_env_var| {
+				format!(
+					r#"
+
+				[github]
+				token_env_var = "{token_env_var}"
+				"#
+				)
+			});
+		let agent_config = config.agent().transport().map_or_else(String::new, |transport| {
+			format!(
+				r#"
+
+				[agent]
+				transport = "{transport}"
+				"#
+			)
+		});
+
+		ServiceConfig::parse_toml(&format!(
+			r#"
+				id = "{}"
+				repo_root = "{}"
+				workspace_root = "{}"
+				workflow_path = "{}"
+
+				[tracker]
+				project_slug = "{}"
+				api_key_env_var = "{}"
+				{github_config}
+				{agent_config}
+
+				[operator_http]
+				listen_address = "{listen_address}"
+			"#,
+			config.id(),
+			config.repo_root().display(),
+			config.workspace_root().display(),
+			config.workflow_path().display(),
+			config.tracker().project_slug(),
+			config.tracker().api_key_env_var(),
+		))
+		.expect("service config with operator http listener should parse")
 	}
 
 	fn temp_project_layout_with_tracker_project_slug(
@@ -9618,6 +9904,69 @@ Custom workflow.
 		assert!(rendered.contains("last_event: turn/completed @ 2026-03-14 10:00:01"));
 		assert!(rendered.contains("Retained Workspaces"));
 		assert!(rendered.contains("workspace_path: .workspaces/PUB-101"));
+	}
+
+	#[test]
+	fn operator_state_endpoint_is_disabled_when_listener_is_not_configured() {
+		let (_temp_dir, config, _workflow) = temp_project_layout();
+
+		assert!(
+			orchestrator::start_operator_state_endpoint(&config)
+				.expect("disabled listener should not fail")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn operator_state_endpoint_serves_snapshot_json_when_enabled() {
+		let (_temp_dir, base_config, _workflow) = temp_project_layout();
+		let config = service_config_with_operator_http_listener(&base_config, "127.0.0.1:0");
+		let state_store = StateStore::open_in_memory().expect("state store should open");
+		let issue = sample_issue("Todo", &[]);
+		let workspace_path = config.workspace_root().join("PUB-101");
+
+		state_store
+			.record_run_attempt("run-1", &issue.id, 1, "running")
+			.expect("run attempt should record");
+		state_store
+			.upsert_lease("pubfi", &issue.id, "run-1", "In Progress")
+			.expect("lease should record");
+		state_store
+			.upsert_workspace(
+				"pubfi",
+				&issue.id,
+				"x/pubfi-pub-101",
+				&workspace_path.display().to_string(),
+			)
+			.expect("workspace should record");
+
+		let snapshot = orchestrator::build_operator_status_snapshot(&config, &state_store, 10)
+			.expect("snapshot should build");
+		let snapshot_json = serde_json::to_vec(&snapshot).expect("snapshot json should serialize");
+		let response = String::from_utf8(
+			orchestrator::build_operator_state_http_response(
+				format!(
+					"GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+					orchestrator::OPERATOR_STATE_ENDPOINT_PATH
+				)
+				.as_bytes(),
+				Some(snapshot_json.as_slice()),
+			)
+			.expect("response build should succeed"),
+		)
+		.expect("response should be utf-8");
+		let (status_line, body) =
+			response.split_once("\r\n").expect("response should contain a status line");
+		let body = body.split_once("\r\n\r\n").expect("response should contain a body").1;
+		let served_snapshot: serde_json::Value =
+			serde_json::from_str(body).expect("body should be valid json");
+
+		assert_eq!(status_line, "HTTP/1.1 200 OK");
+		assert_eq!(served_snapshot["project_id"], "pubfi");
+		assert_eq!(served_snapshot["run_limit"], 10);
+		assert_eq!(served_snapshot["active_runs"][0]["run_id"], "run-1");
+		assert_eq!(served_snapshot["active_runs"][0]["phase"], "executing");
+		assert_eq!(served_snapshot["workspaces"][0]["workspace_path"], "workspaces/PUB-101");
 	}
 
 	#[test]

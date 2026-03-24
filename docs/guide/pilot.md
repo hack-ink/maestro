@@ -170,6 +170,15 @@ cargo run -- daemon --poll-interval-s 60 --config ./tmp/maestro.toml
 
 Daemon mode currently requires a Unix target because the parent process hands the single project dispatch-slot lock to the spawned `run --once` child via file-descriptor inheritance.
 
+If you need remote read-only inspection, add an optional `[operator_http]` block to the same service config before starting the daemon:
+
+```toml
+[operator_http]
+listen_address = "127.0.0.1:8900"
+```
+
+The listener is disabled by default when that block is absent. When enabled, daemon mode serves the same JSON operator snapshot used by `cargo run -- status --json --config ./tmp/maestro.toml` from `GET /state`.
+
 During daemon mode, each poll tick now does two distinct things:
 
 1. inspect any currently leased active lane
