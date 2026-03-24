@@ -3463,8 +3463,6 @@ where
 		.transport()
 		.unwrap_or(workflow.frontmatter().agent().transport())
 		.to_owned();
-	let model =
-		project.agent().model().or(workflow.frontmatter().agent().model()).map(str::to_owned);
 	let review_context = build_review_run_context(project, issue_run)?;
 	let tracker_tool_bridge = TrackerToolBridge::with_run_context(
 		tracker,
@@ -3503,7 +3501,6 @@ where
 				issue_run,
 				review_context.recorded_pr_url.as_deref(),
 			),
-			model: model.clone(),
 			personality: workflow.frontmatter().agent().personality().map(str::to_owned),
 			service_tier: workflow.frontmatter().agent().service_tier().map(str::to_owned),
 			max_turns: workflow.frontmatter().execution().max_turns(),

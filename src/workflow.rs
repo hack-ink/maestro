@@ -229,7 +229,6 @@ pub struct WorkflowAgent {
 	sandbox: String,
 	#[serde(default = "default_approval_policy")]
 	approval_policy: String,
-	model: Option<String>,
 	personality: Option<String>,
 	service_tier: Option<String>,
 }
@@ -249,11 +248,6 @@ impl WorkflowAgent {
 		&self.approval_policy
 	}
 
-	/// Optional model override.
-	pub fn model(&self) -> Option<&str> {
-		self.model.as_deref()
-	}
-
 	/// Optional personality override.
 	pub fn personality(&self) -> Option<&str> {
 		self.personality.as_deref()
@@ -271,7 +265,6 @@ impl Default for WorkflowAgent {
 			transport: default_transport(),
 			sandbox: default_sandbox(),
 			approval_policy: default_approval_policy(),
-			model: None,
 			personality: None,
 			service_tier: None,
 		}

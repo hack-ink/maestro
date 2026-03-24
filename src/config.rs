@@ -146,17 +146,11 @@ impl ProjectGitHubConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 pub struct ProjectAgentConfig {
 	transport: Option<String>,
-	model: Option<String>,
 }
 impl ProjectAgentConfig {
 	/// Optional app-server transport override for this project.
 	pub fn transport(&self) -> Option<&str> {
 		self.transport.as_deref()
-	}
-
-	/// Optional default model override for this project.
-	pub fn model(&self) -> Option<&str> {
-		self.model.as_deref()
 	}
 }
 
@@ -236,7 +230,6 @@ mod tests {
 
 				[agent]
 				transport = "stdio://"
-				model = "gpt-5-codex"
 			"#,
 		)
 		.expect("service config should parse");
@@ -245,7 +238,7 @@ mod tests {
 		assert_eq!(config.workflow_path(), Path::new("WORKFLOW.md"));
 		assert_eq!(config.tracker().project_slug(), "pubfi");
 		assert!(!config.tracker().resolve_api_key().expect("HOME should resolve").is_empty());
-		assert_eq!(config.agent().model(), Some("gpt-5-codex"));
+		assert_eq!(config.agent().transport(), Some("stdio://"));
 	}
 
 	#[test]

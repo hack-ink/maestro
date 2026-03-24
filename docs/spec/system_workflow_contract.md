@@ -115,9 +115,6 @@ Supported keys:
   - type: string
   - optional
   - default: `"never"`
-- `model`
-  - type: string
-  - optional
 - `personality`
   - type: string
   - optional
