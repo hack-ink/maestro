@@ -14,8 +14,6 @@ needs_attention_label = "maestro:needs-attention"
 
 [agent]
 transport = "stdio://"
-sandbox = "workspace-write"
-approval_policy = "never"
 personality = "pragmatic"
 
 [execution]
@@ -32,6 +30,8 @@ validation_commands = [
 +++
 
 Use `cargo make` whenever an equivalent task exists.
+
+Child-run execution policy inherits from the Codex runtime. Do not add repo-local sandbox or approval policy overrides.
 
 Use the issue-scoped tracker tools autonomously for normal-path state changes and comments on the currently leased issue.
 

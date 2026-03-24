@@ -45,8 +45,6 @@ pub(crate) struct AppServerRunRequest<'a> {
 	pub(crate) attempt_number: i64,
 	pub(crate) listen: String,
 	pub(crate) cwd: String,
-	pub(crate) approval_policy: String,
-	pub(crate) sandbox: String,
 	pub(crate) developer_instructions: String,
 	pub(crate) user_input: String,
 	pub(crate) personality: Option<String>,
@@ -200,8 +198,6 @@ struct InitializeResponse {
 
 #[derive(Debug, Default, Serialize)]
 struct ThreadStartRequest {
-	#[serde(rename = "approvalPolicy", skip_serializing_if = "Option::is_none")]
-	approval_policy: Option<String>,
 	#[serde(rename = "baseInstructions", skip_serializing_if = "Option::is_none")]
 	base_instructions: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -218,8 +214,6 @@ struct ThreadStartRequest {
 	model_provider: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	personality: Option<String>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	sandbox: Option<String>,
 	#[serde(rename = "serviceName", skip_serializing_if = "Option::is_none")]
 	service_name: Option<String>,
 	#[serde(rename = "serviceTier", skip_serializing_if = "Option::is_none")]
@@ -238,8 +232,6 @@ struct Thread {
 
 #[derive(Debug, Default, Serialize)]
 struct TurnStartRequest {
-	#[serde(rename = "approvalPolicy", skip_serializing_if = "Option::is_none")]
-	approval_policy: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	cwd: Option<String>,
 	input: Vec<UserInput>,
@@ -247,8 +239,6 @@ struct TurnStartRequest {
 	output_schema: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	personality: Option<String>,
-	#[serde(rename = "sandboxPolicy", skip_serializing_if = "Option::is_none")]
-	sandbox_policy: Option<Value>,
 	#[serde(rename = "serviceTier", skip_serializing_if = "Option::is_none")]
 	service_tier: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -407,8 +397,6 @@ pub(crate) fn probe_app_server(listen: &str) -> Result<AppServerRunResult> {
 			attempt_number: 1,
 			listen: listen.to_owned(),
 			cwd: env::current_dir()?.display().to_string(),
-			approval_policy: String::from("never"),
-			sandbox: String::from("workspace-write"),
 			developer_instructions: PROBE_DEVELOPER_INSTRUCTIONS.to_owned(),
 			user_input: PROBE_USER_INPUT.to_owned(),
 			personality: None,
@@ -483,10 +471,8 @@ fn execute_app_server_run_inner(
 	let thread_response = client.start_thread(ThreadStartRequest {
 		cwd: Some(request.cwd.clone()),
 		dynamic_tools: request.dynamic_tool_handler.map(|handler| handler.tool_specs()),
-		approval_policy: Some(request.approval_policy.clone()),
 		developer_instructions: Some(request.developer_instructions.clone()),
 		personality: request.personality.clone(),
-		sandbox: Some(request.sandbox.clone()),
 		service_tier: request.service_tier.clone().map(Value::String),
 		..ThreadStartRequest::default()
 	})?;
@@ -1004,6 +990,33 @@ mod tests {
 			request.input.as_slice(),
 			[super::UserInput::Text { text }] if text == "hello"
 		));
+	}
+
+	#[test]
+	fn thread_start_request_inherits_execution_policy_from_runtime() {
+		let request = super::ThreadStartRequest {
+			cwd: Some(String::from("/tmp/workspace")),
+			developer_instructions: Some(String::from("Follow the workflow.")),
+			personality: Some(String::from("pragmatic")),
+			..super::ThreadStartRequest::default()
+		};
+		let value = serde_json::to_value(&request).expect("thread start request should serialize");
+
+		assert_eq!(value["cwd"], "/tmp/workspace");
+		assert_eq!(value["developerInstructions"], "Follow the workflow.");
+		assert_eq!(value["personality"], "pragmatic");
+		assert!(value.get("approvalPolicy").is_none());
+		assert!(value.get("sandbox").is_none());
+	}
+
+	#[test]
+	fn turn_start_request_omits_execution_policy_overrides() {
+		let request = super::build_turn_start_request("thread-1", "hello");
+		let value = serde_json::to_value(&request).expect("turn start request should serialize");
+
+		assert_eq!(value["threadId"], "thread-1");
+		assert!(value.get("approvalPolicy").is_none());
+		assert!(value.get("sandboxPolicy").is_none());
 	}
 
 	#[test]
