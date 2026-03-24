@@ -948,6 +948,8 @@ pub(crate) struct RunActivityMarker {
 	last_activity_unix_epoch: Option<i64>,
 	last_protocol_activity_unix_epoch: Option<i64>,
 	retry_budget_attempt_count: Option<i64>,
+	retry_kind: Option<String>,
+	retry_ready_at_unix_epoch: Option<i64>,
 }
 impl RunActivityMarker {
 	pub(crate) fn run_id(&self) -> &str {
@@ -964,6 +966,18 @@ impl RunActivityMarker {
 
 	pub(crate) fn last_activity_unix_epoch(&self) -> Option<i64> {
 		self.last_activity_unix_epoch
+	}
+
+	pub(crate) fn last_protocol_activity_unix_epoch(&self) -> Option<i64> {
+		self.last_protocol_activity_unix_epoch
+	}
+
+	pub(crate) fn retry_kind(&self) -> Option<&str> {
+		self.retry_kind.as_deref()
+	}
+
+	pub(crate) fn retry_ready_at_unix_epoch(&self) -> Option<i64> {
+		self.retry_ready_at_unix_epoch
 	}
 }
 
@@ -1166,7 +1180,7 @@ impl WorkspaceMappingRecord {
 	}
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RunActivityMarkerRecord {
 	run_id: Option<String>,
 	attempt_number: Option<i64>,
@@ -1174,6 +1188,8 @@ struct RunActivityMarkerRecord {
 	last_activity_unix_epoch: Option<i64>,
 	last_protocol_activity_unix_epoch: Option<i64>,
 	retry_budget_attempt_count: Option<i64>,
+	retry_kind: Option<String>,
+	retry_ready_at_unix_epoch: Option<i64>,
 }
 
 struct StateGateGuard {
@@ -1264,28 +1280,50 @@ pub(crate) fn write_run_retry_budget_attempt_count(
 ) -> Result<()> {
 	fs::create_dir_all(workspace_path)?;
 
-	let existing_marker = read_run_activity_marker_record(workspace_path)?;
-	let last_activity_unix_epoch =
-		existing_marker.as_ref().and_then(|marker| marker.last_activity_unix_epoch);
-	let last_protocol_activity_unix_epoch =
-		existing_marker.as_ref().and_then(|marker| marker.last_protocol_activity_unix_epoch);
-	let mut marker_body = format!(
-		"run_id={run_id}\nattempt_number={attempt_number}\nprocess_id={}\nretry_budget_attempt_count={retry_budget_attempt_count}\n",
-		existing_marker.as_ref().and_then(|marker| marker.process_id).unwrap_or_else(process::id)
-	);
+	let mut marker = read_run_activity_marker_record(workspace_path)?.unwrap_or_default();
 
-	if let Some(last_activity_unix_epoch) = last_activity_unix_epoch {
-		marker_body
-			.push_str(format!("last_activity_unix_epoch={last_activity_unix_epoch}\n").as_str());
-	}
-	if let Some(last_protocol_activity_unix_epoch) = last_protocol_activity_unix_epoch {
-		marker_body.push_str(
-			format!("last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n")
-				.as_str(),
-		);
-	}
+	marker.run_id = Some(run_id.to_owned());
+	marker.attempt_number = Some(attempt_number);
 
-	fs::write(workspace_path.join(RUN_ACTIVITY_MARKER_FILE), marker_body)?;
+	marker.process_id.get_or_insert_with(process::id);
+
+	marker.retry_budget_attempt_count = Some(retry_budget_attempt_count);
+
+	write_run_activity_marker_record(workspace_path, &marker)?;
+
+	Ok(())
+}
+
+pub(crate) fn write_run_retry_schedule(
+	workspace_path: &Path,
+	run_id: &str,
+	attempt_number: i64,
+	retry_kind: &str,
+	retry_ready_at_unix_epoch: i64,
+) -> Result<()> {
+	fs::create_dir_all(workspace_path)?;
+
+	let mut marker = read_run_activity_marker_record(workspace_path)?.unwrap_or_default();
+
+	marker.run_id = Some(run_id.to_owned());
+	marker.attempt_number = Some(attempt_number);
+	marker.retry_kind = Some(retry_kind.to_owned());
+	marker.retry_ready_at_unix_epoch = Some(retry_ready_at_unix_epoch);
+
+	write_run_activity_marker_record(workspace_path, &marker)?;
+
+	Ok(())
+}
+
+pub(crate) fn clear_run_retry_schedule(workspace_path: &Path) -> Result<()> {
+	let Some(mut marker) = read_run_activity_marker_record(workspace_path)? else {
+		return Ok(());
+	};
+
+	marker.retry_kind = None;
+	marker.retry_ready_at_unix_epoch = None;
+
+	write_run_activity_marker_record(workspace_path, &marker)?;
 
 	Ok(())
 }
@@ -1306,6 +1344,8 @@ pub(crate) fn read_run_activity_marker_snapshot(
 			last_activity_unix_epoch: marker.last_activity_unix_epoch,
 			last_protocol_activity_unix_epoch: marker.last_protocol_activity_unix_epoch,
 			retry_budget_attempt_count: marker.retry_budget_attempt_count,
+			retry_kind: marker.retry_kind,
+			retry_ready_at_unix_epoch: marker.retry_ready_at_unix_epoch,
 		})
 	}))
 }
@@ -1586,34 +1626,31 @@ fn write_run_activity_marker_at(
 	last_protocol_activity_unix_epoch: Option<i64>,
 ) -> Result<()> {
 	let marker_path = workspace_path.join(RUN_ACTIVITY_MARKER_FILE);
-	let preserved_protocol_activity =
-		read_run_activity_marker_record(workspace_path)?.and_then(|marker| {
-			(marker.run_id.as_deref() == Some(run_id)
-				&& marker.attempt_number == Some(attempt_number))
-			.then_some(marker.last_protocol_activity_unix_epoch)
-			.flatten()
-		});
-	let preserved_retry_budget_attempt_count = read_run_activity_marker_record(workspace_path)?
-		.and_then(|marker| marker.retry_budget_attempt_count);
-	let last_protocol_activity_unix_epoch =
-		last_protocol_activity_unix_epoch.or(preserved_protocol_activity);
-	let mut marker_body = format!(
-		"run_id={run_id}\nattempt_number={attempt_number}\nprocess_id={process_id}\nlast_activity_unix_epoch={last_activity_unix_epoch}\n"
-	);
+	let existing_marker = read_run_activity_marker_record(workspace_path)?;
+	let same_run_marker = existing_marker.as_ref().filter(|marker| {
+		marker.run_id.as_deref() == Some(run_id) && marker.attempt_number == Some(attempt_number)
+	});
+	let mut marker = RunActivityMarkerRecord {
+		run_id: Some(run_id.to_owned()),
+		attempt_number: Some(attempt_number),
+		process_id: Some(process_id),
+		last_activity_unix_epoch: Some(last_activity_unix_epoch),
+		last_protocol_activity_unix_epoch: last_protocol_activity_unix_epoch.or_else(|| {
+			same_run_marker.and_then(|marker| marker.last_protocol_activity_unix_epoch)
+		}),
+		retry_budget_attempt_count: existing_marker
+			.as_ref()
+			.and_then(|marker| marker.retry_budget_attempt_count),
+		retry_kind: None,
+		retry_ready_at_unix_epoch: None,
+	};
 
-	if let Some(last_protocol_activity_unix_epoch) = last_protocol_activity_unix_epoch {
-		marker_body.push_str(
-			format!("last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n")
-				.as_str(),
-		);
-	}
-	if let Some(retry_budget_attempt_count) = preserved_retry_budget_attempt_count {
-		marker_body.push_str(
-			format!("retry_budget_attempt_count={retry_budget_attempt_count}\n").as_str(),
-		);
+	if let Some(same_run_marker) = same_run_marker {
+		marker.retry_kind = same_run_marker.retry_kind.clone();
+		marker.retry_ready_at_unix_epoch = same_run_marker.retry_ready_at_unix_epoch;
 	}
 
-	fs::write(marker_path, marker_body)?;
+	fs::write(marker_path, serialize_run_activity_marker_record(&marker))?;
 
 	Ok(())
 }
@@ -1644,11 +1681,59 @@ fn read_run_activity_marker_record(
 				marker.last_protocol_activity_unix_epoch = value.parse::<i64>().ok(),
 			"retry_budget_attempt_count" =>
 				marker.retry_budget_attempt_count = value.parse::<i64>().ok(),
+			"retry_kind" => marker.retry_kind = Some(value.to_owned()),
+			"retry_ready_at_unix_epoch" =>
+				marker.retry_ready_at_unix_epoch = value.parse::<i64>().ok(),
 			_ => {},
 		}
 	}
 
 	Ok(Some(marker))
+}
+
+fn write_run_activity_marker_record(
+	workspace_path: &Path,
+	marker: &RunActivityMarkerRecord,
+) -> Result<()> {
+	fs::write(
+		workspace_path.join(RUN_ACTIVITY_MARKER_FILE),
+		serialize_run_activity_marker_record(marker),
+	)?;
+
+	Ok(())
+}
+
+fn serialize_run_activity_marker_record(marker: &RunActivityMarkerRecord) -> String {
+	let mut body = String::new();
+
+	if let Some(run_id) = &marker.run_id {
+		body.push_str(&format!("run_id={run_id}\n"));
+	}
+	if let Some(attempt_number) = marker.attempt_number {
+		body.push_str(&format!("attempt_number={attempt_number}\n"));
+	}
+	if let Some(process_id) = marker.process_id {
+		body.push_str(&format!("process_id={process_id}\n"));
+	}
+	if let Some(last_activity_unix_epoch) = marker.last_activity_unix_epoch {
+		body.push_str(&format!("last_activity_unix_epoch={last_activity_unix_epoch}\n"));
+	}
+	if let Some(last_protocol_activity_unix_epoch) = marker.last_protocol_activity_unix_epoch {
+		body.push_str(&format!(
+			"last_protocol_activity_unix_epoch={last_protocol_activity_unix_epoch}\n"
+		));
+	}
+	if let Some(retry_budget_attempt_count) = marker.retry_budget_attempt_count {
+		body.push_str(&format!("retry_budget_attempt_count={retry_budget_attempt_count}\n"));
+	}
+	if let Some(retry_kind) = &marker.retry_kind {
+		body.push_str(&format!("retry_kind={retry_kind}\n"));
+	}
+	if let Some(retry_ready_at_unix_epoch) = marker.retry_ready_at_unix_epoch {
+		body.push_str(&format!("retry_ready_at_unix_epoch={retry_ready_at_unix_epoch}\n"));
+	}
+
+	body
 }
 
 fn read_review_handoff_marker_record(
@@ -1731,7 +1816,7 @@ fn clear_close_on_exec(file: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	#[cfg(unix)] use std::os::fd::IntoRawFd;
-	use std::{collections::HashMap, fs, path::Path};
+	use std::{collections::HashMap, fs, path::Path, process};
 
 	use tempfile::TempDir;
 
@@ -2183,6 +2268,34 @@ mod tests {
 				.expect("last activity lookup should succeed")
 				.is_some()
 		);
+	}
+
+	#[test]
+	fn run_activity_marker_round_trips_retry_schedule_fields() {
+		let temp_dir = TempDir::new().expect("tempdir should create");
+
+		state::write_run_activity_marker_for_process(temp_dir.path(), "run-1", 1, process::id())
+			.expect("activity marker should write");
+		state::write_run_retry_schedule(temp_dir.path(), "run-1", 1, "failure", 12_345)
+			.expect("retry schedule should write");
+
+		let marker = state::read_run_activity_marker_snapshot(temp_dir.path())
+			.expect("marker snapshot should load")
+			.expect("marker snapshot should exist");
+
+		assert_eq!(marker.run_id(), "run-1");
+		assert_eq!(marker.attempt_number(), 1);
+		assert_eq!(marker.retry_kind(), Some("failure"));
+		assert_eq!(marker.retry_ready_at_unix_epoch(), Some(12_345));
+
+		state::clear_run_retry_schedule(temp_dir.path()).expect("retry schedule should clear");
+
+		let cleared = state::read_run_activity_marker_snapshot(temp_dir.path())
+			.expect("marker snapshot should reload")
+			.expect("marker snapshot should still exist");
+
+		assert_eq!(cleared.retry_kind(), None);
+		assert_eq!(cleared.retry_ready_at_unix_epoch(), None);
 	}
 
 	#[test]
