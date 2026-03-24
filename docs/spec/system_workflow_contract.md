@@ -107,14 +107,6 @@ Supported keys:
   - type: string
   - optional
   - default: `"stdio://"`
-- `sandbox`
-  - type: string
-  - optional
-  - default: `"workspace-write"`
-- `approval_policy`
-  - type: string
-  - optional
-  - default: `"never"`
 - `personality`
   - type: string
   - optional
@@ -122,6 +114,8 @@ Supported keys:
 - `service_tier`
   - type: string
   - optional
+
+Child-run execution policy is not part of the repo-owned workflow contract. `maestro` must let `codex app-server` inherit sandbox and approval behavior from the active Codex runtime instead of declaring repo-local overrides in `WORKFLOW.md`.
 
 ## `[execution]`
 
@@ -203,8 +197,6 @@ needs_attention_label = "maestro:needs-attention"
 
 [agent]
 transport = "stdio://"
-sandbox = "workspace-write"
-approval_policy = "never"
 personality = "pragmatic"
 
 [execution]

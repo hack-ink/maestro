@@ -98,10 +98,12 @@ At minimum, the target repo should define:
 - `[tracker] provider = "linear"`
 - `[tracker] project_slug = "<Linear project slugId>"`
 - `[tracker] startable_states = ["Todo"]` or another explicit start set
-- `[agent]` policy such as sandbox and approval mode
+- `[agent] transport` plus any repo-local personality or service-tier defaults
 - `[execution] max_attempts`
 - `[execution] max_retry_backoff_ms`
 - optional `[context] read_first = [...]` only when the repo truly needs extra repo-local files loaded in addition to the `WORKFLOW.md` body; treat this as a Maestro-local extension, not as the primary policy surface
+
+Child-run execution policy is not part of the repo-owned `WORKFLOW.md` contract. `maestro` must let `codex app-server` inherit sandbox and approval behavior from the active Codex runtime instead of pinning repo-local overrides.
 
 The target Linear team should also expose:
 

@@ -108,11 +108,11 @@ The MVP thread start request owns these fields:
 
 - `cwd`
 - `dynamicTools` when the run exposes issue-scoped tracker tools
-- `approvalPolicy`
-- `sandbox`
 - `developerInstructions`
 - `personality` when configured
 - `serviceTier` when configured
+
+Maestro must not inject repo-owned sandbox or approval-policy overrides into `thread/start`. Child runs inherit execution policy from the active Codex runtime.
 
 `ThreadStartResponse` returns the effective thread plus the effective execution settings.
 
@@ -131,7 +131,7 @@ The MVP turn start request owns these fields:
 
 - `threadId`
 - `input`
-- optional overrides for `cwd`, `approvalPolicy`, `personality`, `serviceTier`, and sandbox policy when the run needs turn-level overrides
+- optional overrides for `cwd`, `personality`, and `serviceTier` when the run needs turn-level overrides
 
 `TurnStartResponse` returns the accepted turn object.
 
@@ -146,7 +146,7 @@ Within one bounded Maestro run attempt, the runtime may start multiple turns on 
 ### `thread/status/changed`
 
 - Track whether the thread is `active`, `idle`, `systemError`, or `notLoaded`.
-- `waitingOnApproval` and `waitingOnUserInput` are policy violations for the MVP because the default approval policy is `never` and the run is non-interactive.
+- `waitingOnApproval` and `waitingOnUserInput` are policy violations for the MVP because Maestro runs are non-interactive and must inherit a Codex runtime policy that does not require manual approval or user input.
 
 ### `turn/started`
 
@@ -175,7 +175,7 @@ The failure classifier must consider retry budget from the repo `WORKFLOW.md` po
 - request identifiers
 - JSON-RPC framing
 - local journaling of protocol messages
-- mapping repo workflow policy into request fields
+- mapping repo workflow policy into request fields other than inherited runtime execution policy
 - servicing issue-scoped tracker tool calls
 - run classification and fallback reconciliation writes when the agent never reached a tracker update
 

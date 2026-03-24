@@ -226,10 +226,6 @@ pub enum TrackerProvider {
 pub struct WorkflowAgent {
 	#[serde(default = "default_transport")]
 	transport: String,
-	#[serde(default = "default_sandbox")]
-	sandbox: String,
-	#[serde(default = "default_approval_policy")]
-	approval_policy: String,
 	personality: Option<String>,
 	service_tier: Option<String>,
 }
@@ -237,16 +233,6 @@ impl WorkflowAgent {
 	/// App-server transport.
 	pub fn transport(&self) -> &str {
 		&self.transport
-	}
-
-	/// Sandbox mode for the run.
-	pub fn sandbox(&self) -> &str {
-		&self.sandbox
-	}
-
-	/// Approval policy for the run.
-	pub fn approval_policy(&self) -> &str {
-		&self.approval_policy
 	}
 
 	/// Optional personality override.
@@ -262,17 +248,11 @@ impl WorkflowAgent {
 
 impl Default for WorkflowAgent {
 	fn default() -> Self {
-		Self {
-			transport: default_transport(),
-			sandbox: default_sandbox(),
-			approval_policy: default_approval_policy(),
-			personality: None,
-			service_tier: None,
-		}
+		Self { transport: default_transport(), personality: None, service_tier: None }
 	}
 }
 
-/// Repo-local execution policy.
+/// Repo-local execution and validation policy.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct WorkflowExecution {
 	#[serde(default = "default_max_attempts")]
@@ -446,14 +426,6 @@ fn default_needs_attention_label() -> String {
 
 fn default_transport() -> String {
 	String::from("stdio://")
-}
-
-fn default_sandbox() -> String {
-	String::from("workspace-write")
-}
-
-fn default_approval_policy() -> String {
-	String::from("never")
 }
 
 fn default_max_attempts() -> u32 {
@@ -713,6 +685,34 @@ Read the repo policy first.
 	}
 
 	#[test]
+	fn rejects_legacy_agent_execution_policy_fields() {
+		for (field, value) in [("sandbox", "\"workspace-write\""), ("approval_policy", "\"never\"")]
+		{
+			let result = WorkflowDocument::parse_markdown(&format!(
+				r#"
++++
+version = 1
+
+[tracker]
+provider = "linear"
+project_slug = "pubfi"
+
+[agent]
+transport = "stdio://"
+{field} = {value}
++++
+
+Read the repo policy first.
+			"#
+			));
+			let error =
+				result.expect_err("legacy agent execution policy fields should be rejected");
+
+			assert!(error.to_string().contains(&format!("unknown field `{field}`")));
+		}
+	}
+
+	#[test]
 	fn rejects_missing_frontmatter() {
 		let result = WorkflowDocument::parse_markdown("Read the repo policy first.");
 
@@ -732,8 +732,6 @@ project_slug = "pubfi"
 
 [agent]
 transport = "stdio://"
-sandbox = "workspace-write"
-approval_policy = "never"
 
 [execution]
 max_attempts = 5

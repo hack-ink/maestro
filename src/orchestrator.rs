@@ -3725,8 +3725,6 @@ where
 			attempt_number: issue_run.attempt_number,
 			listen: transport,
 			cwd: issue_run.workspace.path.display().to_string(),
-			approval_policy: workflow.frontmatter().agent().approval_policy().to_owned(),
-			sandbox: workflow.frontmatter().agent().sandbox().to_owned(),
 			developer_instructions: build_developer_instructions(
 				project,
 				workflow,
@@ -6712,8 +6710,6 @@ startable_states = ["Todo"]
 
 [agent]
 transport = "stdio://"
-sandbox = "workspace-write"
-approval_policy = "never"
 
 [execution]
 max_attempts = 3
@@ -8793,8 +8789,6 @@ needs_attention_label = "maestro:needs-attention"
 
 [agent]
 transport = "stdio://"
-sandbox = "workspace-write"
-approval_policy = "never"
 
 [execution]
 max_attempts = 3
