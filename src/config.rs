@@ -144,6 +144,7 @@ impl ProjectGitHubConfig {
 
 /// Project-level agent defaults from service configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectAgentConfig {
 	transport: Option<String>,
 }
@@ -419,6 +420,28 @@ mod tests {
 		.expect("service config should parse");
 
 		assert_eq!(config.github().token_env_var(), None);
+	}
+
+	#[test]
+	fn rejects_legacy_agent_model_field() {
+		let result = ServiceConfig::parse_toml(
+			r#"
+				id = "pubfi"
+				repo_root = "/tmp/pubfi"
+				workspace_root = "/tmp/pubfi/.workspaces"
+
+				[tracker]
+				project_slug = "pubfi"
+				api_key_env_var = "HOME"
+
+				[agent]
+				transport = "stdio://"
+				model = "gpt-5.4"
+			"#,
+		);
+		let error = result.expect_err("legacy `agent.model` key should be rejected");
+
+		assert!(error.to_string().contains("unknown field `model`"));
 	}
 
 	#[test]
